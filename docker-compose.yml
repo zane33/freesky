@@ -3,10 +3,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    ports:
-      #- "${PORT:-3000}:${PORT:-3000}"
-      #- "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
-      #- "2019:2019"  # Expose Caddy admin port for debugging
+    # Use container networking - share network namespace with existing container
+    network_mode: "container:1127bc9a124ee5265b213c73cae979e188d5f5b19566adbd5cb8abdc4a786fc7"
+    # Ports are not needed when using container networking
+    # ports:
+    #   - "${PORT:-3000}:${PORT:-3000}"
+    #   - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
+    #   - "2019:2019"  # Expose Caddy admin port for debugging
     environment:
       - PORT=${PORT:-3000}
       - BACKEND_PORT=${BACKEND_PORT:-8005}
@@ -28,15 +31,6 @@ services:
           memory: 1G
         reservations:
           memory: 512M
-    networks:
-      freesky-network:
-        aliases:
-          - freesky
-    dns:
-      - 8.8.8.8  # Use Google DNS as primary
-      - 1.1.1.1  # Use Cloudflare DNS as backup
-    extra_hosts:
-      - "host.docker.internal:host-gateway"  # Allow container to access host network
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${PORT:-3000}/health", "||", "exit", "1"]
@@ -44,11 +38,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
-
-networks:
-  freesky-network:
-    driver: bridge
-    # Enable internet access
-    driver_opts:
-      com.docker.network.bridge.enable_ip_masquerade: "true"
-      com.docker.network.bridge.enable_icc: "true"
