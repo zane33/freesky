@@ -7,8 +7,19 @@ import reflex as rx
 # Get environment variables with defaults
 frontend_port = int(os.environ.get("PORT", "3000"))
 backend_port = int(os.environ.get("BACKEND_PORT", "8005"))
-api_url = os.environ.get("API_URL", f"http://localhost:{frontend_port}")  # Frontend interface with integrated backend
-backend_uri = os.environ.get("BACKEND_URI", f"http://localhost:{backend_port}")  # Backend service
+
+# Dynamic host detection for container deployment
+def get_host_ip():
+    """Get the host IP dynamically, fallback to 0.0.0.0 for container deployment"""
+    host = os.environ.get("HOST_IP")
+    if host:
+        return host
+    # For container deployment, use 0.0.0.0 to bind to all interfaces
+    return "0.0.0.0"
+
+host_ip = get_host_ip()
+api_url = os.environ.get("API_URL", f"http://{host_ip}:{backend_port}")  # Use backend port for API URLs
+backend_uri = os.environ.get("BACKEND_URI", f"http://{host_ip}:{backend_port}")  # Backend service
 daddylive_uri = os.environ.get("DADDYLIVE_URI", "https://thedaddy.click")
 proxy_content = os.environ.get("PROXY_CONTENT", "TRUE").lower() == "true"
 socks5 = os.environ.get("SOCKS5", "")

@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Get environment variables
 frontend_port = int(os.environ.get("PORT", "3000"))
 backend_port = int(os.environ.get("BACKEND_PORT", "8005"))
-api_url = os.environ.get("API_URL", f"http://localhost:{frontend_port}")  # Use frontend port for integrated API
+api_url = os.environ.get("API_URL", f"http://0.0.0.0:{backend_port}")  # Use backend port and bind to all interfaces
 
 # Parse API_URL to create WebSocket URL with backend port
 parsed_url = urlparse(api_url)

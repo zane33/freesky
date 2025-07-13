@@ -4,19 +4,18 @@ services:
       context: .
       dockerfile: Dockerfile
     # Use container networking - share network namespace with existing container
-    #network_mode: "container:1127bc9a124ee5265b213c73cae979e188d5f5b19566adbd5cb8abdc4a786fc7"
+    network_mode: "container:1127bc9a124ee5265b213c73cae979e188d5f5b19566adbd5cb8abdc4a786fc7"
     # Ports are not needed when using container networking
     
-    ports:
-      - "${PORT:-3000}:${PORT:-3000}"
-      - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
-      - "2019:2019"  # Expose Caddy admin port for debugging
+    # ports:
+    #   - "${PORT:-3000}:${PORT:-3000}"
+    #   - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
+    #   - "2019:2019"  # Expose Caddy admin port for debugging
     environment:
       - PORT=${PORT:-3000}
       - BACKEND_PORT=${BACKEND_PORT:-8005}
-      - HOST_IP=${HOST_IP:-}  # Dynamic host IP, will use 0.0.0.0 if not set
-      - BACKEND_URI=${BACKEND_URI:-}  # Let rxconfig determine this dynamically
-      - API_URL=${API_URL:-}  # Let rxconfig determine this dynamically
+      - BACKEND_URI=${BACKEND_URI:-http://192.168.4.5:${BACKEND_PORT:-8005}}
+      - API_URL=${API_URL:-http://192.168.4.5:${PORT:-3000}}
       - DADDYLIVE_URI=${DADDYLIVE_URI:-https://thedaddy.click}
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
       - SOCKS5=${SOCKS5:-}
@@ -35,13 +34,13 @@ services:
           memory: 512M
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-3000}/health", "||", "exit", "1"]
+      test: ["CMD", "curl", "-f", "http://192.168.4.5:${PORT:-3000}/health", "||", "exit", "1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
 
 # Remove networks section when using container networking
-networks:
-  freesky-network:
-     driver: bridge
+# networks:
+#   freesky-network:
+#     driver: bridge

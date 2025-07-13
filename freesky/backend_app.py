@@ -24,8 +24,8 @@ os.environ["REFLEX_ENV"] = "prod"
 os.environ["REFLEX_SKIP_COMPILE"] = "1"  # Skip frontend compilation in production
 
 # Get environment variables
-api_url = os.environ.get("API_URL", "http://localhost:3000")  # Frontend interface
-backend_uri = os.environ.get("BACKEND_URI", "http://localhost:8005")  # Backend service
+api_url = os.environ.get("API_URL", "http://0.0.0.0:8005")  # Use backend port and bind to all interfaces
+backend_uri = os.environ.get("BACKEND_URI", "http://0.0.0.0:8005")  # Backend service
 backend_port = int(os.environ.get("BACKEND_PORT", "8005"))
 workers = int(os.environ.get("WORKERS", "3"))
 
