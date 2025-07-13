@@ -51,14 +51,14 @@ def playlist() -> rx.Component:
                             rx.button(
                                 "Download Playlist",
                                 rx.icon("download", margin_right="0.5rem"),
-                                on_click=rx.redirect("/playlist.m3u8", is_external=True),
+                                on_click=rx.redirect(f"{config.api_url}/playlist.m3u8", is_external=True),
                                 size="3",
                             ),
                             rx.button(
                                 "Copy Link",
                                 rx.icon("clipboard", margin_right="0.5rem"),
                                 on_click=[
-                                    rx.set_clipboard("/playlist.m3u8"),
+                                    rx.set_clipboard(f"{config.api_url}/playlist.m3u8"),
                                     rx.toast("Playlist URL copied to clipboard!"),
                                 ],
                                 size="3",
@@ -73,11 +73,11 @@ def playlist() -> rx.Component:
 
                         rx.box(
                             rx.text(
-                                "/playlist.m3u8",
+                                f"{config.api_url}/playlist.m3u8",
                                 font_family="mono",
                                 font_size="sm",
                             ),
-                            padding="0.75rem",
+                            padding="0.75rem",  
                             background="gray.100",
                             border_radius="md",
                             width="100%",
