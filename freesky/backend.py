@@ -8,7 +8,7 @@ from typing import Optional, Dict, Tuple
 from freesky.free_sky import StepDaddy, Channel
 from fastapi import Response, status, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
+# CORSMiddleware removed - CORS handled by Caddy
 from .utils import urlsafe_base64_decode
 import json
 from urllib.parse import urlparse, urlunparse
@@ -37,15 +37,7 @@ fastapi_app = FastAPI(
     version="1.0.0"
 )
 
-# Add CORS middleware with consolidated settings
-fastapi_app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for docker deployment flexibility
-    allow_credentials=False,  # Can't use credentials with wildcard origins
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
+# CORS is handled by Caddy reverse proxy to prevent duplicate headers
 
 # Create HTTP client with optimized settings for streaming
 client = httpx.AsyncClient(
@@ -127,18 +119,7 @@ async def add_process_time_header(request: Request, call_next):
     return response
 
 # Add OPTIONS handler for streaming endpoints to handle CORS preflight requests
-@fastapi_app.options("/stream/{channel_id}.m3u8")
-async def stream_options(channel_id: str):
-    return Response(
-        content="",
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Expose-Headers": "*",
-            "Access-Control-Max-Age": "86400"
-        }
-    )
+# OPTIONS handler removed - CORS preflight handled by Caddy
 
 @fastapi_app.get("/stream/{channel_id}.m3u8")
 async def stream(channel_id: str):
@@ -155,10 +136,6 @@ async def stream(channel_id: str):
                     content=cached_data,
                     media_type="application/vnd.apple.mpegurl",
                     headers={
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                        "Access-Control-Allow-Headers": "*",
-                        "Access-Control-Expose-Headers": "*",
                         "Cache-Control": "no-cache, no-store, must-revalidate",
                         "Pragma": "no-cache",
                         "Expires": "0",
@@ -186,8 +163,7 @@ async def stream(channel_id: str):
             content=stream_data,
             media_type="application/vnd.apple.mpegurl",
             headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                 "Access-Control-Allow-Headers": "*",
                 "Access-Control-Expose-Headers": "*",
                 "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -230,7 +206,6 @@ async def content_options(path: str):
     return Response(
         content="",
         headers={
-            "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS", 
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Expose-Headers": "*",
@@ -250,8 +225,7 @@ async def content(path: str):
                 proxy_stream(), 
                 media_type="application/octet-stream",
                 headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                     "Access-Control-Allow-Headers": "*",
                     "Access-Control-Expose-Headers": "*",
                     "Cache-Control": "public, max-age=3600",
@@ -350,7 +324,6 @@ def playlist_options():
     return Response(
         content="",
         headers={
-            "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Expose-Headers": "*",
@@ -365,7 +338,6 @@ def playlist():
         content=free_sky.playlist(),
         media_type="application/vnd.apple.mpegurl",
         headers={
-            "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Expose-Headers": "*",
@@ -381,7 +353,6 @@ def api_playlist_options():
     return Response(
         content="",
         headers={
-            "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Expose-Headers": "*",
@@ -396,7 +367,6 @@ def api_playlist():
         content=free_sky.playlist(),
         media_type="application/vnd.apple.mpegurl",
         headers={
-            "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Expose-Headers": "*",
