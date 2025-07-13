@@ -37,8 +37,8 @@ ARG PORT BACKEND_PORT API_URL DADDYLIVE_URI PROXY_CONTENT SOCKS5
 # Set environment variables for the build
 ENV PORT=${PORT:-3000} \
     BACKEND_PORT=${BACKEND_PORT:-8005} \
-    BACKEND_URI=${BACKEND_URI:-http://localhost:${BACKEND_PORT:-8005}} \
-    API_URL=${API_URL:-http://localhost:${PORT:-3000}} \
+    BACKEND_URI=${BACKEND_URI:-http://0.0.0.0:${BACKEND_PORT:-8005}} \
+    API_URL=${API_URL:-http://0.0.0.0:${PORT:-3000}} \
     DADDYLIVE_URI=${DADDYLIVE_URI:-"https://thedaddy.click"} \
     PROXY_CONTENT=${PROXY_CONTENT:-TRUE} \
     SOCKS5=${SOCKS5:-""} \
@@ -87,10 +87,10 @@ ARG PORT BACKEND_PORT API_URL DADDYLIVE_URI PROXY_CONTENT SOCKS5
 ENV PATH="/app/.venv/bin:$PATH" \
     PORT=${PORT:-3000} \
     BACKEND_PORT=${BACKEND_PORT:-8005} \
-    BACKEND_URI=${BACKEND_URI:-http://localhost:${BACKEND_PORT:-8005}} \
-    API_URL=${API_URL:-http://localhost:${PORT:-3000}} \
+    BACKEND_URI=${BACKEND_URI:-http://0.0.0.0:${BACKEND_PORT:-8005}} \
+    API_URL=${API_URL:-http://0.0.0.0:${PORT:-3000}} \
     DADDYLIVE_URI=${DADDYLIVE_URI:-"https://thedaddy.click"} \
-    REDIS_URL=redis://localhost \
+    REDIS_URL=redis://0.0.0.0 \
     PYTHONUNBUFFERED=1 \
     PROXY_CONTENT=${PROXY_CONTENT:-TRUE} \
     SOCKS5=${SOCKS5:-""} \

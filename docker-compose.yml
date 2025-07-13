@@ -24,7 +24,7 @@ services:
       # Add proxy environment variables
       - HTTP_PROXY=${HTTP_PROXY:-}
       - HTTPS_PROXY=${HTTPS_PROXY:-}
-      - NO_PROXY=localhost,127.0.0.1,0.0.0.0
+      - NO_PROXY=127.0.0.1,0.0.0.0
     deploy:
       resources:
         limits:
@@ -33,7 +33,7 @@ services:
           memory: 512M
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-3000}/health", "||", "exit", "1"]
+      test: ["CMD", "curl", "-f", "http://0.0.0.0:${PORT:-3000}/health", "||", "exit", "1"]
       interval: 30s
       timeout: 10s
       retries: 3
