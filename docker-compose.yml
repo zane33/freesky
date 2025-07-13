@@ -4,14 +4,14 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "${PORT:-3000}:${PORT:-3000}"
-      - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
-      - "2019:2019"  # Expose Caddy admin port for debugging
+      #- "${PORT:-3000}:${PORT:-3000}"
+      #- "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
+      #- "2019:2019"  # Expose Caddy admin port for debugging
     environment:
       - PORT=${PORT:-3000}
       - BACKEND_PORT=${BACKEND_PORT:-8005}
-      - BACKEND_URI=${BACKEND_URI:-http://localhost:${BACKEND_PORT:-8005}}
-      - API_URL=${API_URL:-http://localhost:${PORT:-3000}}
+      - BACKEND_URI=${BACKEND_URI:-http://0.0.0.0:${BACKEND_PORT:-8005}}
+      - API_URL=${API_URL:-http://0.0.0.0:${PORT:-3000}}
       - DADDYLIVE_URI=${DADDYLIVE_URI:-https://thedaddy.click}
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
       - SOCKS5=${SOCKS5:-}
@@ -21,7 +21,7 @@ services:
       # Add proxy environment variables
       - HTTP_PROXY=${HTTP_PROXY:-}
       - HTTPS_PROXY=${HTTPS_PROXY:-}
-      - NO_PROXY=localhost,127.0.0.1
+      - NO_PROXY=localhost,127.0.0.1,0.0.0.0
     deploy:
       resources:
         limits:
