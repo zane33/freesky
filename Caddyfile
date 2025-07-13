@@ -1,0 +1,113 @@
+:{$PORT}
+
+log {
+	format json
+	level DEBUG
+}
+
+# Basic settings - compress all except streaming endpoints
+@compress {
+    not path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /_event/* /logo/* /watch/*
+}
+encode @compress gzip
+root * /srv
+
+# Streaming endpoints need permissive headers for external players
+@streaming {
+    path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /playlist.m3u8
+}
+
+# Restrictive headers for non-streaming content
+@non_streaming {
+    not path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /playlist.m3u8
+}
+
+# Security headers for non-streaming content only
+header @non_streaming {
+	X-Content-Type-Options nosniff
+	X-Frame-Options DENY
+	X-XSS-Protection "1; mode=block"
+	Referrer-Policy "strict-origin-when-cross-origin"
+	Permissions-Policy "geolocation=(), microphone=(), camera=()"
+}
+
+# Permissive headers for streaming content (for VLC and external players)
+header @streaming {
+	X-Content-Type-Options nosniff
+	Access-Control-Allow-Origin "*"
+	Access-Control-Allow-Methods "GET, POST, OPTIONS"
+	Access-Control-Allow-Headers "*"
+	Access-Control-Expose-Headers "*"
+	Cache-Control "no-cache, no-store, must-revalidate"
+	Pragma "no-cache"
+	Expires "0"
+}
+
+# Handle playlist.m3u8 endpoint first (highest priority)
+handle /playlist.m3u8 {
+	reverse_proxy localhost:{$BACKEND_PORT}
+}
+
+# Handle logo requests first (highest priority)
+@logo path /logo/*
+handle @logo {
+	reverse_proxy localhost:{$BACKEND_PORT}
+}
+
+# Handle WebSocket events - match path only, let backend handle WebSocket upgrade
+@websocket path /_event*
+handle @websocket {
+	reverse_proxy localhost:{$BACKEND_PORT}
+}
+
+# Handle backend routes
+handle_path /api/* {
+	uri strip_prefix /api
+	reverse_proxy localhost:{$BACKEND_PORT}
+}
+
+handle_path /stream/* {
+	reverse_proxy localhost:{$BACKEND_PORT} {
+		flush_interval -1
+		header_up X-Real-IP {remote_host}
+		header_down -Server
+	}
+}
+
+handle_path /key/* {
+	reverse_proxy localhost:{$BACKEND_PORT} {
+		flush_interval -1
+		header_up X-Real-IP {remote_host}
+	}
+}
+
+handle_path /content/* {
+	reverse_proxy localhost:{$BACKEND_PORT} {
+		flush_interval -1
+		header_up X-Real-IP {remote_host}
+		header_down -Server
+	}
+}
+
+handle /health {
+	reverse_proxy localhost:{$BACKEND_PORT}
+}
+
+handle /channels {
+	reverse_proxy localhost:{$BACKEND_PORT}
+}
+
+handle /ping {
+	reverse_proxy localhost:{$BACKEND_PORT}
+}
+
+handle /schedule {
+	reverse_proxy localhost:{$BACKEND_PORT}
+}
+
+# Handle all other requests
+handle {
+	# Try static files first
+	try_files {path} /index.html
+	file_server
+}
