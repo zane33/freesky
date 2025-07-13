@@ -122,6 +122,7 @@ async def add_process_time_header(request: Request, call_next):
 # OPTIONS handler removed - CORS preflight handled by Caddy
 
 @fastapi_app.get("/stream/{channel_id}.m3u8")
+@fastapi_app.get("/api/stream/{channel_id}.m3u8")
 async def stream(channel_id: str):
     try:
         # Check cache first
@@ -178,7 +179,7 @@ async def stream(channel_id: str):
         logger.error(f"Error streaming channel {channel_id}: {str(e)}")
         return JSONResponse(content={"error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-@fastapi_app.get("/key/{url}/{host}")
+@fastapi_app.get("/api/key/{url}/{host}")
 async def key(url: str, host: str):
     try:
         # Add timeout to key retrieval
@@ -201,7 +202,7 @@ async def key(url: str, host: str):
         logger.error(f"Error getting key: {str(e)}")
         return JSONResponse(content={"error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-@fastapi_app.options("/content/{path}")
+@fastapi_app.options("/api/content/{path}")
 async def content_options(path: str):
     return Response(
         content="",
@@ -213,7 +214,7 @@ async def content_options(path: str):
         }
     )
 
-@fastapi_app.get("/content/{path}")
+@fastapi_app.get("/api/content/{path}")
 async def content(path: str):
     try:
         async with _stream_semaphore:  # Control concurrent streams
