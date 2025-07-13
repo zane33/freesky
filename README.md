@@ -59,6 +59,8 @@ freesky relies on several key Python packages, each serving a specific purpose i
 
 ## 🐳 Docker Configuration
 
+> **⚠️ Remote Deployment Note**: If you're deploying to a remote server (like Portainer) and accessing from other machines, you may encounter connection errors. See [DEPLOYMENT.md](DEPLOYMENT.md) for configuration details.
+
 The application uses a multi-stage Docker build for optimal image size and security. Here's a breakdown of the Docker setup:
 
 ### Dockerfile Structure

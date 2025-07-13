@@ -10,8 +10,8 @@ services:
     environment:
       - PORT=${PORT:-3000}
       - BACKEND_PORT=${BACKEND_PORT:-8005}
-      - BACKEND_URI=http://localhost:${BACKEND_PORT:-8005}
-      - API_URL=http://localhost:${PORT:-3000}
+      - BACKEND_URI=${BACKEND_URI:-http://localhost:${BACKEND_PORT:-8005}}
+      - API_URL=${API_URL:-http://localhost:${PORT:-3000}}
       - DADDYLIVE_URI=${DADDYLIVE_URI:-https://thedaddy.click}
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
       - SOCKS5=${SOCKS5:-}
