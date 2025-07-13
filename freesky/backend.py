@@ -89,26 +89,38 @@ channel_update_task = None
 
 @fastapi_app.on_event("startup")
 async def startup_event():
-    global channel_update_task
-    # Start the channel update background task
-    channel_update_task = asyncio.create_task(update_channels())
-    active_tasks["channel_update"] = channel_update_task
-    logger.info("Channel update background task started")
+    # Background task now managed by Reflex lifespan
+    logger.info("FastAPI startup complete - channel loading managed by Reflex")
 
 @fastapi_app.on_event("shutdown")
 async def shutdown_event():
-    # Cancel all active tasks
+    logger.info("Starting shutdown procedure...")
+    
+    # Cancel all active tasks with timeout
     for task_name, task in active_tasks.items():
         if not task.done():
+            logger.info(f"Cancelling task: {task_name}")
             task.cancel()
             try:
-                await task
-            except asyncio.CancelledError:
-                logger.info(f"Task {task_name} cancelled")
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                logger.info(f"Task {task_name} cancelled/timed out")
+            except Exception as e:
+                logger.error(f"Error cancelling task {task_name}: {e}")
     
-    # Close HTTP client
-    await client.aclose()
-    logger.info("HTTP client and background tasks closed")
+    # Clear task registry
+    active_tasks.clear()
+    
+    # Close HTTP client with timeout
+    try:
+        await asyncio.wait_for(client.aclose(), timeout=10.0)
+        logger.info("HTTP client closed successfully")
+    except asyncio.TimeoutError:
+        logger.warning("HTTP client close timed out")
+    except Exception as e:
+        logger.error(f"Error closing HTTP client: {e}")
+    
+    logger.info("Shutdown procedure completed")
 
 @fastapi_app.middleware("http")
 async def add_process_time_header(request: Request, call_next):

@@ -30,6 +30,7 @@ config = rx.Config(
     api_url=api_url,  # Frontend interface where clients connect
     backend_port=backend_port,  # Use proper backend port
     env=rx.Env.PROD,  # Use production mode
+    show_devtools=False,  # Hide Reflex developer tools
     frontend_packages=[
         "socket.io-client",
         "@emotion/react",
@@ -39,7 +40,8 @@ config = rx.Config(
     ],
     # Enable WebSocket support
     connect_on_init=True,  # Connect WebSocket on page load
-    timeout=30000,  # WebSocket timeout in milliseconds
+    timeout=120000,  # WebSocket timeout in milliseconds (2 minutes)
+    reconnect_delay=3000,  # Delay before attempting reconnection (3 seconds)
     # Allow all origins for WebSocket
     cors_allowed_origins=["*"],
     # Custom configuration
