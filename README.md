@@ -272,6 +272,7 @@ docker-compose up -d
 
 - **MAX_CONCURRENT_STREAMS**: Controls **thread-level** concurrency per worker
   - Handles async I/O operations within each process
+  - Each stream gets isolated HTTP client and TCP connection
   - Memory usage scales with this limit
   - Recommended: 5-10 streams per worker
 
@@ -370,13 +371,14 @@ The backend is built with **FastAPI** and provides REST API endpoints for data p
 - **⚡ Intelligent Caching**: Stream caching with LRU eviction and TTL
 - **🔄 Background Tasks**: Periodic channel updates and monitoring
 - **🎯 Concurrent Streaming**: Multithreaded streaming with configurable limits
-- **📈 Real-time Monitoring**: Stream utilization and performance metrics
+- **🔗 Stream Isolation**: Each stream gets dedicated HTTP client and TCP connection
+- **📈 Real-time Monitoring**: Stream utilization and performance metrics with live session tracking
 
 #### **Backend Technologies:**
 - **FastAPI**: Modern Python web framework for API endpoints
 - **Reflex Integration**: Seamless integration with Reflex state system
 - **Uvicorn**: ASGI server with configurable multiple workers
-- **HTTPX**: Modern HTTP client with HTTP/2 and connection pooling
+- **HTTPX**: Modern HTTP client with isolated connections per stream
 - **Asyncio**: Advanced concurrency with semaphores and connection management
 - **Python 3.13**: Latest Python with enhanced async/await support
 
@@ -592,6 +594,10 @@ GET /ping                     # Simple ping endpoint with channel count
   "total_active_streams": 8,
   "max_concurrent_streams": 20,
   "stream_utilization": "40.0%",
+  "connection_isolation": "per_stream",
+  "connection_reuse": "disabled",
+  "multithreading_mode": "full_concurrency",
+  "session_tracking": "per_request",
   "uptime": 1752463063.68
 }
 ```
@@ -619,7 +625,44 @@ class State(rx.State):
 - **Response Times**: Average API response times with X-Process-Time headers
 - **Error Rates**: Failed request percentages and timeout handling
 - **Background Tasks**: Channel update task status and health
-- **Connection Pooling**: HTTP client connection reuse and keep-alive stats
+- **Stream Isolation**: Per-stream connection tracking and isolation metrics
+- **Real-time Session Tracking**: Live updates of active streaming sessions
+
+### 🔗 Stream Isolation Architecture
+
+freesky implements **complete stream isolation** to ensure maximum performance and reliability for concurrent streaming:
+
+#### **Per-Stream Connection Isolation**
+- **Dedicated HTTP Client**: Each streaming session creates its own isolated HTTP client
+- **Individual TCP Connections**: No connection sharing or pooling between streams
+- **Zero Connection Reuse**: Connections are immediately closed after streaming ends
+- **Complete Independence**: Stream failures don't affect other active streams
+
+#### **Isolation Configuration**
+```python
+# Each stream gets isolated client with these settings:
+httpx.AsyncClient(
+    http2=False,                     # Simpler connection handling
+    max_keepalive_connections=0,     # No connection reuse
+    max_connections=1,               # One connection per client
+    keepalive_expiry=0.0            # Close immediately after use
+)
+```
+
+#### **Stream Lifecycle**
+```
+1. Client Request → New HTTP Client Created
+2. HTTP Client → New TCP Connection to Upstream
+3. Streaming → Dedicated Connection Active
+4. Stream End → Connection Closed & Client Destroyed
+```
+
+#### **Benefits of Stream Isolation**
+- ✅ **Maximum Reliability**: Individual stream issues don't cascade
+- ✅ **True Multithreading**: Complete independence between streams
+- ✅ **Resource Isolation**: Memory and connection resources per stream
+- ✅ **Clean Cleanup**: No lingering connections or resource leaks
+- ✅ **Real-time Tracking**: Accurate session monitoring and metrics
 
 This architecture ensures scalable, real-time performance using Reflex's reactive state management system, eliminating the complexity of manual WebSocket handling while providing instant UI updates.
 

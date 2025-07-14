@@ -43,17 +43,32 @@ fastapi_app = FastAPI(
 
 # CORS is handled by Caddy reverse proxy to prevent duplicate headers
 
-# Create HTTP client with optimized settings for high-concurrency streaming
+# Create HTTP client with settings optimized for isolated connections per stream
+# This client is used for non-streaming requests (logos, keys, etc.)
 client = httpx.AsyncClient(
     http2=True,
-    timeout=httpx.Timeout(30.0, connect=10.0),  # Longer timeouts for streaming
+    timeout=httpx.Timeout(30.0, connect=10.0),
     limits=httpx.Limits(
-        max_keepalive_connections=max_concurrent_streams * 5,  # Dynamic based on concurrent streams
-        max_connections=max_concurrent_streams * 10,           # 10x the concurrent stream limit
-        keepalive_expiry=120.0                                 # Longer keepalive for streaming
+        max_keepalive_connections=10,  # Limited keepalive for non-streaming requests
+        max_connections=50,            # Reasonable limit for general requests
+        keepalive_expiry=60.0          # Shorter keepalive
     ),
     follow_redirects=True
 )
+
+# Function to create isolated HTTP clients for each streaming session
+def create_isolated_stream_client():
+    """Create a new HTTP client for each streaming session to ensure complete isolation"""
+    return httpx.AsyncClient(
+        http2=False,  # Disable HTTP/2 for simpler connection handling
+        timeout=httpx.Timeout(60.0, connect=15.0),  # Longer timeout for streaming
+        limits=httpx.Limits(
+            max_keepalive_connections=0,  # No connection reuse - every request gets new connection
+            max_connections=1,            # Only one connection per client
+            keepalive_expiry=0.0          # No keepalive - close immediately after use
+        ),
+        follow_redirects=True
+    )
 
 free_sky = StepDaddy()
 
@@ -82,13 +97,48 @@ cache_ttl = 30  # 30 seconds for live streaming freshness
 
 # Track active tasks and streaming sessions for cleanup
 active_tasks: Dict[str, asyncio.Task] = {}
-active_streams: Dict[str, Dict[str, float]] = {}  # Track clients per channel with timestamps
+active_streams: Dict[str, Dict[str, float]] = {}  # Track M3U8 requests per channel with timestamps
+active_content_sessions: Dict[str, Dict[str, float]] = {}  # Track actual video streaming sessions
+session_to_channel: Dict[str, str] = {}  # Map session IDs to channel IDs
 
 # Concurrency control for streaming with configurable limits
 _stream_semaphore = asyncio.Semaphore(max_concurrent_streams)
 _content_semaphore = asyncio.Semaphore(max_concurrent_streams * 2)  # More content streams allowed
 
 logger.info("Backend initialized with connection pooling")
+
+def extract_channel_from_content_path(content_path: str) -> str:
+    """Extract channel identifier from content path for session tracking"""
+    try:
+        # Decrypt the content URL to analyze it
+        decrypted_url = free_sky.content_url(content_path)
+        
+        # Look for channel identifiers in the URL
+        # Common patterns: /channel_id/, /stream-123/, etc.
+        import re
+        
+        # Try to find channel ID patterns in the URL
+        patterns = [
+            r'/([0-9]+)/',  # /123/
+            r'stream-([0-9]+)',  # stream-123
+            r'channel_([0-9]+)',  # channel_123
+            r'/([0-9]+)\.',  # /123.ts
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, decrypted_url)
+            if match:
+                return match.group(1)
+        
+        # Fallback: use a hash of the base URL for grouping
+        from urllib.parse import urlparse
+        parsed = urlparse(decrypted_url)
+        base_path = '/'.join(parsed.path.split('/')[:3])  # First 3 path segments
+        return str(abs(hash(base_path)) % 10000)  # Convert to a 4-digit identifier
+        
+    except Exception as e:
+        logger.debug(f"Could not extract channel from content path: {e}")
+        return "unknown"
 
 # Start channel update task
 channel_update_task = None
@@ -146,8 +196,9 @@ async def stream(channel_id: str):
         # Get current time for tracking and caching
         current_time = time.time()
         
-        # Generate unique client ID for tracking (simplified without request object)
-        client_id = f"stream_{current_time}_{id(asyncio.current_task())}"
+        # Generate unique client ID for tracking - each request is a separate session
+        task_id = id(asyncio.current_task())
+        client_id = f"stream_{current_time}_{task_id}_{hash(str(current_time) + str(task_id)) % 10000}"
         
         # Track active streams per channel with timestamp
         if channel_id not in active_streams:
@@ -287,20 +338,77 @@ async def content_options(path: str):
     )
 
 @fastapi_app.get("/api/content/{path}")
-async def content(path: str):
+async def content(path: str, request: Request):
+    current_time = time.time()
+    session_id = None
+    channel_id = None
+    
     try:
+        # Extract channel ID from content path for session tracking
+        channel_id = extract_channel_from_content_path(path)
+        
+        # Generate unique session ID for this streaming session 
+        # Each request gets its own session regardless of IP - true multithreading
+        task_id = id(asyncio.current_task())
+        session_id = f"content_{current_time}_{task_id}_{hash(str(current_time) + str(task_id)) % 10000}"
+        
+        # Track this streaming session
+        if channel_id not in active_content_sessions:
+            active_content_sessions[channel_id] = {}
+        active_content_sessions[channel_id][session_id] = current_time
+        session_to_channel[session_id] = channel_id
+        
+        logger.info(f"Starting content stream session {session_id} for channel {channel_id}. Total active content sessions for this channel: {len(active_content_sessions[channel_id])}")
+        
         # Use dedicated content semaphore for higher throughput
         async with _content_semaphore:
-            logger.debug(f"Proxying content: {path}")
+            logger.debug(f"Proxying content: {path[:100]}...")  # Truncate for cleaner logs
             
             async def proxy_stream():
+                last_heartbeat = time.time()
+                chunk_count = 0
+                # Create isolated client for this specific streaming session
+                isolated_client = create_isolated_stream_client()
+                
                 try:
-                    async with client.stream("GET", free_sky.content_url(path), timeout=60) as response:
+                    logger.info(f"Creating isolated connection for stream session {session_id}")
+                    async with isolated_client.stream("GET", free_sky.content_url(path), timeout=60) as response:
+                        logger.info(f"Stream session {session_id} established new isolated connection (status: {response.status_code})")
                         async for chunk in response.aiter_bytes(chunk_size=8 * 1024):  # Larger chunks for better throughput
+                            chunk_count += 1
+                            current_chunk_time = time.time()
+                            
+                            # Update session timestamp every 5 seconds for real-time tracking
+                            if current_chunk_time - last_heartbeat > 5:
+                                if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
+                                    active_content_sessions[channel_id][session_id] = current_chunk_time
+                                    last_heartbeat = current_chunk_time
+                            
                             yield chunk
+                            
+                    logger.info(f"Stream session {session_id} completed normally after {chunk_count} chunks")
                 except Exception as e:
-                    logger.error(f"Error in proxy stream: {str(e)}")
+                    logger.error(f"Error in isolated proxy stream for session {session_id}: {str(e)}")
                     raise
+                finally:
+                    # Always close the isolated client to ensure no connection reuse
+                    try:
+                        await isolated_client.aclose()
+                        logger.debug(f"Closed isolated client for session {session_id}")
+                    except Exception as e:
+                        logger.error(f"Error closing isolated client for session {session_id}: {str(e)}")
+                    
+                    # Clean up session tracking when streaming actually ends
+                    if session_id and channel_id:
+                        if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
+                            del active_content_sessions[channel_id][session_id]
+                            if session_id in session_to_channel:
+                                del session_to_channel[session_id]
+                            logger.info(f"Cleaned up content stream session {session_id} for channel {channel_id}. Remaining sessions for this channel: {len(active_content_sessions.get(channel_id, {}))}")
+                            
+                            # Clean up empty channel entries
+                            if channel_id in active_content_sessions and not active_content_sessions[channel_id]:
+                                del active_content_sessions[channel_id]
             
             return StreamingResponse(
                 proxy_stream(), 
@@ -311,11 +419,23 @@ async def content(path: str):
                     "Access-Control-Expose-Headers": "*",
                     "Cache-Control": "public, max-age=3600",
                     "Accept-Ranges": "bytes",
-                    "Transfer-Encoding": "chunked"
+                    "Transfer-Encoding": "chunked",
+                    "X-Session-ID": session_id
                 }
             )
     except Exception as e:
-        logger.error(f"Error proxying content: {str(e)}")
+        logger.error(f"Error proxying content for session {session_id}: {str(e)}")
+        # Clean up session on error
+        if session_id and channel_id:
+            if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
+                del active_content_sessions[channel_id][session_id]
+                if session_id in session_to_channel:
+                    del session_to_channel[session_id]
+                logger.info(f"Cleaned up failed content stream session {session_id} for channel {channel_id}")
+                
+                # Clean up empty channel entries
+                if channel_id in active_content_sessions and not active_content_sessions[channel_id]:
+                    del active_content_sessions[channel_id]
         return JSONResponse(content={"error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 async def update_channels():
@@ -498,10 +618,11 @@ async def ping():
 
 @fastapi_app.get("/health")
 async def health():
-    # Calculate total active streams and clean up stale entries
+    # Calculate streaming statistics and clean up stale entries
     current_time = time.time()
     stale_timeout = 300  # 5 minutes timeout for stale entries
     
+    # Clean up stale M3U8 requests
     for channel_id in list(active_streams.keys()):
         # Remove stale entries (older than 5 minutes)
         stale_clients = [
@@ -510,22 +631,49 @@ async def health():
         ]
         for client_id in stale_clients:
             del active_streams[channel_id][client_id]
-            logger.debug(f"Removed stale client {client_id} from channel {channel_id}")
+            logger.debug(f"Removed stale M3U8 client {client_id} from channel {channel_id}")
         
         # Remove empty channels
         if not active_streams[channel_id]:
             del active_streams[channel_id]
     
-    total_active_streams = sum(len(clients) for clients in active_streams.values())
+    # Clean up stale content streaming sessions
+    for channel_id in list(active_content_sessions.keys()):
+        # Remove stale sessions (older than 30 seconds for more real-time tracking)
+        content_stale_timeout = 30  # 30 seconds for content sessions (shorter for more real-time tracking)
+        stale_sessions = [
+            session_id for session_id, timestamp in active_content_sessions[channel_id].items()
+            if current_time - timestamp > content_stale_timeout
+        ]
+        for session_id in stale_sessions:
+            del active_content_sessions[channel_id][session_id]
+            if session_id in session_to_channel:
+                del session_to_channel[session_id]
+            logger.debug(f"Removed stale content session {session_id} from channel {channel_id}")
+        
+        # Remove empty channels
+        if not active_content_sessions[channel_id]:
+            del active_content_sessions[channel_id]
+    
+    # Calculate real streaming statistics from content sessions
+    total_active_content_streams = sum(len(sessions) for sessions in active_content_sessions.values())
+    total_m3u8_requests = sum(len(clients) for clients in active_streams.values())
     
     return {
         "status": "healthy",
         "channels_count": len(free_sky.channels),
         "cache_size": len(stream_cache),
-        "active_channels": len(active_streams),
-        "total_active_streams": total_active_streams,
+        "active_channels": len(active_content_sessions),  # Channels with active video streaming
+        "total_active_streams": total_active_content_streams,  # Real video streaming sessions
+        "total_m3u8_requests": total_m3u8_requests,  # Playlist requests (for debugging)
         "max_concurrent_streams": max_concurrent_streams,
-        "stream_utilization": f"{(total_active_streams / max_concurrent_streams) * 100:.1f}%",
+        "content_semaphore_limit": max_concurrent_streams * 2,  # Content streaming capacity
+        "stream_utilization": f"{(total_active_content_streams / max_concurrent_streams) * 100:.1f}%",
+        "content_sessions_per_channel": {ch: len(sessions) for ch, sessions in active_content_sessions.items()},
+        "multithreading_mode": "full_concurrency",  # Every request = separate thread
+        "session_tracking": "per_request",  # No IP-based limitations
+        "connection_isolation": "per_stream",  # Each stream gets isolated HTTP client
+        "connection_reuse": "disabled",  # No connection pooling for streams
         "uptime": time.time()
     }
 

@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     # Use container networking - share network namespace with existing container
-    #network_mode: "container:1127bc9a124ee5265b213c73cae979e188d5f5b19566adbd5cb8abdc4a786fc7"
+    network_mode: "container:1127bc9a124ee5265b213c73cae979e188d5f5b19566adbd5cb8abdc4a786fc7"
     # Ports are not needed when using container networking
     
     ports:
@@ -43,6 +43,6 @@ services:
       start_period: 60s
 
 # Remove networks section when using container networking
-networks:
-  freesky-network:
-     driver: bridge
+#networks:
+  #freesky-network:
+     #driver: bridge
