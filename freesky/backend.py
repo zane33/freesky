@@ -4,7 +4,7 @@ import httpx
 import logging
 import time
 from functools import lru_cache
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Set
 from freesky.free_sky import StepDaddy, Channel
 from fastapi import Response, status, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # Get environment variables
 frontend_port = int(os.environ.get("PORT", "3000"))
 backend_port = int(os.environ.get("BACKEND_PORT", "8005"))
+max_concurrent_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "10"))
 api_url = os.environ.get("API_URL", f"http://0.0.0.0:{backend_port}")  # Use backend port and bind to all interfaces
 
 # Parse API_URL to create WebSocket URL with backend port
@@ -42,14 +43,14 @@ fastapi_app = FastAPI(
 
 # CORS is handled by Caddy reverse proxy to prevent duplicate headers
 
-# Create HTTP client with optimized settings for streaming
+# Create HTTP client with optimized settings for high-concurrency streaming
 client = httpx.AsyncClient(
     http2=True,
-    timeout=httpx.Timeout(15.0, connect=5.0),  # Reasonable timeouts
+    timeout=httpx.Timeout(30.0, connect=10.0),  # Longer timeouts for streaming
     limits=httpx.Limits(
-        max_keepalive_connections=50,  # Increased for better streaming
-        max_connections=200,            # Increased from 75
-        keepalive_expiry=60.0          # Increased from 30
+        max_keepalive_connections=max_concurrent_streams * 5,  # Dynamic based on concurrent streams
+        max_connections=max_concurrent_streams * 10,           # 10x the concurrent stream limit
+        keepalive_expiry=120.0                                 # Longer keepalive for streaming
     ),
     follow_redirects=True
 )
@@ -76,14 +77,16 @@ class LRUCache(OrderedDict):
             del self[oldest]
 
 # Cache with size limit and TTL optimized for streaming
-stream_cache = LRUCache(maxsize=100)  # Increased for better caching
+stream_cache = LRUCache(maxsize=max_concurrent_streams * 10)  # Dynamic cache size
 cache_ttl = 30  # 30 seconds for live streaming freshness
 
-# Track active tasks for cleanup
+# Track active tasks and streaming sessions for cleanup
 active_tasks: Dict[str, asyncio.Task] = {}
+active_streams: Dict[str, Set[str]] = {}  # Track clients per channel
 
-# Concurrency control for streaming
-_stream_semaphore = asyncio.Semaphore(10)
+# Concurrency control for streaming with configurable limits
+_stream_semaphore = asyncio.Semaphore(max_concurrent_streams)
+_content_semaphore = asyncio.Semaphore(max_concurrent_streams * 2)  # More content streams allowed
 
 logger.info("Backend initialized with connection pooling")
 
@@ -138,8 +141,19 @@ async def add_process_time_header(request: Request, call_next):
 
 @fastapi_app.get("/stream/{channel_id}.m3u8")
 @fastapi_app.get("/api/stream/{channel_id}.m3u8")
-async def stream(channel_id: str):
+async def stream(channel_id: str, request: Request):
     try:
+        # Generate unique client ID for tracking
+        client_ip = request.client.host if request.client else "unknown"
+        client_id = f"{client_ip}_{id(request)}"
+        
+        # Track active streams per channel
+        if channel_id not in active_streams:
+            active_streams[channel_id] = set()
+        active_streams[channel_id].add(client_id)
+        
+        logger.info(f"Client {client_id} requesting stream for channel {channel_id}. Active streams: {len(active_streams[channel_id])}")
+        
         # Check cache first
         cache_key = f"stream_{channel_id}"
         current_time = time.time()
@@ -147,7 +161,7 @@ async def stream(channel_id: str):
         if cache_key in stream_cache:
             cached_data, cached_time = stream_cache[cache_key]
             if current_time - cached_time < cache_ttl:
-                logger.info(f"Serving cached stream for channel {channel_id}")
+                logger.info(f"Serving cached stream for channel {channel_id} to client {client_id}")
                 return Response(
                     content=cached_data,
                     media_type="application/vnd.apple.mpegurl",
@@ -155,44 +169,85 @@ async def stream(channel_id: str):
                         "Cache-Control": "no-cache, no-store, must-revalidate",
                         "Pragma": "no-cache",
                         "Expires": "0",
-                        "Accept-Ranges": "bytes"
+                        "Accept-Ranges": "bytes",
+                        "X-Stream-Source": "cache"
                     }
                 )
         
-        # Generate new stream with timeout
-        try:
-            stream_data = await asyncio.wait_for(
-                free_sky.stream(channel_id),
-                timeout=10.0  # 10 second timeout for stream generation
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout generating stream for channel {channel_id}")
-            return JSONResponse(
-                content={"error": "Stream generation timeout"},
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT
-            )
-        
-        # Cache the result (LRU cache handles cleanup)
-        stream_cache[cache_key] = (stream_data, current_time)
+        # Use semaphore to control concurrent stream generation
+        async with _stream_semaphore:
+            # Double-check cache after acquiring semaphore (another request might have populated it)
+            if cache_key in stream_cache:
+                cached_data, cached_time = stream_cache[cache_key]
+                if current_time - cached_time < cache_ttl:
+                    logger.info(f"Serving freshly cached stream for channel {channel_id} to client {client_id}")
+                    return Response(
+                        content=cached_data,
+                        media_type="application/vnd.apple.mpegurl",
+                        headers={
+                            "Cache-Control": "no-cache, no-store, must-revalidate",
+                            "Pragma": "no-cache",
+                            "Expires": "0",
+                            "Accept-Ranges": "bytes",
+                            "X-Stream-Source": "cache-after-semaphore"
+                        }
+                    )
+            
+            # Generate new stream with timeout
+            try:
+                logger.info(f"Generating new stream for channel {channel_id} for client {client_id}")
+                stream_data = await asyncio.wait_for(
+                    free_sky.stream(channel_id),
+                    timeout=15.0  # Increased timeout for stream generation
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout generating stream for channel {channel_id} for client {client_id}")
+                # Clean up client tracking
+                if channel_id in active_streams:
+                    active_streams[channel_id].discard(client_id)
+                return JSONResponse(
+                    content={"error": "Stream generation timeout"},
+                    status_code=status.HTTP_504_GATEWAY_TIMEOUT
+                )
+            
+            # Cache the result (LRU cache handles cleanup)
+            stream_cache[cache_key] = (stream_data, current_time)
+            logger.info(f"Successfully generated and cached stream for channel {channel_id}")
         
         return Response(
             content=stream_data,
             media_type="application/vnd.apple.mpegurl",
             headers={
-                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                 "Access-Control-Allow-Headers": "*",
                 "Access-Control-Expose-Headers": "*",
                 "Cache-Control": "no-cache, no-store, must-revalidate",
                 "Pragma": "no-cache",
                 "Expires": "0",
-                "Accept-Ranges": "bytes"
+                "Accept-Ranges": "bytes",
+                "X-Stream-Source": "generated"
             }
         )
     except IndexError:
+        # Clean up client tracking
+        if channel_id in active_streams:
+            active_streams[channel_id].discard(client_id)
         return JSONResponse(content={"error": "Stream not found"}, status_code=status.HTTP_404_NOT_FOUND)
     except Exception as e:
-        logger.error(f"Error streaming channel {channel_id}: {str(e)}")
+        logger.error(f"Error streaming channel {channel_id} for client {client_id}: {str(e)}")
+        # Clean up client tracking
+        if channel_id in active_streams:
+            active_streams[channel_id].discard(client_id)
         return JSONResponse(content={"error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        # Clean up inactive streams
+        if channel_id in active_streams:
+            if client_id in active_streams[channel_id]:
+                # Keep client in active streams since they successfully got the stream
+                pass
+            # Clean up empty channel entries
+            if not active_streams[channel_id]:
+                del active_streams[channel_id]
 
 @fastapi_app.get("/api/key/{url}/{host}")
 async def key(url: str, host: str):
@@ -230,18 +285,27 @@ async def content_options(path: str):
     )
 
 @fastapi_app.get("/api/content/{path}")
-async def content(path: str):
+async def content(path: str, request: Request):
     try:
-        async with _stream_semaphore:  # Control concurrent streams
+        # Use dedicated content semaphore for higher throughput
+        async with _content_semaphore:
+            client_ip = request.client.host if request.client else "unknown"
+            logger.debug(f"Proxying content for client {client_ip}: {path}")
+            
             async def proxy_stream():
-                async with client.stream("GET", free_sky.content_url(path), timeout=30) as response:
-                    async for chunk in response.aiter_bytes(chunk_size=4 * 1024):  # Optimized chunks for lower latency
-                        yield chunk
+                try:
+                    async with client.stream("GET", free_sky.content_url(path), timeout=60) as response:
+                        async for chunk in response.aiter_bytes(chunk_size=8 * 1024):  # Larger chunks for better throughput
+                            yield chunk
+                except Exception as e:
+                    logger.error(f"Error in proxy stream for {client_ip}: {str(e)}")
+                    raise
+            
             return StreamingResponse(
                 proxy_stream(), 
                 media_type="application/octet-stream",
                 headers={
-                            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                     "Access-Control-Allow-Headers": "*",
                     "Access-Control-Expose-Headers": "*",
                     "Cache-Control": "public, max-age=3600",
@@ -433,10 +497,17 @@ async def ping():
 
 @fastapi_app.get("/health")
 async def health():
+    # Calculate total active streams
+    total_active_streams = sum(len(clients) for clients in active_streams.values())
+    
     return {
         "status": "healthy",
         "channels_count": len(free_sky.channels),
         "cache_size": len(stream_cache),
+        "active_channels": len(active_streams),
+        "total_active_streams": total_active_streams,
+        "max_concurrent_streams": max_concurrent_streams,
+        "stream_utilization": f"{(total_active_streams / max_concurrent_streams) * 100:.1f}%",
         "uptime": time.time()
     }
 

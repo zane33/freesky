@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import reflex as rx
 import logging
@@ -27,8 +28,10 @@ class Channel(rx.Base):
 class StepDaddy:
     def __init__(self):
         socks5 = config.socks5
+        max_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "10"))
+        
         session_config = {
-            "timeout": 30,  # Add timeout to prevent hanging requests
+            "timeout": 45,  # Longer timeout for high-concurrency streaming
             "impersonate": "chrome110",  # Better browser impersonation
             "max_redirects": 5,  # Limit redirects
         }
@@ -42,6 +45,8 @@ class StepDaddy:
         self._load_lock = asyncio.Lock()  # Prevent concurrent channel loading
         with open("freesky/meta.json", "r") as f:
             self._meta = json.load(f)
+        
+        logger.info(f"StepDaddy initialized with max_streams: {max_streams}")
 
     def _headers(self, referer: str = None, origin: str = None):
         if referer is None:
@@ -183,9 +188,12 @@ class StepDaddy:
     _stream_semaphore = None
     
     def _get_stream_semaphore(self):
-        """Get or create stream semaphore"""
+        """Get or create stream semaphore with configurable limit"""
         if self._stream_semaphore is None:
-            self._stream_semaphore = asyncio.Semaphore(10)  # Limit to 10 concurrent stream requests
+            # Get max concurrent streams from environment
+            max_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "10"))
+            self._stream_semaphore = asyncio.Semaphore(max_streams)
+            logger.info(f"Created stream semaphore with limit: {max_streams}")
         return self._stream_semaphore
 
     async def key(self, url: str, host: str):

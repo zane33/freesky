@@ -28,6 +28,7 @@ api_url = os.environ.get("API_URL", "http://0.0.0.0:8005")  # Use backend port a
 backend_uri = os.environ.get("BACKEND_URI", "http://0.0.0.0:8005")  # Backend service
 backend_port = int(os.environ.get("BACKEND_PORT", "8005"))
 workers = int(os.environ.get("WORKERS", "3"))
+max_concurrent_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "10"))
 
 # Configure logging
 logging.basicConfig(
@@ -175,12 +176,12 @@ def run():
         loop="asyncio",
         ws_ping_interval=None,  # We handle pings ourselves
         ws_ping_timeout=None,
-        timeout_keep_alive=60,  # Longer keepalive for streaming
-        backlog=4096,  # Larger backlog for more concurrent connections
-        limit_concurrency=2000,  # Higher concurrency limit
-        limit_max_requests=20000,  # More requests per worker
-        timeout_graceful_shutdown=15,
-        h11_max_incomplete_event_size=16 * 1024 * 1024,  # 16MB for large streaming chunks
+        timeout_keep_alive=120,  # Longer keepalive for streaming
+        backlog=max_concurrent_streams * 100,  # Dynamic backlog based on concurrent streams
+        limit_concurrency=max_concurrent_streams * 50,  # Higher concurrency limit based on streams
+        limit_max_requests=max_concurrent_streams * 1000,  # More requests per worker
+        timeout_graceful_shutdown=30,  # Longer shutdown time for stream cleanup
+        h11_max_incomplete_event_size=32 * 1024 * 1024,  # 32MB for large streaming chunks
     )
     server = uvicorn.Server(config)
     server.run()
