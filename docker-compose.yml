@@ -1,48 +1,62 @@
+version: '3.8'
+
 services:
   freesky:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    # Use container networking - share network namespace with existing container
-    network_mode: "container:1127bc9a124ee5265b213c73cae979e188d5f5b19566adbd5cb8abdc4a786fc7"
-    # Ports are not needed when using container networking
+    # Using pre-built image from https://github.com/zane33/freesky
+    image: freesky-freesky:latest
     
+    # Use container networking - share network namespace with existing container
+    # Replace with actual container ID/name or comment out for default networking
+    network_mode: "container:1127bc9a124ee5265b213c73cae979e188d5f5b19566adbd5cb8abdc4a786fc7"
+    
+    # Ports are not needed when using container networking
+    # Comment out if using container networking
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
       - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
       - "2019:2019"  # Expose Caddy admin port for debugging
+    
     environment:
+      # Application Configuration
       - PORT=${PORT:-3000}
       - BACKEND_PORT=${BACKEND_PORT:-8005}
       - HOST_IP=${HOST_IP:-}  # Dynamic host IP, will use 0.0.0.0 if not set
       - BACKEND_URI=${BACKEND_URI:-}  # Let rxconfig determine this dynamically
       - API_URL=${API_URL:-}  # Let rxconfig determine this dynamically
+      
+      # External Services
       - DADDYLIVE_URI=${DADDYLIVE_URI:-https://thedaddy.click}
+      
+      # Application Settings
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
       - SOCKS5=${SOCKS5:-}
       - WORKERS=${WORKERS:-3}  # Reduced from 6 to 3 workers
       - MAX_CONCURRENT_STREAMS=${MAX_CONCURRENT_STREAMS:-10}  # Configurable concurrent streaming limit
+      
+      # Reflex Framework Settings
       - REFLEX_ENV=prod
       - REFLEX_SKIP_COMPILE=1
-      # Add proxy environment variables
+      
+      # Proxy Configuration
       - HTTP_PROXY=${HTTP_PROXY:-}
       - HTTPS_PROXY=${HTTPS_PROXY:-}
       - NO_PROXY=localhost,127.0.0.1
+    
+    # Resource Limits
     deploy:
       resources:
         limits:
           memory: 1G
         reservations:
           memory: 512M
+    
+    # Restart Policy
     restart: unless-stopped
+    
+    # Health Check
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${PORT:-3000}/health", "||", "exit", "1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
-
-# Remove networks section when using container networking
-#networks:
-  #freesky-network:
-     #driver: bridge
