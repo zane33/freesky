@@ -1,10 +1,10 @@
 services:
   freesky:
     # Build from local repository Dockerfile
-    build: .
-    image: freesky:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     
-    # Use container networking - share network namespace with existing container
     # Replace with actual container ID/name or comment out for default networking
     network_mode: "container:transmission-openvpn"
     
