@@ -7,7 +7,7 @@ services:
     
     # Use container networking - share network namespace with existing container
     # Replace with actual container ID/name or comment out for default networking
-    network_mode: "container:1127bc9a124ee5265b213c73cae979e188d5f5b19566adbd5cb8abdc4a786fc7"
+    network_mode: "container:transmission-openvpn"
     
     # Ports are not needed when using container networking
     # Comment out if using container networking
