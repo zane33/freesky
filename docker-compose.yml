@@ -11,10 +11,10 @@ services:
     
     # Ports are not needed when using container networking
     # Comment out if using container networking
-    ports:
-      - "${PORT:-3000}:${PORT:-3000}"
-      - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
-      - "2019:2019"  # Expose Caddy admin port for debugging
+    #ports:
+    #  - "${PORT:-3000}:${PORT:-3000}"
+    #  - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
+    #  - "2019:2019"  # Expose Caddy admin port for debugging
     
     environment:
       # Application Configuration
