@@ -21,6 +21,7 @@ services:
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
       - SOCKS5=${SOCKS5:-}
       - WORKERS=${WORKERS:-3}  # Reduced from 6 to 3 workers
+      - MAX_CONCURRENT_STREAMS=${MAX_CONCURRENT_STREAMS:-10}  # Configurable concurrent streaming limit
       - REFLEX_ENV=prod
       - REFLEX_SKIP_COMPILE=1
       # Add proxy environment variables

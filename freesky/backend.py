@@ -82,7 +82,7 @@ cache_ttl = 30  # 30 seconds for live streaming freshness
 
 # Track active tasks and streaming sessions for cleanup
 active_tasks: Dict[str, asyncio.Task] = {}
-active_streams: Dict[str, Set[str]] = {}  # Track clients per channel
+active_streams: Dict[str, Dict[str, float]] = {}  # Track clients per channel with timestamps
 
 # Concurrency control for streaming with configurable limits
 _stream_semaphore = asyncio.Semaphore(max_concurrent_streams)
@@ -140,23 +140,24 @@ async def add_process_time_header(request: Request, call_next):
 # OPTIONS handler removed - CORS preflight handled by Caddy
 
 @fastapi_app.get("/stream/{channel_id}.m3u8")
-@fastapi_app.get("/api/stream/{channel_id}.m3u8")
-async def stream(channel_id: str, request: Request):
+@fastapi_app.get("/api/stream/{channel_id}.m3u8") 
+async def stream(channel_id: str):
     try:
-        # Generate unique client ID for tracking
-        client_ip = request.client.host if request.client else "unknown"
-        client_id = f"{client_ip}_{id(request)}"
+        # Get current time for tracking and caching
+        current_time = time.time()
         
-        # Track active streams per channel
+        # Generate unique client ID for tracking (simplified without request object)
+        client_id = f"stream_{current_time}_{id(asyncio.current_task())}"
+        
+        # Track active streams per channel with timestamp
         if channel_id not in active_streams:
-            active_streams[channel_id] = set()
-        active_streams[channel_id].add(client_id)
+            active_streams[channel_id] = {}
+        active_streams[channel_id][client_id] = current_time
         
         logger.info(f"Client {client_id} requesting stream for channel {channel_id}. Active streams: {len(active_streams[channel_id])}")
         
         # Check cache first
         cache_key = f"stream_{channel_id}"
-        current_time = time.time()
         
         if cache_key in stream_cache:
             cached_data, cached_time = stream_cache[cache_key]
@@ -203,8 +204,8 @@ async def stream(channel_id: str, request: Request):
             except asyncio.TimeoutError:
                 logger.error(f"Timeout generating stream for channel {channel_id} for client {client_id}")
                 # Clean up client tracking
-                if channel_id in active_streams:
-                    active_streams[channel_id].discard(client_id)
+                if channel_id in active_streams and client_id in active_streams[channel_id]:
+                    del active_streams[channel_id][client_id]
                 return JSONResponse(
                     content={"error": "Stream generation timeout"},
                     status_code=status.HTTP_504_GATEWAY_TIMEOUT
@@ -230,24 +231,25 @@ async def stream(channel_id: str, request: Request):
         )
     except IndexError:
         # Clean up client tracking
-        if channel_id in active_streams:
-            active_streams[channel_id].discard(client_id)
+        if channel_id in active_streams and client_id in active_streams[channel_id]:
+            del active_streams[channel_id][client_id]
         return JSONResponse(content={"error": "Stream not found"}, status_code=status.HTTP_404_NOT_FOUND)
     except Exception as e:
         logger.error(f"Error streaming channel {channel_id} for client {client_id}: {str(e)}")
         # Clean up client tracking
-        if channel_id in active_streams:
-            active_streams[channel_id].discard(client_id)
+        if channel_id in active_streams and client_id in active_streams[channel_id]:
+            del active_streams[channel_id][client_id]
         return JSONResponse(content={"error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     finally:
-        # Clean up inactive streams
-        if channel_id in active_streams:
-            if client_id in active_streams[channel_id]:
-                # Keep client in active streams since they successfully got the stream
-                pass
+        # Clean up completed stream requests
+        if channel_id in active_streams and client_id in active_streams[channel_id]:
+            del active_streams[channel_id][client_id]
+            logger.debug(f"Cleaned up client {client_id} from channel {channel_id}")
+            
             # Clean up empty channel entries
             if not active_streams[channel_id]:
                 del active_streams[channel_id]
+                logger.debug(f"Removed empty channel {channel_id} from active streams")
 
 @fastapi_app.get("/api/key/{url}/{host}")
 async def key(url: str, host: str):
@@ -285,12 +287,11 @@ async def content_options(path: str):
     )
 
 @fastapi_app.get("/api/content/{path}")
-async def content(path: str, request: Request):
+async def content(path: str):
     try:
         # Use dedicated content semaphore for higher throughput
         async with _content_semaphore:
-            client_ip = request.client.host if request.client else "unknown"
-            logger.debug(f"Proxying content for client {client_ip}: {path}")
+            logger.debug(f"Proxying content: {path}")
             
             async def proxy_stream():
                 try:
@@ -298,7 +299,7 @@ async def content(path: str, request: Request):
                         async for chunk in response.aiter_bytes(chunk_size=8 * 1024):  # Larger chunks for better throughput
                             yield chunk
                 except Exception as e:
-                    logger.error(f"Error in proxy stream for {client_ip}: {str(e)}")
+                    logger.error(f"Error in proxy stream: {str(e)}")
                     raise
             
             return StreamingResponse(
@@ -497,7 +498,24 @@ async def ping():
 
 @fastapi_app.get("/health")
 async def health():
-    # Calculate total active streams
+    # Calculate total active streams and clean up stale entries
+    current_time = time.time()
+    stale_timeout = 300  # 5 minutes timeout for stale entries
+    
+    for channel_id in list(active_streams.keys()):
+        # Remove stale entries (older than 5 minutes)
+        stale_clients = [
+            client_id for client_id, timestamp in active_streams[channel_id].items()
+            if current_time - timestamp > stale_timeout
+        ]
+        for client_id in stale_clients:
+            del active_streams[channel_id][client_id]
+            logger.debug(f"Removed stale client {client_id} from channel {channel_id}")
+        
+        # Remove empty channels
+        if not active_streams[channel_id]:
+            del active_streams[channel_id]
+    
     total_active_streams = sum(len(clients) for clients in active_streams.values())
     
     return {

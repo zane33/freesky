@@ -109,9 +109,9 @@ The `docker-compose.yml` file provides a production-ready setup with:
   - DNS configuration for reliable name resolution
 
 - **Environment Variables**:
-  - Flexible configuration through environment variables
-  - Default values for quick deployment
-  - Support for proxy settings
+  - Comprehensive configuration through environment variables
+  - Production-ready defaults for quick deployment
+  - Support for concurrent streaming, proxy settings, and scaling
 
 - **Resource Management**:
   - Automatic container restart
@@ -120,30 +120,200 @@ The `docker-compose.yml` file provides a production-ready setup with:
 
 Example `docker-compose.yml`:
 ```yaml
-version: '3.8'
 services:
-  step-daddy-live-hd:
+  freesky:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
       - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
-      - "2019:2019"  # Caddy admin port
+      - "2019:2019"  # Caddy admin port for debugging
     environment:
       - PORT=${PORT:-3000}
       - BACKEND_PORT=${BACKEND_PORT:-8005}
-      - API_URL=http://localhost:${PORT:-3000}
+      - HOST_IP=${HOST_IP:-}  # Dynamic host IP, will use 0.0.0.0 if not set
+      - BACKEND_URI=${BACKEND_URI:-}  # Let rxconfig determine this dynamically
+      - API_URL=${API_URL:-}  # Let rxconfig determine this dynamically
       - DADDYLIVE_URI=${DADDYLIVE_URI:-https://thedaddy.click}
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
       - SOCKS5=${SOCKS5:-}
-      - WORKERS=${WORKERS:-6}
+      - WORKERS=${WORKERS:-3}  # Backend worker processes
+      - MAX_CONCURRENT_STREAMS=${MAX_CONCURRENT_STREAMS:-10}  # Concurrent streaming limit
+      - REFLEX_ENV=prod
+      - REFLEX_SKIP_COMPILE=1
     networks:
-      step-daddy-network:
-        aliases:
-          - step-daddy-live-hd
+      freesky-network:
+        driver: bridge
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-3000}/health", "||", "exit", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 ```
+
+---
+
+## ⚙️ Environment Variables
+
+freesky provides comprehensive configuration through environment variables, allowing you to customize the application for different deployment scenarios. All variables have sensible defaults for quick deployment.
+
+### 🌐 Network Configuration
+
+| Variable | Default | Description | Example |
+|----------|---------|-------------|---------|
+| `PORT` | `3000` | Frontend port for web interface | `PORT=8080` |
+| `BACKEND_PORT` | `8005` | Backend API server port | `BACKEND_PORT=9000` |
+| `HOST_IP` | `0.0.0.0` | Host IP for binding services | `HOST_IP=192.168.1.100` |
+| `API_URL` | *auto-detected* | External API URL for client connections | `API_URL=https://mydomain.com` |
+| `BACKEND_URI` | *auto-detected* | Internal backend service URL | `BACKEND_URI=http://localhost:8005` |
+
+### 🚀 Performance & Scaling
+
+| Variable | Default | Description | Recommendations |
+|----------|---------|-------------|-----------------|
+| `WORKERS` | `3` | Number of backend worker processes | `1-2` for small deployments<br>`3-6` for medium traffic<br>`6-12` for high traffic |
+| `MAX_CONCURRENT_STREAMS` | `10` | Maximum concurrent streaming connections | `5-10` for basic use<br>`15-25` for medium traffic<br>`50+` for high-capacity servers |
+
+### 📺 Content Configuration
+
+| Variable | Default | Description | Usage |
+|----------|---------|-------------|-------|
+| `DADDYLIVE_URI` | `https://thedaddy.click` | Content provider URL | Change if using alternative provider |
+| `PROXY_CONTENT` | `TRUE` | Enable content proxying through backend | `TRUE` for better CORS handling<br>`FALSE` for lower server load |
+| `SOCKS5` | *(empty)* | SOCKS5 proxy for external requests | `SOCKS5=127.0.0.1:1080` |
+
+### 🔧 Development & Production
+
+| Variable | Default | Description | When to Use |
+|----------|---------|-------------|-------------|
+| `REFLEX_ENV` | `prod` | Reflex environment mode | `dev` for development<br>`prod` for production |
+| `REFLEX_SKIP_COMPILE` | `1` | Skip frontend compilation | `1` for Docker builds<br>`0` for development |
+
+### 📊 Configuration Examples
+
+#### **Basic Home Setup**
+```bash
+# Simple home deployment
+PORT=3000
+BACKEND_PORT=8005
+WORKERS=2
+MAX_CONCURRENT_STREAMS=5
+PROXY_CONTENT=TRUE
+```
+
+#### **Medium Traffic Server**
+```bash
+# Office or small business
+PORT=3000
+BACKEND_PORT=8005
+WORKERS=4
+MAX_CONCURRENT_STREAMS=20
+PROXY_CONTENT=TRUE
+API_URL=https://tv.yourdomain.com
+```
+
+#### **High-Capacity Production**
+```bash
+# Large-scale deployment
+PORT=3000
+BACKEND_PORT=8005
+WORKERS=8
+MAX_CONCURRENT_STREAMS=50
+PROXY_CONTENT=FALSE  # Direct streaming for lower server load
+API_URL=https://iptv.yourdomain.com
+HOST_IP=10.0.1.100
+```
+
+#### **Development Environment**
+```bash
+# Local development
+PORT=3000
+BACKEND_PORT=8005
+WORKERS=1
+MAX_CONCURRENT_STREAMS=3
+PROXY_CONTENT=TRUE
+REFLEX_ENV=dev
+REFLEX_SKIP_COMPILE=0
+```
+
+### 🛠️ Environment File Setup
+
+Create a `.env` file in your project root:
+
+```bash
+# Create environment file
+cat > .env << EOF
+PORT=3000
+BACKEND_PORT=8005
+WORKERS=4
+MAX_CONCURRENT_STREAMS=15
+PROXY_CONTENT=TRUE
+DADDYLIVE_URI=https://thedaddy.click
+API_URL=http://192.168.1.100:3000
+REFLEX_ENV=prod
+REFLEX_SKIP_COMPILE=1
+EOF
+
+# Deploy with environment file
+docker-compose up -d
+```
+
+### 📈 Performance Impact
+
+#### **WORKERS vs MAX_CONCURRENT_STREAMS**
+
+- **WORKERS**: Controls **process-level** concurrency
+  - Each worker is a separate Python process
+  - Bypasses Python GIL limitations
+  - Recommended: 1 worker per CPU core
+
+- **MAX_CONCURRENT_STREAMS**: Controls **thread-level** concurrency per worker
+  - Handles async I/O operations within each process
+  - Memory usage scales with this limit
+  - Recommended: 5-10 streams per worker
+
+#### **Optimal Scaling Formula**
+```
+Total Capacity = WORKERS × MAX_CONCURRENT_STREAMS
+
+Examples:
+- 4 workers × 10 streams = 40 concurrent streams
+- 6 workers × 15 streams = 90 concurrent streams
+- 8 workers × 20 streams = 160 concurrent streams
+```
+
+### 🔍 Monitoring Configuration
+
+Check your current configuration:
+```bash
+# View environment in running container
+docker exec <container_name> env | grep -E "(PORT|WORKERS|MAX_CONCURRENT|API_URL|PROXY_CONTENT)"
+
+# Check streaming capacity
+curl http://localhost:3000/api/health
+```
+
+Expected health response:
+```json
+{
+  "status": "healthy",
+  "channels_count": 688,
+  "max_concurrent_streams": 15,
+  "total_active_streams": 3,
+  "stream_utilization": "20.0%",
+  "active_channels": 2
+}
+```
+
+### ⚠️ Important Notes
+
+1. **Memory Usage**: Each concurrent stream uses ~10-50MB RAM
+2. **CPU Usage**: Workers should not exceed available CPU cores
+3. **Network**: Higher `MAX_CONCURRENT_STREAMS` requires more bandwidth
+4. **Storage**: Logs and cache scale with concurrent connections
 
 ---
 
@@ -195,17 +365,20 @@ The backend is built with **FastAPI** and provides REST API endpoints for data p
 #### **Key Backend Features:**
 - **🚀 FastAPI**: High-performance async web framework
 - **📊 Data Processing**: Channel parsing and IPTV stream handling
-- **🎭 Content Proxying**: Optional video stream proxying
+- **🎭 Content Proxying**: Optional video stream proxying with concurrent handling
 - **🔒 CORS Handling**: Cross-origin request management
-- **⚡ Caching**: Intelligent caching for improved performance
+- **⚡ Intelligent Caching**: Stream caching with LRU eviction and TTL
 - **🔄 Background Tasks**: Periodic channel updates and monitoring
+- **🎯 Concurrent Streaming**: Multithreaded streaming with configurable limits
+- **📈 Real-time Monitoring**: Stream utilization and performance metrics
 
 #### **Backend Technologies:**
 - **FastAPI**: Modern Python web framework for API endpoints
 - **Reflex Integration**: Seamless integration with Reflex state system
-- **Uvicorn**: ASGI server with multiple workers
-- **Aiohttp**: Async HTTP client for external requests
-- **Python 3.13**: Latest Python with async/await support
+- **Uvicorn**: ASGI server with configurable multiple workers
+- **HTTPX**: Modern HTTP client with HTTP/2 and connection pooling
+- **Asyncio**: Advanced concurrency with semaphores and connection management
+- **Python 3.13**: Latest Python with enhanced async/await support
 
 ### 📡 Communication Protocols
 
@@ -322,10 +495,16 @@ User → Reflex Frontend → Backend → Stream URL → Frontend → External St
   - ❌ Potential CORS issues
   - ❌ Limited control over streams
 
-#### **WORKERS Configuration**
-- **Purpose**: Number of backend worker processes
-- **Impact**: Affects concurrent user capacity
-- **Recommendation**: 1 worker per 50-100 concurrent users
+#### **Performance Configuration**
+- **WORKERS**: Number of backend worker processes
+  - **Purpose**: Process-level concurrency for CPU-bound tasks
+  - **Impact**: Affects overall request handling capacity
+  - **Recommendation**: 1 worker per CPU core (typically 2-8 workers)
+  
+- **MAX_CONCURRENT_STREAMS**: Thread-level streaming concurrency per worker
+  - **Purpose**: Controls concurrent streaming connections
+  - **Impact**: Memory usage and streaming capacity
+  - **Recommendation**: 5-15 streams per worker (total = WORKERS × MAX_CONCURRENT_STREAMS)
 
 ### 🔍 Real-time Features
 
@@ -399,8 +578,22 @@ async def stream(channel_id: str):
 
 #### **Health Endpoints**
 ```
-GET /health                    # Basic health check with channel count
-GET /ping                     # Simple ping endpoint
+GET /health                    # Comprehensive health check with streaming metrics
+GET /ping                     # Simple ping endpoint with channel count
+```
+
+**Health Response Example:**
+```json
+{
+  "status": "healthy",
+  "channels_count": 688,
+  "cache_size": 15,
+  "active_channels": 3,
+  "total_active_streams": 8,
+  "max_concurrent_streams": 20,
+  "stream_utilization": "40.0%",
+  "uptime": 1752463063.68
+}
 ```
 
 #### **Reflex State Monitoring**
@@ -419,11 +612,14 @@ class State(rx.State):
 ```
 
 #### **Backend Performance Metrics**
-- **Channel Count**: Number of available channels
-- **Cache Performance**: Stream cache hit rates
-- **Response Times**: Average API response times
-- **Error Rates**: Failed request percentages
-- **Background Tasks**: Channel update task status
+- **Channel Count**: Number of available channels (688+)
+- **Concurrent Streaming**: Active streams vs maximum capacity
+- **Stream Utilization**: Percentage of streaming capacity in use
+- **Cache Performance**: Stream cache hit rates and LRU efficiency
+- **Response Times**: Average API response times with X-Process-Time headers
+- **Error Rates**: Failed request percentages and timeout handling
+- **Background Tasks**: Channel update task status and health
+- **Connection Pooling**: HTTP client connection reuse and keep-alive stats
 
 This architecture ensures scalable, real-time performance using Reflex's reactive state management system, eliminating the complexity of manual WebSocket handling while providing instant UI updates.
 

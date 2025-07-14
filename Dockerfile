@@ -54,7 +54,9 @@ RUN echo "Building frontend with API_URL=$API_URL" && \
     (cd /app && \
      reflex init && \
      cd .web && \
-     npm install --legacy-peer-deps && \
+     npm config set strict-ssl false && \
+     npm config set registry https://registry.npmjs.org/ && \
+     (npm install --legacy-peer-deps || npm install --legacy-peer-deps --verbose) && \
      cd .. && \
      reflex export --frontend-only --no-zip && \
      mv .web/build/client/* /srv/ && \
