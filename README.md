@@ -472,11 +472,12 @@ rx.foreach(State.filtered_channels, channel_card)
 
 #### **3. Video Streaming Flow**
 ```
-With PROXY_CONTENT=TRUE:
-User → Reflex Frontend → Backend → External Stream → Backend → User
+With PROXY_CONTENT=TRUE (Isolated Streaming):
+User → Reflex Frontend → Backend → New HTTP Client → New TCP Connection → Upstream → Backend → User
+Each stream creates isolated client and connection
 
-With PROXY_CONTENT=FALSE:
-User → Reflex Frontend → Backend → Stream URL → Frontend → External Stream
+With PROXY_CONTENT=FALSE (Direct Streaming):
+User → Reflex Frontend → Backend → Stream URL → Frontend → Direct Connection → Upstream
 ```
 
 ### 🛠️ Configuration Impact on Communication
@@ -488,14 +489,20 @@ User → Reflex Frontend → Backend → Stream URL → Frontend → External St
 - **Impact**: Affects all API calls and WebSocket connections
 
 #### **PROXY_CONTENT Configuration**
-- **TRUE**: All video streams proxied through backend
+- **TRUE**: All video streams proxied through backend with complete isolation
   - ✅ Better CORS handling
   - ✅ Unified authentication
+  - ✅ Isolated HTTP clients per stream
+  - ✅ Independent TCP connections
+  - ✅ Real-time session tracking
   - ⚠️ Higher bandwidth usage
+  - ⚠️ More memory per stream
 - **FALSE**: Direct streaming from external sources
   - ✅ Lower server load
+  - ✅ Reduced memory usage
   - ❌ Potential CORS issues
   - ❌ Limited control over streams
+  - ❌ No session isolation benefits
 
 #### **Performance Configuration**
 - **WORKERS**: Number of backend worker processes
@@ -504,8 +511,9 @@ User → Reflex Frontend → Backend → Stream URL → Frontend → External St
   - **Recommendation**: 1 worker per CPU core (typically 2-8 workers)
   
 - **MAX_CONCURRENT_STREAMS**: Thread-level streaming concurrency per worker
-  - **Purpose**: Controls concurrent streaming connections
-  - **Impact**: Memory usage and streaming capacity
+  - **Purpose**: Controls concurrent streaming connections with isolation
+  - **Implementation**: Each stream gets dedicated HTTP client and TCP connection
+  - **Impact**: Memory usage and streaming capacity (higher per stream due to isolation)
   - **Recommendation**: 5-15 streams per worker (total = WORKERS × MAX_CONCURRENT_STREAMS)
 
 ### 🔍 Real-time Features
@@ -524,6 +532,12 @@ User → Reflex Frontend → Backend → Stream URL → Frontend → External St
 - **Purpose**: Keep channel data fresh automatically
 - **Technology**: Background asyncio tasks with state updates
 - **Control**: User can toggle auto-refresh on/off
+
+#### **Real-time Stream Monitoring**
+- **Purpose**: Live tracking of active streaming sessions
+- **Technology**: Per-stream session tracking with isolated clients
+- **Updates**: Session count updates in real-time (30-second cleanup cycle)
+- **Metrics**: Individual stream isolation and connection status
 
 ### 🚨 Error Handling
 
@@ -545,17 +559,22 @@ async def load_channels(self):
         self.is_loading = False
 ```
 
-#### **API Timeouts**
+#### **API Timeouts and Stream Isolation**
 ```python
-# Backend implements timeout handling with fallback
-@fastapi_app.get("/stream/{channel_id}")
-async def stream(channel_id: str):
+# Backend implements isolated streaming with timeout handling
+@fastapi_app.get("/api/content/{path}")
+async def content(path: str):
+    # Create isolated client for this specific stream
+    isolated_client = create_isolated_stream_client()
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(stream_url)
-            return response.content
+        async with isolated_client.stream("GET", stream_url, timeout=60) as response:
+            async for chunk in response.aiter_bytes():
+                yield chunk
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Stream timeout")
+    finally:
+        # Always close isolated client
+        await isolated_client.aclose()
 ```
 
 ### 🔒 Security Considerations
