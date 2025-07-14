@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   freesky:
     # Using pre-built image from https://github.com/zane33/freesky
