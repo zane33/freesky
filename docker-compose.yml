@@ -1,7 +1,8 @@
 services:
   freesky:
-    # Using pre-built image from https://github.com/zane33/freesky
-    image: freesky-freesky:latest
+    # Build from local repository Dockerfile
+    build: .
+    image: freesky:latest
     
     # Use container networking - share network namespace with existing container
     # Replace with actual container ID/name or comment out for default networking
