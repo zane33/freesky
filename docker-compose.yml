@@ -19,7 +19,7 @@ services:
       # Application Configuration
       - PORT=${PORT:-3000}
       - BACKEND_PORT=${BACKEND_PORT:-8005}
-      - HOST_IP=${HOST_IP:-}  # Dynamic host IP, will use 0.0.0.0 if not set
+      - HOST_IP=${HOST_IP:-0.0.0.0}  # Dynamic host IP, will use 0.0.0.0 if not set
       - BACKEND_URI=${BACKEND_URI:-}  # Let rxconfig determine this dynamically
       - API_URL=${API_URL:-}  # Let rxconfig determine this dynamically
       

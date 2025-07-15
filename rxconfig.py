@@ -9,8 +9,8 @@ frontend_port = int(os.environ.get("PORT", "3000"))
 backend_port = int(os.environ.get("BACKEND_PORT", "8005"))
 
 
-host_ip = os.environ.get("HOST_IP", "0.0.0.0")
-api_url = os.environ.get("API_URL", f"http://{host_ip}:{backend_port}")  # Use backend port for API URLs
+host_ip = os.environ.get("HOST_IP", "0.0.0.0") or "0.0.0.0"  # Handle empty string
+api_url = os.environ.get("API_URL", f"http://{host_ip}:{frontend_port}")  # Use frontend port for client-facing URLs
 backend_uri = os.environ.get("BACKEND_URI", f"http://{host_ip}:{backend_port}")  # Backend service
 daddylive_uri = os.environ.get("DADDYLIVE_URI", "https://thedaddy.click")
 proxy_content = os.environ.get("PROXY_CONTENT", "TRUE").lower() == "true"
