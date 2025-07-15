@@ -42,6 +42,8 @@ config = rx.Config(
     backend_uri=backend_uri,
     proxy_content=proxy_content,
     socks5=socks5,
+    host_ip=host_ip,
+    frontend_port=frontend_port,
     # Configure CSP headers with broader permissions for development
     frontend_headers={
         "Content-Security-Policy": (
