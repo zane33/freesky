@@ -19,6 +19,7 @@ socks5 = os.environ.get("SOCKS5", "")
 # Create config
 config = rx.Config(
     app_name="freesky",
+    host=host_ip,
     api_url=api_url,  # Frontend interface where clients connect
     backend_port=backend_port,  # Use proper backend port
     env=rx.Env.PROD,  # Use production mode
