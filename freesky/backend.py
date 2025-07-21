@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 frontend_port = int(os.environ.get("PORT", "3000"))
 backend_port = int(os.environ.get("BACKEND_PORT", "8005"))
 max_concurrent_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "10"))
-api_url = os.environ.get("API_URL", f"http://0.0.0.0:{backend_port}")  # Use backend port and bind to all interfaces
+api_url = os.environ.get("API_URL", f"http://0.0.0.0:{frontend_port}")  # Use frontend port for client-facing URLs
 
 # Parse API_URL to create WebSocket URL with backend port
 parsed_url = urlparse(api_url)

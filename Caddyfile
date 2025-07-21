@@ -66,7 +66,7 @@ handle_path /api/* {
 	reverse_proxy localhost:{$BACKEND_PORT}
 }
 
-handle_path /stream/* {
+handle_path /api/stream/* {
 	reverse_proxy localhost:{$BACKEND_PORT} {
 		flush_interval -1
 		header_up X-Real-IP {remote_host}
@@ -74,14 +74,14 @@ handle_path /stream/* {
 	}
 }
 
-handle_path /key/* {
+handle_path /api/key/* {
 	reverse_proxy localhost:{$BACKEND_PORT} {
 		flush_interval -1
 		header_up X-Real-IP {remote_host}
 	}
 }
 
-handle_path /content/* {
+handle_path /api/content/* {
 	reverse_proxy localhost:{$BACKEND_PORT} {
 		flush_interval -1
 		header_up X-Real-IP {remote_host}
