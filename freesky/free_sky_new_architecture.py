@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+"""
+Updated streaming architecture for dlhd.click with vidembed.re integration
+"""
 import json
 import os
 import re
@@ -25,15 +29,15 @@ class Channel(rx.Base):
     logo: str
 
 
-class StepDaddy:
+class StepDaddyNew:
     def __init__(self):
         socks5 = config.socks5
         max_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "10"))
         
         session_config = {
-            "timeout": 45,  # Longer timeout for high-concurrency streaming
-            "impersonate": "chrome110",  # Better browser impersonation
-            "max_redirects": 5,  # Limit redirects
+            "timeout": 45,
+            "impersonate": "chrome110",
+            "max_redirects": 5,
         }
         
         if socks5:
@@ -42,11 +46,11 @@ class StepDaddy:
         self._session = AsyncSession(**session_config)
         self._base_url = config.daddylive_uri
         self.channels = []
-        self._load_lock = asyncio.Lock()  # Prevent concurrent channel loading
+        self._load_lock = asyncio.Lock()
         with open("freesky/meta.json", "r") as f:
             self._meta = json.load(f)
         
-        logger.info(f"StepDaddy initialized with max_streams: {max_streams}")
+        logger.info(f"StepDaddyNew initialized with max_streams: {max_streams}")
 
     def _headers(self, referer: str = None, origin: str = None):
         if referer is None:
@@ -64,7 +68,6 @@ class StepDaddy:
         async with self._load_lock:
             channels = []
             try:
-                #Load in raw html from 24-7-channels.php
                 logger.debug(f"Starting channel load from {self._base_url}/24-7-channels.php")
                 response = await self._session.get(f"{self._base_url}/24-7-channels.php", headers=self._headers())
                 
@@ -74,12 +77,11 @@ class StepDaddy:
                     return
 
                 logger.debug("Looking for channels block in response")
-                # Find <
                 channels_block = re.compile("<center><h1(.+?)tab-2", re.MULTILINE | re.DOTALL).findall(str(response.text))
 
                 if not channels_block:
                     logger.error("No channels block found in response")
-                    logger.debug(f"Response text: {response.text[:500]}...")  # Log first 500 chars
+                    logger.debug(f"Response text: {response.text[:500]}...")
                     return
 
                 logger.debug("Found channels block, extracting channel data")
@@ -103,10 +105,9 @@ class StepDaddy:
 
                 logger.info(f"Successfully processed {len(channels)} channels")
             except Exception as e:
-                logger.error(f"Error loading channels: {str(e)}", exc_info=True)  # Add full traceback
-                # Don't raise the exception, just log it and keep existing channels
+                logger.error(f"Error loading channels: {str(e)}", exc_info=True)
             finally:
-                if channels:  # Only update if we successfully loaded channels
+                if channels:
                     logger.debug(f"Updating channels list with {len(channels)} channels")
                     self.channels = sorted(channels, key=lambda channel: (channel.name.startswith("18"), channel.name))
                 else:
@@ -139,7 +140,9 @@ class StepDaddy:
         return Channel(id=channel_id, name=channel_name, tags=meta.get("tags", []), logo=logo)
 
     async def stream(self, channel_id: str):
+        """New streaming method for dlhd.click with vidembed.re integration"""
         try:
+            # Step 1: Initial Stream Request
             url = f"{self._base_url}/stream/stream-{channel_id}.php"
             if len(channel_id) > 3:
                 url = f"{self._base_url}/stream/bet.php?id=bet{channel_id}"
@@ -147,44 +150,108 @@ class StepDaddy:
             # Use semaphore to limit concurrent stream requests
             semaphore = self._get_stream_semaphore()
             async with semaphore:
+                logger.debug(f"Making initial request to: {url}")
                 response = await self._session.post(url, headers=self._headers())
-                source_url = re.compile("iframe src=\"(.*)\" width").findall(response.text)[0]
-                source_response = await self._session.post(source_url, headers=self._headers(url))
-
-                # Not generic
-                channel_key = re.compile(r"var\s+channelKey\s*=\s*\"(.*?)\";").findall(source_response.text)[-1]
-                auth_ts = extract_and_decode_var("__c", source_response.text)
-                auth_sig = extract_and_decode_var("__e", source_response.text)
-                auth_path = extract_and_decode_var("__b", source_response.text)
-                auth_rnd = extract_and_decode_var("__d", source_response.text)
-                auth_url = extract_and_decode_var("__a", source_response.text)
-                auth_request_url = f"{auth_url}{auth_path}?channel_id={channel_key}&ts={auth_ts}&rnd={auth_rnd}&sig={auth_sig}"
-                auth_response = await self._session.get(auth_request_url, headers=self._headers(source_url))
-                if auth_response.status_code != 200:
-                    raise ValueError("Failed to get auth response")
-                key_url = urlparse(source_url)
-                key_url = f"{key_url.scheme}://{key_url.netloc}/server_lookup.php?channel_id={channel_key}"
-                key_response = await self._session.get(key_url, headers=self._headers(source_url))
-                server_key = key_response.json().get("server_key")
-                if not server_key:
-                    raise ValueError("No server key found in response")
-                if server_key == "top1/cdn":
-                    server_url = f"https://top1.newkso.ru/top1/cdn/{channel_key}/mono.m3u8"
+                
+                if response.status_code != 200:
+                    raise ValueError(f"Failed to get initial response: HTTP {response.status_code}")
+                
+                # Step 2: Extract vidembed URL (new pattern)
+                logger.debug("Looking for vidembed URL...")
+                vidembed_pattern = r'https://vidembed\.re/stream/[^"\']+'
+                vidembed_matches = re.findall(vidembed_pattern, response.text)
+                
+                if not vidembed_matches:
+                    raise ValueError("No vidembed URL found in response")
+                
+                vidembed_url = vidembed_matches[0]
+                logger.debug(f"Found vidembed URL: {vidembed_url}")
+                
+                # Step 3: Access vidembed page
+                logger.debug("Accessing vidembed page...")
+                vidembed_response = await self._session.get(vidembed_url, headers=self._headers(url))
+                
+                if vidembed_response.status_code != 200:
+                    raise ValueError(f"Failed to access vidembed page: HTTP {vidembed_response.status_code}")
+                
+                # Step 4: Extract stream information from vidembed page
+                logger.debug("Extracting stream information from vidembed page...")
+                
+                # Look for direct stream URLs in the vidembed response
+                stream_urls = self._extract_stream_urls(vidembed_response.text)
+                
+                if stream_urls:
+                    # If we found direct stream URLs, return the first one
+                    stream_url = stream_urls[0]
+                    logger.debug(f"Found direct stream URL: {stream_url}")
+                    
+                    # Fetch the stream content
+                    stream_response = await self._session.get(stream_url, headers=self._headers(vidembed_url))
+                    
+                    if stream_response.status_code == 200:
+                        # Process the stream content (M3U8, etc.)
+                        return self._process_stream_content(stream_response.text, vidembed_url)
+                    else:
+                        raise ValueError(f"Failed to fetch stream: HTTP {stream_response.status_code}")
                 else:
-                    server_url = f"https://{server_key}new.newkso.ru/{server_key}/{channel_key}/mono.m3u8"
-                m3u8 = await self._session.get(server_url, headers=self._headers(quote(str(source_url))))
-                m3u8_data = ""
-                for line in m3u8.text.split("\n"):
-                    if line.startswith("#EXT-X-KEY:"):
-                        original_url = re.search(r'URI="(.*?)"', line).group(1)
-                        line = line.replace(original_url, f"/api/key/{encrypt(original_url)}/{encrypt(urlparse(source_url).netloc)}")
-                    elif line.startswith("http") and config.proxy_content:
-                        line = f"/api/content/{encrypt(line)}"
-                    m3u8_data += line + "\n"
-                return m3u8_data
+                    # If no direct URLs found, the vidembed page might contain the player
+                    # We'll need to return the vidembed URL for client-side processing
+                    logger.debug("No direct stream URLs found, returning vidembed URL for client processing")
+                    return self._create_vidembed_response(vidembed_url)
+                
         except Exception as e:
             logger.error(f"Error in stream method for channel {channel_id}: {str(e)}")
             raise
+
+    def _extract_stream_urls(self, vidembed_content: str) -> List[str]:
+        """Extract direct stream URLs from vidembed content"""
+        stream_patterns = [
+            r'https://[^"\']*\.m3u8[^"\']*',
+            r'https://[^"\']*\.mp4[^"\']*',
+            r'https://[^"\']*stream[^"\']*',
+            r'https://[^"\']*cdn[^"\']*',
+        ]
+        
+        found_urls = []
+        for pattern in stream_patterns:
+            matches = re.findall(pattern, vidembed_content)
+            found_urls.extend(matches)
+        
+        # Remove duplicates and filter out non-stream URLs
+        unique_urls = list(set(found_urls))
+        stream_urls = [url for url in unique_urls if any(ext in url.lower() for ext in ['.m3u8', '.mp4', 'stream', 'cdn'])]
+        
+        return stream_urls
+
+    def _process_stream_content(self, content: str, referer: str) -> str:
+        """Process stream content (M3U8, etc.) and proxy URLs"""
+        if content.startswith('#EXTM3U'):
+            # This is an M3U8 playlist, process it
+            lines = content.split('\n')
+            processed_lines = []
+            
+            for line in lines:
+                if line.startswith('http') and config.proxy_content:
+                    # Proxy content URLs
+                    line = f"/api/content/{encrypt(line)}"
+                elif line.startswith('#EXT-X-KEY:'):
+                    # Process encryption keys
+                    original_url = re.search(r'URI="(.*?)"', line)
+                    if original_url:
+                        line = line.replace(original_url.group(1), f"/api/key/{encrypt(original_url.group(1))}/{encrypt(urlparse(referer).netloc)}")
+                
+                processed_lines.append(line)
+            
+            return '\n'.join(processed_lines)
+        else:
+            # Not an M3U8 playlist, return as is
+            return content
+
+    def _create_vidembed_response(self, vidembed_url: str) -> str:
+        """Create a response that includes the vidembed URL for client-side processing"""
+        # This could be a JSON response or a custom format
+        # For now, we'll return a simple text response with the URL
+        return f"VIDEMBED_URL:{vidembed_url}"
 
     # Semaphore for limiting concurrent stream requests
     _stream_semaphore = None
@@ -192,7 +259,6 @@ class StepDaddy:
     def _get_stream_semaphore(self):
         """Get or create stream semaphore with configurable limit"""
         if self._stream_semaphore is None:
-            # Get max concurrent streams from environment
             max_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "10"))
             self._stream_semaphore = asyncio.Semaphore(max_streams)
             logger.info(f"Created stream semaphore with limit: {max_streams}")
@@ -219,4 +285,4 @@ class StepDaddy:
 
     async def schedule(self):
         response = await self._session.get(f"{self._base_url}/schedule/schedule-generated.php", headers=self._headers())
-        return response.json()
+        return response.json() 

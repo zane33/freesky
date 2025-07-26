@@ -5,11 +5,14 @@ import logging
 import time
 from functools import lru_cache
 from typing import Optional, Dict, Tuple, Set
-from freesky.free_sky import StepDaddy, Channel
+from freesky.free_sky_hybrid import StepDaddyHybrid as StepDaddy
+from freesky.free_sky import Channel
 from fastapi import Response, status, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 # CORSMiddleware removed - CORS handled by Caddy
-from .utils import urlsafe_base64_decode
+from .utils import urlsafe_base64_decode, encrypt
+from .vidembed_extractor import extract_hls_from_vidembed
+from .multi_service_streamer import multi_streamer
 import json
 from urllib.parse import urlparse, urlunparse
 from collections import OrderedDict
@@ -100,6 +103,30 @@ active_tasks: Dict[str, asyncio.Task] = {}
 active_streams: Dict[str, Dict[str, float]] = {}  # Track M3U8 requests per channel with timestamps
 active_content_sessions: Dict[str, Dict[str, float]] = {}  # Track actual video streaming sessions
 session_to_channel: Dict[str, str] = {}  # Map session IDs to channel IDs
+
+def _process_stream_content(content: str, referer: str) -> str:
+    """Process stream content for proxying"""
+    if content.startswith('#EXTM3U'):
+        # Process M3U8 playlists
+        lines = content.split('\n')
+        processed_lines = []
+        
+        for line in lines:
+            if line.startswith('http') and config.proxy_content:
+                # Proxy content URLs
+                line = f"/api/content/{encrypt(line)}"
+            elif line.startswith('#EXT-X-KEY:'):
+                # Process encryption keys
+                original_url = re.search(r'URI="(.*?)"', line)
+                if original_url:
+                    line = line.replace(original_url.group(1), 
+                        f"/api/key/{encrypt(original_url.group(1))}/{encrypt(urlparse(referer).netloc)}")
+            
+            processed_lines.append(line)
+        
+        return '\n'.join(processed_lines)
+    else:
+        return content
 
 # Concurrency control for streaming with configurable limits
 _stream_semaphore = asyncio.Semaphore(max_concurrent_streams)
@@ -248,10 +275,57 @@ async def stream(channel_id: str):
             # Generate new stream with timeout
             try:
                 logger.info(f"Generating new stream for channel {channel_id} for client {client_id}")
+                
+                # Use multi-service streamer to try multiple upstream feeds
                 stream_data = await asyncio.wait_for(
-                    free_sky.stream(channel_id),
+                    multi_streamer.get_stream(channel_id),
                     timeout=15.0  # Increased timeout for stream generation
                 )
+                
+                if not stream_data:
+                    logger.error(f"No stream found for channel {channel_id} on any service")
+                    return JSONResponse(
+                        content={"error": "Stream not found on any service"},
+                        status_code=status.HTTP_404_NOT_FOUND
+                    )
+                
+                # Handle vidembed URLs - try to extract HLS stream
+                if stream_data.startswith("VIDEMBED_URL:"):
+                    vidembed_url = stream_data.replace("VIDEMBED_URL:", "")
+                    logger.info(f"Vidembed URL detected for channel {channel_id}, attempting HLS extraction")
+                    
+                    # For now, skip Playwright extraction in production and use M3U8 redirect
+                    # This avoids issues with headless browsers in Docker containers
+                    logger.info(f"Using M3U8 redirect for vidembed channel {channel_id}")
+                    stream_data = f"#EXTM3U\n#EXTINF:-1,Vidembed Stream\n{vidembed_url}"
+                    
+                    # TODO: Enable Playwright extraction when needed
+                    # try:
+                    #     # Try to extract HLS stream using Playwright
+                    #     hls_url = await extract_hls_from_vidembed(vidembed_url)
+                    #     if hls_url:
+                    #         logger.info(f"Successfully extracted HLS stream for channel {channel_id}: {hls_url}")
+                    #         
+                    #         # Fetch the actual HLS content
+                    #         async with create_isolated_stream_client() as client:
+                    #             hls_response = await client.get(hls_url, timeout=30.0)
+                    #             if hls_response.status_code == 200:
+                    #                 # Process the HLS content for proxying
+                    #                 processed_content = _process_stream_content(hls_response.text, hls_url)
+                    #                 stream_data = processed_content
+                    #                 logger.info(f"Successfully processed HLS stream for channel {channel_id}")
+                    #             else:
+                    #                 logger.warning(f"Failed to fetch HLS content for channel {channel_id}: {hls_response.status_code}")
+                    #                 # Fall back to vidembed redirect in M3U8 format
+                    #                 stream_data = f"#EXTM3U\n#EXTINF:-1,Vidembed Stream\n{vidembed_url}"
+                    #     else:
+                    #         logger.warning(f"Failed to extract HLS stream for channel {channel_id}, falling back to vidembed redirect in M3U8 format")
+                    #         stream_data = f"#EXTM3U\n#EXTINF:-1,Vidembed Stream\n{vidembed_url}"
+                    # except Exception as e:
+                    #     logger.error(f"Error extracting HLS stream for channel {channel_id}: {str(e)}")
+                    #     # Fall back to vidembed redirect in M3U8 format
+                    #     stream_data = f"#EXTM3U\n#EXTINF:-1,Vidembed Stream\n{vidembed_url}"
+                
             except asyncio.TimeoutError:
                 logger.error(f"Timeout generating stream for channel {channel_id} for client {client_id}")
                 # Clean up client tracking
@@ -617,6 +691,7 @@ async def ping():
     return {"status": "ok", "channels_count": len(free_sky.channels)}
 
 @fastapi_app.get("/health")
+@fastapi_app.get("/api/health")
 async def health():
     # Calculate streaming statistics and clean up stale entries
     current_time = time.time()
@@ -744,4 +819,123 @@ async def schedule_endpoint():
             }
         
         return {"schedule": fallback_schedule, "status": "fallback"}
+
+@fastapi_app.get("/api/vidembed/{channel_id}")
+async def vidembed_redirect(channel_id: str):
+    """Redirect to vidembed URL for channels that use vidembed.re"""
+    try:
+        # Get the vidembed URL from the hybrid streaming class
+        stream_data = await free_sky.stream(channel_id)
+        
+        if stream_data.startswith("VIDEMBED_URL:"):
+            vidembed_url = stream_data.replace("VIDEMBED_URL:", "")
+            logger.info(f"Redirecting channel {channel_id} to vidembed: {vidembed_url}")
+            
+            # Return a JSON response with the vidembed URL
+            return JSONResponse(content={
+                "type": "vidembed",
+                "url": vidembed_url,
+                "channel_id": channel_id
+            })
+        else:
+            # This channel doesn't use vidembed, return error
+            return JSONResponse(
+                content={"error": "Channel does not use vidembed architecture"},
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+            
+    except Exception as e:
+        logger.error(f"Error getting vidembed URL for channel {channel_id}: {str(e)}")
+        return JSONResponse(
+            content={"error": "Failed to get vidembed URL"},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+@fastapi_app.get("/api/services/status")
+async def get_service_status():
+    """Get status of all streaming services"""
+    try:
+        status = multi_streamer.get_service_status()
+        return JSONResponse(content={
+            "services": status,
+            "enabled_count": len(multi_streamer.enabled_services),
+            "total_count": len(multi_streamer.services)
+        })
+    except Exception as e:
+        logger.error(f"Error getting service status: {str(e)}")
+        return JSONResponse(
+            content={"error": "Failed to get service status"},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+@fastapi_app.post("/api/services/{service_name}/enable")
+async def enable_service(service_name: str):
+    """Enable a streaming service"""
+    try:
+        multi_streamer.enable_service(service_name)
+        return JSONResponse(content={
+            "message": f"Service {service_name} enabled",
+            "enabled_services": multi_streamer.enabled_services
+        })
+    except Exception as e:
+        logger.error(f"Error enabling service {service_name}: {str(e)}")
+        return JSONResponse(
+            content={"error": f"Failed to enable service {service_name}"},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+@fastapi_app.post("/api/services/{service_name}/disable")
+async def disable_service(service_name: str):
+    """Disable a streaming service"""
+    try:
+        multi_streamer.disable_service(service_name)
+        return JSONResponse(content={
+            "message": f"Service {service_name} disabled",
+            "enabled_services": multi_streamer.enabled_services
+        })
+    except Exception as e:
+        logger.error(f"Error disabling service {service_name}: {str(e)}")
+        return JSONResponse(
+            content={"error": f"Failed to disable service {service_name}"},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+@fastapi_app.get("/api/channels/search")
+async def search_channels(query: str = ""):
+    """Search for channels across all services"""
+    try:
+        if not query:
+            # Return all channels if no query provided
+            channels = await multi_streamer.get_all_channels()
+        else:
+            channels = await multi_streamer.search_channels(query)
+        
+        return JSONResponse(content={
+            "channels": channels,
+            "count": len(channels),
+            "query": query
+        })
+    except Exception as e:
+        logger.error(f"Error searching channels: {str(e)}")
+        return JSONResponse(
+            content={"error": "Failed to search channels"},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+@fastapi_app.get("/api/channels/all")
+async def get_all_channels():
+    """Get all channels from all enabled services"""
+    try:
+        channels = await multi_streamer.get_all_channels()
+        return JSONResponse(content={
+            "channels": channels,
+            "count": len(channels),
+            "enabled_services": multi_streamer.enabled_services
+        })
+    except Exception as e:
+        logger.error(f"Error getting all channels: {str(e)}")
+        return JSONResponse(
+            content={"error": "Failed to get channels"},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 

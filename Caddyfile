@@ -60,35 +60,40 @@ handle @websocket {
 	reverse_proxy localhost:{$BACKEND_PORT}
 }
 
-# Handle backend routes
-handle_path /api/* {
-	uri strip_prefix /api
+# Handle API endpoints - most specific first
+@api_stream path /api/stream/*
+handle @api_stream {
+	reverse_proxy localhost:{$BACKEND_PORT} {
+		flush_interval -1
+		header_up X-Real-IP {remote_host}
+		header_down -Server
+	}
+}
+
+@api_key path /api/key/*
+handle @api_key {
+	reverse_proxy localhost:{$BACKEND_PORT} {
+		flush_interval -1
+		header_up X-Real-IP {remote_host}
+	}
+}
+
+@api_content path /api/content/*
+handle @api_content {
+	reverse_proxy localhost:{$BACKEND_PORT} {
+		flush_interval -1
+		header_up X-Real-IP {remote_host}
+		header_down -Server
+	}
+}
+
+# Handle other API endpoints
+@api path /api/*
+handle @api {
 	reverse_proxy localhost:{$BACKEND_PORT}
 }
 
-handle_path /api/stream/* {
-	reverse_proxy localhost:{$BACKEND_PORT} {
-		flush_interval -1
-		header_up X-Real-IP {remote_host}
-		header_down -Server
-	}
-}
-
-handle_path /api/key/* {
-	reverse_proxy localhost:{$BACKEND_PORT} {
-		flush_interval -1
-		header_up X-Real-IP {remote_host}
-	}
-}
-
-handle_path /api/content/* {
-	reverse_proxy localhost:{$BACKEND_PORT} {
-		flush_interval -1
-		header_up X-Real-IP {remote_host}
-		header_down -Server
-	}
-}
-
+# Handle specific backend endpoints
 handle /health {
 	reverse_proxy localhost:{$BACKEND_PORT}
 }
