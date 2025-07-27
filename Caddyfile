@@ -49,10 +49,7 @@ handle /playlist.m3u8 {
 }
 
 # Handle logo requests first (highest priority)
-@logo path /logo/*
-handle @logo {
-	reverse_proxy localhost:{$BACKEND_PORT}
-}
+CCC
 
 # Handle WebSocket events - match path only, let backend handle WebSocket upgrade
 @websocket path /_event*
@@ -69,6 +66,16 @@ handle @api_stream {
 		header_down -Server
 	}
 }
+
+@api_logo path /api/logo/*
+handle @api_logo {
+	reverse_proxy localhost:{$BACKEND_PORT} {
+		flush_interval -1
+		header_up X-Real-IP {remote_host}
+		header_down -Server
+	}
+}
+
 
 @api_key path /api/key/*
 handle @api_key {
