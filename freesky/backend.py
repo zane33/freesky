@@ -656,9 +656,18 @@ async def get_schedule():
     return await free_sky.schedule()
 
 @fastapi_app.get("/logo/{logo}")
+@fastapi_app.get("/api/logo/{logo}")
 async def logo(logo: str):
-    url = urlsafe_base64_decode(logo)
-    file = url.split("/")[-1]
+    logger.debug(f"Logo request received: {logo}")
+    try:
+        url = urlsafe_base64_decode(logo)
+        logger.debug(f"Decoded URL: {url}")
+        file = url.split("/")[-1]
+        logger.debug(f"Filename: {file}")
+    except Exception as e:
+        logger.error(f"Error decoding logo URL: {str(e)}")
+        return JSONResponse(content={"error": "Invalid logo URL"}, status_code=status.HTTP_400_BAD_REQUEST)
+    
     if not os.path.exists("./logo-cache"):
         os.makedirs("./logo-cache")
     if os.path.exists(f"./logo-cache/{file}"):
