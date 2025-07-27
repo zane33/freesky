@@ -10,7 +10,20 @@ backend_port = int(os.environ.get("BACKEND_PORT", "8005"))
 
 
 host_ip = os.environ.get(f"HOST_IP", "0.0.0.0") or "0.0.0.0"  # Handle empty string
-api_url = os.environ.get("API_URL", f"http://{host_ip}:{frontend_port}")  # Use frontend port for client-facing URLs
+
+# For API_URL, we need to use a publicly accessible hostname/IP, not 0.0.0.0
+# If API_URL is explicitly set, use it; otherwise try to construct a sensible default
+api_url = os.environ.get("API_URL")
+if not api_url:
+    # Check if we're running in Docker
+    import os
+    if os.path.exists("/.dockerenv"):
+        # We're in Docker - use the host IP from environment or default to localhost
+        docker_host_ip = os.environ.get("DOCKER_HOST_IP", "localhost")
+        api_url = f"http://{docker_host_ip}:{frontend_port}"
+    else:
+        # We're running locally - use localhost
+        api_url = f"http://localhost:{frontend_port}"
 backend_uri = os.environ.get("BACKEND_URI", f"http://{host_ip}:{backend_port}")  # Backend service
 daddylive_uri = os.environ.get("DADDYLIVE_URI", "https://thedaddy.click")
 proxy_content = os.environ.get("PROXY_CONTENT", "TRUE").lower() == "true"
