@@ -49,7 +49,6 @@ handle /playlist.m3u8 {
 }
 
 # Handle logo requests first (highest priority)
-CCC
 
 # Handle WebSocket events - match path only, let backend handle WebSocket upgrade
 @websocket path /_event*
