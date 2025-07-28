@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # Get environment variables
 frontend_port = int(os.environ.get("PORT", "3000"))
 backend_port = int(os.environ.get("BACKEND_PORT", "8005"))
-max_concurrent_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "10"))
+max_concurrent_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "5"))  # Reduced from 10 to 5
 api_url = os.environ.get("API_URL", f"http://0.0.0.0:{frontend_port}")  # Use frontend port for client-facing URLs
 
 # Parse API_URL to create WebSocket URL with backend port
@@ -52,9 +52,9 @@ client = httpx.AsyncClient(
     http2=True,
     timeout=httpx.Timeout(30.0, connect=10.0),
     limits=httpx.Limits(
-        max_keepalive_connections=10,  # Limited keepalive for non-streaming requests
-        max_connections=50,            # Reasonable limit for general requests
-        keepalive_expiry=60.0          # Shorter keepalive
+        max_keepalive_connections=5,  # Reduced from 10 to 5
+        max_connections=25,            # Reduced from 50 to 25
+        keepalive_expiry=30.0         # Shorter keepalive
     ),
     follow_redirects=True
 )
@@ -64,7 +64,7 @@ def create_isolated_stream_client():
     """Create a new HTTP client for each streaming session to ensure complete isolation"""
     return httpx.AsyncClient(
         http2=False,  # Disable HTTP/2 for simpler connection handling
-        timeout=httpx.Timeout(60.0, connect=15.0),  # Longer timeout for streaming
+        timeout=httpx.Timeout(30.0, connect=10.0),  # Reduced timeout from 60 to 30 seconds
         limits=httpx.Limits(
             max_keepalive_connections=0,  # No connection reuse - every request gets new connection
             max_connections=1,            # Only one connection per client
@@ -95,8 +95,8 @@ class LRUCache(OrderedDict):
             del self[oldest]
 
 # Cache with size limit and TTL optimized for streaming
-stream_cache = LRUCache(maxsize=max_concurrent_streams * 10)  # Dynamic cache size
-cache_ttl = 30  # 30 seconds for live streaming freshness
+stream_cache = LRUCache(maxsize=max_concurrent_streams * 5)  # Reduced from 10 to 5
+cache_ttl = 20  # Reduced from 30 to 20 seconds for live streaming freshness
 
 # Track active tasks and streaming sessions for cleanup
 active_tasks: Dict[str, asyncio.Task] = {}
@@ -130,7 +130,7 @@ def _process_stream_content(content: str, referer: str) -> str:
 
 # Concurrency control for streaming with configurable limits
 _stream_semaphore = asyncio.Semaphore(max_concurrent_streams)
-_content_semaphore = asyncio.Semaphore(max_concurrent_streams * 2)  # More content streams allowed
+_content_semaphore = asyncio.Semaphore(max_concurrent_streams)  # Reduced from 2x to 1x
 
 logger.info("Backend initialized with connection pooling")
 
@@ -276,10 +276,10 @@ async def stream(channel_id: str):
             try:
                 logger.info(f"Generating new stream for channel {channel_id} for client {client_id}")
                 
-                # Use multi-service streamer to try multiple upstream feeds
+                # Use multi-service streamer to try multiple upstream feeds with shorter timeout
                 stream_data = await asyncio.wait_for(
                     multi_streamer.get_stream(channel_id),
-                    timeout=15.0  # Increased timeout for stream generation
+                    timeout=10.0  # Reduced from 15.0 to 10.0 seconds
                 )
                 
                 if not stream_data:
@@ -292,68 +292,60 @@ async def stream(channel_id: str):
                 # Handle vidembed URLs - try to extract HLS stream
                 if stream_data.startswith("VIDEMBED_URL:"):
                     vidembed_url = stream_data.replace("VIDEMBED_URL:", "")
-                    logger.info(f"Vidembed URL detected for channel {channel_id}, attempting HLS extraction")
+                    logger.info(f"Extracting HLS from vidembed URL for channel {channel_id}")
                     
-                    # For now, skip Playwright extraction in production and use M3U8 redirect
-                    # This avoids issues with headless browsers in Docker containers
-                    logger.info(f"Using M3U8 redirect for vidembed channel {channel_id}")
-                    stream_data = f"#EXTM3U\n#EXTINF:-1,Vidembed Stream\n{vidembed_url}"
-                    
-                    # TODO: Enable Playwright extraction when needed
-                    # try:
-                    #     # Try to extract HLS stream using Playwright
-                    #     hls_url = await extract_hls_from_vidembed(vidembed_url)
-                    #     if hls_url:
-                    #         logger.info(f"Successfully extracted HLS stream for channel {channel_id}: {hls_url}")
-                    #         
-                    #         # Fetch the actual HLS content
-                    #         async with create_isolated_stream_client() as client:
-                    #             hls_response = await client.get(hls_url, timeout=30.0)
-                    #             if hls_response.status_code == 200:
-                    #                 # Process the HLS content for proxying
-                    #                 processed_content = _process_stream_content(hls_response.text, hls_url)
-                    #                 stream_data = processed_content
-                    #                 logger.info(f"Successfully processed HLS stream for channel {channel_id}")
-                    #             else:
-                    #                 logger.warning(f"Failed to fetch HLS content for channel {channel_id}: {hls_response.status_code}")
-                    #                 # Fall back to vidembed redirect in M3U8 format
-                    #                 stream_data = f"#EXTM3U\n#EXTINF:-1,Vidembed Stream\n{vidembed_url}"
-                    #     else:
-                    #         logger.warning(f"Failed to extract HLS stream for channel {channel_id}, falling back to vidembed redirect in M3U8 format")
-                    #         stream_data = f"#EXTM3U\n#EXTINF:-1,Vidembed Stream\n{vidembed_url}"
-                    # except Exception as e:
-                    #     logger.error(f"Error extracting HLS stream for channel {channel_id}: {str(e)}")
-                    #     # Fall back to vidembed redirect in M3U8 format
-                    #     stream_data = f"#EXTM3U\n#EXTINF:-1,Vidembed Stream\n{vidembed_url}"
+                    try:
+                        # Extract HLS stream from vidembed with timeout
+                        hls_data = await asyncio.wait_for(
+                            extract_hls_from_vidembed(vidembed_url),
+                            timeout=8.0  # 8 second timeout for HLS extraction
+                        )
+                        
+                        if hls_data:
+                            stream_data = _process_stream_content(hls_data, vidembed_url)
+                            logger.info(f"Successfully extracted HLS stream for channel {channel_id}")
+                        else:
+                            # Fallback to vidembed URL for client-side processing
+                            stream_data = f"VIDEMBED_URL:{vidembed_url}"
+                            logger.info(f"Using vidembed fallback for channel {channel_id}")
+                    except asyncio.TimeoutError:
+                        logger.warning(f"HLS extraction timed out for channel {channel_id}, using vidembed fallback")
+                        stream_data = f"VIDEMBED_URL:{vidembed_url}"
+                    except Exception as e:
+                        logger.error(f"Error extracting HLS from vidembed for channel {channel_id}: {str(e)}")
+                        stream_data = f"VIDEMBED_URL:{vidembed_url}"
+                else:
+                    # Process regular stream data
+                    stream_data = _process_stream_content(stream_data, api_url)
+                
+                # Cache the processed stream data
+                stream_cache[cache_key] = (stream_data, current_time)
+                logger.info(f"Successfully generated and cached stream for channel {channel_id}")
+                
+                return Response(
+                    content=stream_data,
+                    media_type="application/vnd.apple.mpegurl",
+                    headers={
+                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                        "Pragma": "no-cache",
+                        "Expires": "0",
+                        "Accept-Ranges": "bytes",
+                        "X-Stream-Source": "generated"
+                    }
+                )
                 
             except asyncio.TimeoutError:
-                logger.error(f"Timeout generating stream for channel {channel_id} for client {client_id}")
-                # Clean up client tracking
-                if channel_id in active_streams and client_id in active_streams[channel_id]:
-                    del active_streams[channel_id][client_id]
+                logger.error(f"Timeout generating stream for channel {channel_id}")
                 return JSONResponse(
                     content={"error": "Stream generation timeout"},
                     status_code=status.HTTP_504_GATEWAY_TIMEOUT
                 )
-            
-            # Cache the result (LRU cache handles cleanup)
-            stream_cache[cache_key] = (stream_data, current_time)
-            logger.info(f"Successfully generated and cached stream for channel {channel_id}")
-        
-        return Response(
-            content=stream_data,
-            media_type="application/vnd.apple.mpegurl",
-            headers={
-                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                "Access-Control-Allow-Headers": "*",
-                "Access-Control-Expose-Headers": "*",
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0",
-                "Accept-Ranges": "bytes",
-                "X-Stream-Source": "generated"
-            }
-        )
+            except Exception as e:
+                logger.error(f"Error generating stream for channel {channel_id}: {str(e)}")
+                return JSONResponse(
+                    content={"error": str(e)},
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
     except IndexError:
         # Clean up client tracking
         if channel_id in active_streams and client_id in active_streams[channel_id]:
@@ -446,21 +438,28 @@ async def content(path: str, request: Request):
                 
                 try:
                     logger.info(f"Creating isolated connection for stream session {session_id}")
-                    async with isolated_client.stream("GET", free_sky.content_url(path), timeout=60) as response:
-                        logger.info(f"Stream session {session_id} established new isolated connection (status: {response.status_code})")
-                        async for chunk in response.aiter_bytes(chunk_size=8 * 1024):  # Larger chunks for better throughput
-                            chunk_count += 1
-                            current_chunk_time = time.time()
+                    
+                    # Add timeout wrapper to prevent hanging connections
+                    async with asyncio.timeout(25.0):  # 25 second timeout for entire stream
+                        async with isolated_client.stream("GET", free_sky.content_url(path), timeout=25) as response:
+                            logger.info(f"Stream session {session_id} established new isolated connection (status: {response.status_code})")
                             
-                            # Update session timestamp every 5 seconds for real-time tracking
-                            if current_chunk_time - last_heartbeat > 5:
-                                if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
-                                    active_content_sessions[channel_id][session_id] = current_chunk_time
-                                    last_heartbeat = current_chunk_time
-                            
-                            yield chunk
-                            
+                            async for chunk in response.aiter_bytes(chunk_size=16 * 1024):  # Increased chunk size for better throughput
+                                chunk_count += 1
+                                current_chunk_time = time.time()
+                                
+                                # Update session timestamp every 3 seconds for real-time tracking
+                                if current_chunk_time - last_heartbeat > 3:
+                                    if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
+                                        active_content_sessions[channel_id][session_id] = current_chunk_time
+                                        last_heartbeat = current_chunk_time
+                                
+                                yield chunk
+                                
                     logger.info(f"Stream session {session_id} completed normally after {chunk_count} chunks")
+                except asyncio.TimeoutError:
+                    logger.warning(f"Stream session {session_id} timed out after 25 seconds")
+                    raise
                 except Exception as e:
                     logger.error(f"Error in isolated proxy stream for session {session_id}: {str(e)}")
                     raise

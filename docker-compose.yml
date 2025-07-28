@@ -6,14 +6,14 @@ services:
       dockerfile: Dockerfile
     
     # Replace with actual container ID/name or comment out for default networking
-    network_mode: "container:transmission-openvpn"
+    #network_mode: "container:transmission-openvpn"
     
     # Ports are not needed when using container networking
     # Comment out if using container networking
-    #ports:
-    #  - "${PORT:-3000}:${PORT:-3000}"
-    #  - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
-    #  - "2019:2019"  # Expose Caddy admin port for debugging
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+      - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
+      - "2019:2019"  # Expose Caddy admin port for debugging
     
     environment:
       # Application Configuration
@@ -30,8 +30,8 @@ services:
       # Application Settings
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
       - SOCKS5=${SOCKS5:-}
-      - WORKERS=${WORKERS:-3}  # Reduced from 6 to 3 workers
-      - MAX_CONCURRENT_STREAMS=${MAX_CONCURRENT_STREAMS:-10}  # Configurable concurrent streaming limit
+      - WORKERS=${WORKERS:-2}  # Reduced from 3 to 2 workers
+      - MAX_CONCURRENT_STREAMS=${MAX_CONCURRENT_STREAMS:-5}  # Reduced from 10 to 5
       
       # Reflex Framework Settings
       - REFLEX_ENV=prod
@@ -46,9 +46,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 512M  # Reduced from 1G to 512M
         reservations:
-          memory: 512M
+          memory: 256M  # Reduced from 512M to 256M
     
     # Restart Policy
     restart: unless-stopped

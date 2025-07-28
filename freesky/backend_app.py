@@ -176,12 +176,12 @@ def run():
         loop="asyncio",
         ws_ping_interval=None,  # We handle pings ourselves
         ws_ping_timeout=None,
-        timeout_keep_alive=120,  # Longer keepalive for streaming
-        backlog=max_concurrent_streams * 100,  # Dynamic backlog based on concurrent streams
-        limit_concurrency=max_concurrent_streams * 50,  # Higher concurrency limit based on streams
-        limit_max_requests=max_concurrent_streams * 1000,  # More requests per worker
-        timeout_graceful_shutdown=30,  # Longer shutdown time for stream cleanup
-        h11_max_incomplete_event_size=32 * 1024 * 1024,  # 32MB for large streaming chunks
+        timeout_keep_alive=60,  # Reduced from 120 to 60 seconds
+        backlog=max_concurrent_streams * 50,  # Reduced from 100 to 50
+        limit_concurrency=max_concurrent_streams * 25,  # Reduced from 50 to 25
+        limit_max_requests=max_concurrent_streams * 500,  # Reduced from 1000 to 500
+        timeout_graceful_shutdown=15,  # Reduced from 30 to 15 seconds
+        h11_max_incomplete_event_size=16 * 1024 * 1024,  # Reduced from 32MB to 16MB
     )
     server = uvicorn.Server(config)
     server.run()
