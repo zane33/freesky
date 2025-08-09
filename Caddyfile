@@ -2,7 +2,7 @@
 
 log {
 	format json
-	level DEBUG
+	level WARN
 }
 
 # Basic settings - compress all except streaming endpoints
@@ -41,11 +41,15 @@ header @streaming {
 	Cache-Control "no-cache, no-store, must-revalidate"
 	Pragma "no-cache"
 	Expires "0"
+	X-Accel-Buffering "no"
 }
 
 # Handle playlist.m3u8 endpoint first (highest priority)
 handle /playlist.m3u8 {
-	reverse_proxy localhost:{$BACKEND_PORT}
+	reverse_proxy localhost:{$BACKEND_PORT} {
+		flush_interval -1
+		header_down -Server
+	}
 }
 
 # Handle logo requests first (highest priority)
