@@ -441,42 +441,44 @@ async def content(path: str, request: Request):
                 try:
                     logger.info(f"Creating isolated connection for stream session {session_id}")
                     
-                    # Add timeout wrapper to prevent hanging connections
-                    async with asyncio.timeout(25.0):  # 25 second timeout for entire stream
-                        # Build upstream request with proper headers to avoid CDN throttling
-                        upstream_url = free_sky.content_url(path)
-                        parsed = urlparse(upstream_url)
-                        origin = f"{parsed.scheme}://{parsed.netloc}"
-                        request_headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-                            "Accept": "*/*",
-                            "Accept-Language": "en-US,en;q=0.9",
-                            "Accept-Encoding": "identity",
-                            "Referer": origin + "/",
-                            "Origin": origin,
-                        }
-                        # Forward Range header when present (important for some players/CDNs)
-                        incoming_range = request.headers.get("Range")
-                        if incoming_range:
-                            request_headers["Range"] = incoming_range
-                        else:
-                            # Some players don't request ranges; hint CDN to stream from start
+                    # Build upstream request with proper headers to avoid CDN throttling
+                    upstream_url = free_sky.content_url(path)
+                    parsed = urlparse(upstream_url)
+                    origin = f"{parsed.scheme}://{parsed.netloc}"
+                    request_headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                        "Accept": "*/*",
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Accept-Encoding": "identity",
+                        "Referer": origin + "/",
+                        "Origin": origin,
+                    }
+                    # Forward Range header when present (important for some players/CDNs)
+                    incoming_range = request.headers.get("Range")
+                    if incoming_range:
+                        request_headers["Range"] = incoming_range
+                    else:
+                        # Only hint range for progressive MP4; avoid for HLS segments
+                        if parsed.path.lower().endswith(".mp4"):
                             request_headers["Range"] = "bytes=0-"
 
-                        async with isolated_client.stream("GET", upstream_url, headers=request_headers, timeout=25) as response:
-                            logger.info(f"Stream session {session_id} established new isolated connection (status: {response.status_code})")
-                            
-                            async for chunk in response.aiter_bytes(chunk_size=64 * 1024):  # Larger chunks for better throughput
-                                chunk_count += 1
-                                current_chunk_time = time.time()
-                                
-                                # Update session timestamp every 3 seconds for real-time tracking
-                                if current_chunk_time - last_heartbeat > 3:
-                                    if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
-                                        active_content_sessions[channel_id][session_id] = current_chunk_time
-                                        last_heartbeat = current_chunk_time
-                                
-                                yield chunk
+                    # Disable read timeout while keeping connect timeout to avoid mid-segment stalls
+                    http_timeout = httpx.Timeout(connect=10.0, read=None)
+
+                    async with isolated_client.stream("GET", upstream_url, headers=request_headers, timeout=http_timeout) as response:
+                        logger.info(f"Stream session {session_id} established new isolated connection (status: {response.status_code})")
+
+                        async for chunk in response.aiter_bytes(chunk_size=256 * 1024):  # Larger chunks for better throughput
+                            chunk_count += 1
+                            current_chunk_time = time.time()
+
+                            # Update session timestamp every 3 seconds for real-time tracking
+                            if current_chunk_time - last_heartbeat > 3:
+                                if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
+                                    active_content_sessions[channel_id][session_id] = current_chunk_time
+                                    last_heartbeat = current_chunk_time
+
+                            yield chunk
                                 
                     logger.info(f"Stream session {session_id} completed normally after {chunk_count} chunks")
                 except asyncio.TimeoutError:
@@ -505,18 +507,26 @@ async def content(path: str, request: Request):
                             if channel_id in active_content_sessions and not active_content_sessions[channel_id]:
                                 del active_content_sessions[channel_id]
             
+            # Heuristic media type based on URL
+            media_type = "application/octet-stream"
+            lower_url = free_sky.content_url(path).lower()
+            if any(ext in lower_url for ext in [".ts", ".m2ts", ".m2t"]):
+                media_type = "video/mp2t"
+            elif any(ext in lower_url for ext in [".mp4", ".m4s", ".cmfv", ".cmfa"]):
+                media_type = "video/mp4"
+
             return StreamingResponse(
                 proxy_stream(), 
-                media_type="application/octet-stream",
+                media_type=media_type,
                 headers={
                     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                     "Access-Control-Allow-Headers": "*",
                     "Access-Control-Expose-Headers": "*",
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Cache-Control": "no-cache, no-store, must-revalidate, private, no-transform",
                     "Pragma": "no-cache",
                     "Expires": "0",
                     "Accept-Ranges": "bytes",
-                    "Transfer-Encoding": "chunked",
+                    "X-Accel-Buffering": "no",
                     "X-Session-ID": session_id
                 }
             )
