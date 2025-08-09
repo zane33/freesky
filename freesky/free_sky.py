@@ -176,8 +176,16 @@ class StepDaddy:
                 m3u8_data = ""
                 for line in m3u8.text.split("\n"):
                     if line.startswith("#EXT-X-KEY:"):
-                        original_url = re.search(r'URI="(.*?)"', line).group(1)
-                        line = line.replace(original_url, f"/api/key/{encrypt(original_url)}/{encrypt(urlparse(source_url).netloc)}")
+                        url_match = re.search(r'URI="(.*?)"', line)
+                        if url_match:
+                            original_url = url_match.group(1)
+                            # Validate the URL before processing
+                            if original_url and original_url.startswith(('http://', 'https://')):
+                                line = line.replace(original_url, f"/api/key/{encrypt(original_url)}/{encrypt(urlparse(source_url).netloc)}")
+                            else:
+                                logger.warning(f"Skipping invalid key URL: {original_url}")
+                        else:
+                            logger.warning(f"Could not extract URL from EXT-X-KEY line: {line}")
                     elif line.startswith("http") and config.proxy_content:
                         line = f"/api/content/{encrypt(line)}"
                     m3u8_data += line + "\n"
@@ -199,12 +207,23 @@ class StepDaddy:
         return self._stream_semaphore
 
     async def key(self, url: str, host: str):
-        url = decrypt(url)
-        host = decrypt(host)
-        response = await self._session.get(url, headers=self._headers(f"{host}/", host), timeout=60)
-        if response.status_code != 200:
-            raise Exception(f"Failed to get key")
-        return response.content
+        try:
+            url = decrypt(url)
+            host = decrypt(host)
+            logger.debug(f"Decrypted key URL: {url}")
+            logger.debug(f"Decrypted host: {host}")
+            
+            # Validate URL
+            if not url or not url.startswith(('http://', 'https://')):
+                raise ValueError(f"Invalid key URL after decryption: {url}")
+            
+            response = await self._session.get(url, headers=self._headers(f"{host}/", host), timeout=60)
+            if response.status_code != 200:
+                raise Exception(f"Failed to get key: HTTP {response.status_code}")
+            return response.content
+        except Exception as e:
+            logger.error(f"Error in key method - URL: {url if 'url' in locals() else 'not decrypted'}, Host: {host if 'host' in locals() else 'not decrypted'}, Error: {str(e)}")
+            raise
 
     @staticmethod
     def content_url(path: str):
