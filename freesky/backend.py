@@ -3,7 +3,6 @@ import asyncio
 import httpx
 import logging
 import time
-import re
 from functools import lru_cache
 from typing import Optional, Dict, Tuple, Set
 from freesky.free_sky_hybrid import StepDaddyHybrid as StepDaddy
@@ -16,7 +15,6 @@ from .vidembed_extractor import extract_hls_from_vidembed
 from .multi_service_streamer import multi_streamer
 import json
 from urllib.parse import urlparse, urlunparse
-from rxconfig import config
 from collections import OrderedDict
 
 # Set up logging
@@ -443,27 +441,10 @@ async def content(path: str, request: Request):
                     
                     # Add timeout wrapper to prevent hanging connections
                     async with asyncio.timeout(25.0):  # 25 second timeout for entire stream
-                        # Build upstream request with proper headers to avoid CDN throttling
-                        upstream_url = free_sky.content_url(path)
-                        parsed = urlparse(upstream_url)
-                        origin = f"{parsed.scheme}://{parsed.netloc}"
-                        request_headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-                            "Accept": "*/*",
-                            "Accept-Language": "en-US,en;q=0.9",
-                            "Accept-Encoding": "identity",
-                            "Referer": origin + "/",
-                            "Origin": origin,
-                        }
-                        # Forward Range header when present (important for some players/CDNs)
-                        incoming_range = request.headers.get("Range")
-                        if incoming_range:
-                            request_headers["Range"] = incoming_range
-
-                        async with isolated_client.stream("GET", upstream_url, headers=request_headers, timeout=25) as response:
+                        async with isolated_client.stream("GET", free_sky.content_url(path), timeout=25) as response:
                             logger.info(f"Stream session {session_id} established new isolated connection (status: {response.status_code})")
                             
-                            async for chunk in response.aiter_bytes(chunk_size=64 * 1024):  # Larger chunks for better throughput
+                            async for chunk in response.aiter_bytes(chunk_size=16 * 1024):  # Increased chunk size for better throughput
                                 chunk_count += 1
                                 current_chunk_time = time.time()
                                 
