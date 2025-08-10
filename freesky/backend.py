@@ -463,7 +463,7 @@ async def content(path: str, request: Request):
                             request_headers["Range"] = "bytes=0-"
 
                     # Disable read timeout while keeping connect timeout to avoid mid-segment stalls
-                    http_timeout = httpx.Timeout(connect=11.0, read=None, write=10.0, pool=10.0)
+                    http_timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
 
                     async with isolated_client.stream("GET", upstream_url, headers=request_headers, timeout=http_timeout) as response:
                         logger.info(f"Stream session {session_id} established new isolated connection (status: {response.status_code})")
