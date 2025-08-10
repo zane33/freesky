@@ -119,17 +119,10 @@ def _process_stream_content(content: str, referer: str) -> str:
                 line = f"/api/content/{encrypt(line)}"
             elif line.startswith('#EXT-X-KEY:'):
                 # Process encryption keys
-                url_match = re.search(r'URI="(.*?)"', line)
-                if url_match:
-                    original_url = url_match.group(1)
-                    # Validate the URL before processing
-                    if original_url and original_url.startswith(('http://', 'https://')):
-                        line = line.replace(original_url, 
-                            f"/api/key/{encrypt(original_url)}/{encrypt(urlparse(referer).netloc)}")
-                    else:
-                        logger.warning(f"Skipping invalid key URL: {original_url}")
-                else:
-                    logger.warning(f"Could not extract URL from EXT-X-KEY line: {line}")
+                original_url = re.search(r'URI="(.*?)"', line)
+                if original_url:
+                    line = line.replace(original_url.group(1), 
+                        f"/api/key/{encrypt(original_url.group(1))}/{encrypt(urlparse(referer).netloc)}")
             
             processed_lines.append(line)
         
