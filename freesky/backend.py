@@ -98,7 +98,7 @@ class LRUCache(OrderedDict):
 
 # Cache with size limit and TTL optimized for streaming
 stream_cache = LRUCache(maxsize=max_concurrent_streams * 5)  # Reduced from 10 to 5
-cache_ttl = 5  # Keep playlist extremely fresh for live streaming
+cache_ttl = 20  # Reduced from 30 to 20 seconds for live streaming freshness
 
 # Track active tasks and streaming sessions for cleanup
 active_tasks: Dict[str, asyncio.Task] = {}
@@ -459,9 +459,6 @@ async def content(path: str, request: Request):
                         incoming_range = request.headers.get("Range")
                         if incoming_range:
                             request_headers["Range"] = incoming_range
-                        else:
-                            # Some players don't request ranges; hint CDN to stream from start
-                            request_headers["Range"] = "bytes=0-"
 
                         async with isolated_client.stream("GET", upstream_url, headers=request_headers, timeout=25) as response:
                             logger.info(f"Stream session {session_id} established new isolated connection (status: {response.status_code})")
@@ -512,9 +509,7 @@ async def content(path: str, request: Request):
                     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                     "Access-Control-Allow-Headers": "*",
                     "Access-Control-Expose-Headers": "*",
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Pragma": "no-cache",
-                    "Expires": "0",
+                    "Cache-Control": "public, max-age=3600",
                     "Accept-Ranges": "bytes",
                     "Transfer-Encoding": "chunked",
                     "X-Session-ID": session_id
