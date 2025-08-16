@@ -828,6 +828,99 @@ async def schedule_endpoint():
         
         return {"schedule": fallback_schedule, "status": "fallback"}
 
+@fastapi_app.get("/epg.xml")
+@fastapi_app.get("/api/epg.xml")  
+async def epg_xml():
+    """Return EPG data in XML format for external sources consuming channel data."""
+    try:
+        schedule_data = await get_schedule()
+        
+        # Create XML EPG format
+        xml_content = generate_epg_xml(schedule_data)
+        
+        return Response(
+            content=xml_content,
+            media_type="application/xml",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache", 
+                "Expires": "0",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error generating EPG XML: {str(e)}")
+        return JSONResponse(
+            content={"error": "Failed to generate EPG XML"},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+def generate_epg_xml(schedule_data):
+    """Generate XML EPG format from schedule data."""
+    from xml.sax.saxutils import escape
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    
+    xml_lines = ['<?xml version="1.0" encoding="UTF-8"?>']
+    xml_lines.append('<tv>')
+    
+    # Get all channels for the channel list
+    channels = get_channels()
+    channel_dict = {ch.id: ch for ch in channels}
+    
+    # Add channel definitions
+    for channel in channels:
+        xml_lines.append(f'  <channel id="{escape(channel.id)}">')
+        xml_lines.append(f'    <display-name>{escape(channel.name)}</display-name>')
+        if channel.logo:
+            xml_lines.append(f'    <icon src="{escape(channel.logo)}" />')
+        xml_lines.append('  </channel>')
+    
+    # Add programme data
+    for day_name, categories in schedule_data.items():
+        # Parse day from format "DD/MM/YYYY - DayName"
+        try:
+            date_part = day_name.split(" - ")[0]
+            day_date = datetime.strptime(date_part, "%d/%m/%Y").replace(tzinfo=ZoneInfo("UTC"))
+        except:
+            continue
+            
+        for category, events in categories.items():
+            for event in events:
+                try:
+                    # Parse time
+                    time_str = event.get("time", "00:00")
+                    hour, minute = map(int, time_str.split(":"))
+                    start_dt = day_date.replace(hour=hour, minute=minute)
+                    
+                    # Assume 30 minute programs if no end time specified
+                    end_dt = start_dt + timedelta(minutes=30)
+                    
+                    # Get channels for this event
+                    event_channels = event.get("channels", [])
+                    if event.get("channels2"):
+                        event_channels.extend(event.get("channels2", []))
+                    
+                    # Create programme entry for each channel
+                    for channel_info in event_channels:
+                        channel_id = channel_info.get("channel_id", "")
+                        if channel_id and channel_id in channel_dict:
+                            start_time = start_dt.strftime("%Y%m%d%H%M%S %z")
+                            end_time = end_dt.strftime("%Y%m%d%H%M%S %z")
+                            
+                            xml_lines.append(f'  <programme start="{start_time}" stop="{end_time}" channel="{escape(channel_id)}">')
+                            xml_lines.append(f'    <title>{escape(event.get("event", ""))}</title>')
+                            xml_lines.append(f'    <category>{escape(category)}</category>')
+                            xml_lines.append('  </programme>')
+                except Exception as e:
+                    logger.debug(f"Error processing event {event}: {e}")
+                    continue
+    
+    xml_lines.append('</tv>')
+    return '\n'.join(xml_lines)
+
 @fastapi_app.get("/api/vidembed/{channel_id}")
 async def vidembed_redirect(channel_id: str):
     """Redirect to vidembed URL for channels that use vidembed.re"""
