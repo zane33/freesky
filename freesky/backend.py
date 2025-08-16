@@ -279,7 +279,7 @@ async def stream(channel_id: str):
                 # Use multi-service streamer to try multiple upstream feeds with shorter timeout
                 stream_data = await asyncio.wait_for(
                     multi_streamer.get_stream(channel_id),
-                    timeout=10.0  # Reduced from 15.0 to 10.0 seconds
+                    timeout=35.0  # Increased for vidembed iframe authentication
                 )
                 
                 if not stream_data:
@@ -298,7 +298,7 @@ async def stream(channel_id: str):
                         # Extract HLS stream from vidembed with timeout
                         hls_data = await asyncio.wait_for(
                             extract_hls_from_vidembed(vidembed_url),
-                            timeout=8.0  # 8 second timeout for HLS extraction
+                            timeout=30.0  # 30 second timeout for HLS extraction (iframe setup needs time)
                         )
                         
                         if hls_data:

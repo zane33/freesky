@@ -26,6 +26,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
+# Install Playwright browsers for vidembed iframe authentication (without system dependencies)
+RUN playwright install chromium
+
 # Copy local context to `/app` inside container (see .dockerignore)
 COPY . .
 
