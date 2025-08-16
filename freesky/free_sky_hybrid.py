@@ -12,6 +12,7 @@ from urllib.parse import quote, urlparse
 from curl_cffi import AsyncSession
 from typing import List
 from .utils import encrypt, decrypt, urlsafe_base64, extract_and_decode_var
+from .token_validator import TokenValidator, extract_viable_streams
 from rxconfig import config
 
 # Set up logging
@@ -141,56 +142,159 @@ class StepDaddyHybrid:
 
     async def stream(self, channel_id: str):
         """
-        Force all channels to use the old fnjplay.xyz architecture.
+        Handle channel streaming with proper vidembed.re architecture detection and fallback
         """
         try:
-            iframe_url = f"https://fnjplay.xyz/premiumtv/daddylivehd.php?id={channel_id}"
-            return await self._handle_old_architecture(iframe_url, self._base_url)
+            # First, get the channel page to determine architecture
+            channel_page_url = f"{self._base_url}/stream/stream-{channel_id}.php"
+            response = await self._session.get(channel_page_url, headers=self._headers())
+            
+            if response.status_code != 200:
+                raise ValueError(f"Failed to access channel page: HTTP {response.status_code}")
+            
+            # Look for vidembed.re iframe in the channel page
+            vidembed_pattern = r'https://vidembed\.re/stream/([a-f0-9-]{36})'
+            vidembed_matches = re.findall(vidembed_pattern, response.text)
+            
+            if vidembed_matches:
+                # Found vidembed.re URL - use new architecture
+                vidembed_uuid = vidembed_matches[0]
+                vidembed_url = f"https://vidembed.re/stream/{vidembed_uuid}"
+                logger.info(f"Found vidembed.re URL for channel {channel_id}: {vidembed_url}")
+                return await self._handle_new_architecture(vidembed_url, channel_page_url)
+            else:
+                # No vidembed.re found, fall back to old architecture
+                logger.info(f"No vidembed.re URL found for channel {channel_id}, using old architecture")
+                iframe_url = f"https://fnjplay.xyz/premiumtv/daddylivehd.php?id={channel_id}"
+                return await self._handle_old_architecture(iframe_url, self._base_url)
+                
         except Exception as e:
-            logger.error(f"Error in forced old architecture for channel {channel_id}: {str(e)}")
-            raise
+            logger.error(f"Error in stream architecture detection for channel {channel_id}: {str(e)}")
+            # Final fallback to old architecture
+            try:
+                iframe_url = f"https://fnjplay.xyz/premiumtv/daddylivehd.php?id={channel_id}"
+                return await self._handle_old_architecture(iframe_url, self._base_url)
+            except Exception as fallback_error:
+                logger.error(f"Fallback also failed: {str(fallback_error)}")
+                raise
 
     async def _handle_new_architecture(self, vidembed_url: str, referer: str):
-        """Handle the new vidembed.re architecture"""
+        """Handle the new vidembed.re architecture with proper iframe-based authentication"""
         logger.debug(f"Processing vidembed URL: {vidembed_url}")
         
-        # Access vidembed page
-        vidembed_response = await self._session.get(vidembed_url, headers=self._headers(referer))
-        
-        if vidembed_response.status_code != 200:
-            raise ValueError(f"Failed to access vidembed page: HTTP {vidembed_response.status_code}")
-        
-        # Look for direct stream URLs
-        stream_urls = self._extract_stream_urls(vidembed_response.text)
-        
-        if stream_urls:
-            # Found direct stream URLs
-            stream_url = stream_urls[0]
-            logger.debug(f"Found direct stream URL: {stream_url}")
+        try:
+            # Extract UUID from vidembed URL
+            uuid_match = re.search(r'/stream/([a-f0-9-]{36})', vidembed_url)
+            if not uuid_match:
+                raise ValueError("Could not extract UUID from vidembed URL")
             
-            # Fetch the stream content
-            stream_response = await self._session.get(stream_url, headers=self._headers(vidembed_url))
+            uuid = uuid_match.group(1)
+            logger.debug(f"Extracted UUID: {uuid}")
             
-            if stream_response.status_code == 200:
-                return self._process_stream_content(stream_response.text, vidembed_url)
+            # Try to use the iframe-based extractor for proper authentication
+            try:
+                from .vidembed_extractor import extract_hls_from_vidembed
+                logger.info("Attempting iframe-based extraction...")
+                hls_url = await extract_hls_from_vidembed(vidembed_url)
+                
+                if hls_url:
+                    logger.info(f"Successfully extracted HLS URL via iframe: {hls_url}")
+                    # Test the HLS URL
+                    stream_response = await self._session.get(hls_url, headers=self._headers(vidembed_url))
+                    if stream_response.status_code == 200 and stream_response.text.startswith('#EXTM3U'):
+                        return self._process_stream_content(stream_response.text, vidembed_url)
+            except Exception as iframe_error:
+                logger.warning(f"Iframe-based extraction failed: {str(iframe_error)}")
+            
+            # Fallback: Try direct API approach with proper headers
+            logger.info("Attempting direct API approach with iframe simulation...")
+            api_url = f"https://www.vidembed.re/api/source/{uuid}?type=live"
+            
+            # Headers that simulate iframe context
+            api_headers = self._headers(vidembed_url)
+            api_headers.update({
+                "Origin": "https://vidembed.re",
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            })
+            
+            api_response = await self._session.get(api_url, headers=api_headers)
+            
+            if api_response.status_code == 200:
+                try:
+                    api_data = api_response.json()
+                    logger.debug(f"API Response: {api_data}")
+                    
+                    # Look for stream data in the response
+                    if 'data' in api_data and isinstance(api_data['data'], list):
+                        for item in api_data['data']:
+                            if 'file' in item:
+                                stream_url = item['file']
+                                logger.info(f"Found stream URL from API: {stream_url}")
+                                
+                                # Test the stream URL
+                                stream_response = await self._session.get(stream_url, headers=self._headers(vidembed_url))
+                                if stream_response.status_code == 200 and stream_response.text.startswith('#EXTM3U'):
+                                    return self._process_stream_content(stream_response.text, vidembed_url)
+                    
+                    # If direct API response doesn't have stream URLs, check for encrypted data
+                    if 'data' in api_data and isinstance(api_data['data'], str):
+                        # This might be encrypted data that needs client-side decryption
+                        logger.info("API returned encrypted data, may need client-side processing")
+                        return self._create_vidembed_response(vidembed_url)
+                        
+                except Exception as json_error:
+                    logger.warning(f"Error parsing API response JSON: {str(json_error)}")
             else:
-                raise ValueError(f"Failed to fetch stream: HTTP {stream_response.status_code}")
-        else:
-            # No direct URLs found, try to extract from JavaScript variables
-            logger.debug("No direct stream URLs found, trying JavaScript extraction...")
-            js_stream_url = self._extract_js_stream_url(vidembed_response.text)
+                logger.warning(f"API request failed with status {api_response.status_code}")
             
-            if js_stream_url:
-                logger.debug(f"Found JavaScript stream URL: {js_stream_url}")
-                stream_response = await self._session.get(js_stream_url, headers=self._headers(vidembed_url))
+            # Fallback: Access vidembed page directly
+            logger.info("Attempting direct vidembed page access...")
+            vidembed_response = await self._session.get(vidembed_url, headers=self._headers(referer))
+            
+            if vidembed_response.status_code != 200:
+                raise ValueError(f"Failed to access vidembed page: HTTP {vidembed_response.status_code}")
+            
+            # Look for direct stream URLs in page content
+            stream_urls = self._extract_stream_urls(vidembed_response.text)
+            
+            if stream_urls:
+                # Found direct stream URLs
+                stream_url = stream_urls[0]
+                logger.debug(f"Found direct stream URL: {stream_url}")
+                
+                # Fetch the stream content
+                stream_response = await self._session.get(stream_url, headers=self._headers(vidembed_url))
                 
                 if stream_response.status_code == 200:
                     return self._process_stream_content(stream_response.text, vidembed_url)
                 else:
-                    logger.warning(f"Failed to fetch JavaScript stream: HTTP {stream_response.status_code}")
-            
-            # If all else fails, return vidembed URL for client-side processing
-            logger.debug("No direct stream URLs found, returning vidembed URL")
+                    raise ValueError(f"Failed to fetch stream: HTTP {stream_response.status_code}")
+            else:
+                # No direct URLs found, try to extract from JavaScript variables
+                logger.debug("No direct stream URLs found, trying JavaScript extraction...")
+                js_stream_url = self._extract_js_stream_url(vidembed_response.text)
+                
+                if js_stream_url:
+                    logger.debug(f"Found JavaScript stream URL: {js_stream_url}")
+                    stream_response = await self._session.get(js_stream_url, headers=self._headers(vidembed_url))
+                    
+                    if stream_response.status_code == 200:
+                        return self._process_stream_content(stream_response.text, vidembed_url)
+                    else:
+                        logger.warning(f"Failed to fetch JavaScript stream: HTTP {stream_response.status_code}")
+                
+                # If all else fails, return vidembed URL for client-side processing
+                logger.debug("No direct stream URLs found, returning vidembed URL for client-side processing")
+                return self._create_vidembed_response(vidembed_url)
+                
+        except Exception as e:
+            logger.error(f"Error in new architecture handling: {str(e)}")
+            # Return vidembed URL for client-side processing as last resort
             return self._create_vidembed_response(vidembed_url)
 
     async def _handle_old_architecture(self, iframe_url: str, referer: str):
@@ -310,16 +414,40 @@ class StepDaddyHybrid:
         return None
 
     def _process_stream_content(self, content: str, referer: str) -> str:
-        """Process stream content (M3U8, etc.) and proxy URLs"""
+        """Process stream content (M3U8, etc.) and proxy URLs with token validation"""
         if content.startswith('#EXTM3U'):
-            # This is an M3U8 playlist, process it
+            # This is an M3U8 playlist, process it with token validation
+            logger.debug("Processing M3U8 playlist with token validation")
+            
+            # First, extract and validate tokens
+            try:
+                viable_streams = extract_viable_streams(content)
+                if viable_streams:
+                    logger.info(f"Found {len(viable_streams)} viable streams with valid tokens")
+                else:
+                    logger.warning("No viable streams found with valid tokens")
+            except Exception as token_error:
+                logger.warning(f"Token validation failed: {str(token_error)}")
+            
             lines = content.split('\n')
             processed_lines = []
             
             for line in lines:
-                if line.startswith('http') and config.proxy_content:
-                    # Proxy content URLs
-                    line = f"/api/content/{encrypt(line)}"
+                if line.startswith('http'):
+                    # Validate token if present
+                    try:
+                        token_analysis = TokenValidator.analyze_token_security(line)
+                        if not token_analysis.get('valid', True):  # Default to True if no tokens
+                            logger.debug(f"Skipping expired stream: {line}")
+                            continue  # Skip expired streams
+                        elif token_analysis.get('expires_in_seconds', float('inf')) < 3600:  # Less than 1 hour
+                            logger.warning(f"Stream expires soon: {token_analysis.get('expires_in_seconds', 0)} seconds")
+                    except Exception as validation_error:
+                        logger.debug(f"Token validation error for {line}: {str(validation_error)}")
+                    
+                    if config.proxy_content:
+                        # Proxy content URLs
+                        line = f"/api/content/{encrypt(line)}"
                 elif line.startswith('#EXT-X-KEY:'):
                     # Process encryption keys
                     original_url = re.search(r'URI="(.*?)"', line)
@@ -328,7 +456,18 @@ class StepDaddyHybrid:
                 
                 processed_lines.append(line)
             
-            return '\n'.join(processed_lines)
+            processed_content = '\n'.join(processed_lines)
+            
+            # Log token analysis summary
+            try:
+                tokens = TokenValidator.extract_tokens_from_m3u8(content)
+                if tokens:
+                    valid_tokens = sum(1 for t in tokens if t['analysis'].get('valid', False))
+                    logger.info(f"Token summary: {valid_tokens}/{len(tokens)} valid tokens")
+            except Exception as summary_error:
+                logger.debug(f"Error generating token summary: {str(summary_error)}")
+            
+            return processed_content
         else:
             # Not an M3U8 playlist, return as is
             return content

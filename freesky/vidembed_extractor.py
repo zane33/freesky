@@ -69,7 +69,7 @@ class VidembedExtractor:
     
     async def extract_hls_stream(self, vidembed_url: str) -> Optional[str]:
         """
-        Extract HLS stream URL from vidembed URL
+        Extract HLS stream URL from vidembed URL using iframe-based authentication
         
         Args:
             vidembed_url: The vidembed URL to extract from
@@ -84,71 +84,150 @@ class VidembedExtractor:
         try:
             logger.info(f"Extracting HLS stream from: {vidembed_url}")
             
-            # Store captured requests
+            # Store captured API requests
+            api_requests = []
             hls_requests = []
             
-            # Listen for network requests
+            # Listen for network requests with specific focus on API calls
             async def handle_request(request):
                 url = request.url
+                
+                # Capture vidembed API calls that match the analysis pattern
+                if "/api/source/" in url and "type=live" in url:
+                    api_requests.append({
+                        'url': url,
+                        'headers': request.headers,
+                        'method': request.method
+                    })
+                    logger.info(f"Captured vidembed API request: {url}")
+                
+                # Capture HLS streams
                 if any(ext in url.lower() for ext in ['.m3u8', '.mp4', 'playlist', 'master', 'stream']):
                     if 'cdnjs.cloudflare.com' not in url and 'googleapis.com' not in url:
                         hls_requests.append(url)
                         logger.debug(f"Captured HLS request: {url}")
             
+            # Listen for network responses to capture API responses
+            async def handle_response(response):
+                url = response.url
+                if "/api/source/" in url and "type=live" in url:
+                    try:
+                        if response.status == 200:
+                            # Try to get the response JSON
+                            json_data = await response.json()
+                            logger.info(f"API Response from {url}: {json_data}")
+                            
+                            # Look for stream URLs in the response
+                            if 'data' in json_data and isinstance(json_data['data'], list):
+                                for item in json_data['data']:
+                                    if 'file' in item:
+                                        hls_requests.append(item['file'])
+                                        logger.info(f"Found stream URL in API response: {item['file']}")
+                        else:
+                            logger.warning(f"API request failed with status {response.status}")
+                    except Exception as e:
+                        logger.debug(f"Error parsing API response: {str(e)}")
+            
             self._page.on("request", handle_request)
+            self._page.on("response", handle_response)
             
-            # Navigate to vidembed URL
-            logger.info("Loading vidembed page...")
-            await self._page.goto(vidembed_url, wait_until="networkidle", timeout=30000)
+            # Create an iframe context to properly handle origin-based authentication
+            logger.info("Setting up iframe context for authentication...")
             
-            # Wait for JavaScript execution
-            logger.info("Waiting for JavaScript execution...")
+            # First, navigate to a page that will embed the vidembed iframe
+            iframe_html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Vidembed Iframe</title>
+            </head>
+            <body>
+                <iframe src="{vidembed_url}" 
+                        width="926" height="500" 
+                        frameborder="0" 
+                        allowfullscreen
+                        id="vidembed-frame">
+                </iframe>
+                <script>
+                    // Monitor the iframe for any postMessage communications
+                    window.addEventListener('message', function(event) {{
+                        console.log('Received message from iframe:', event.data);
+                    }});
+                </script>
+            </body>
+            </html>
+            """
+            
+            # Set page content to include the iframe
+            await self._page.set_content(iframe_html)
+            
+            # Wait for iframe to load
+            logger.info("Waiting for iframe to load...")
             await asyncio.sleep(10)
             
-            # Try to interact with the page to trigger more requests
+            # Switch to iframe context to interact within the proper origin
             try:
-                # Look for video elements and try to play them
-                video_elements = await self._page.query_selector_all("video")
-                if video_elements:
-                    logger.info(f"Found {len(video_elements)} video elements")
-                    for i, video in enumerate(video_elements[:2]):
+                iframe_element = await self._page.query_selector('#vidembed-frame')
+                if iframe_element:
+                    iframe_frame = await iframe_element.content_frame()
+                    if iframe_frame:
+                        logger.info("Successfully accessed iframe context")
+                        
+                        # Wait for the iframe content to fully load
+                        await asyncio.sleep(5)
+                        
+                        # Try to interact with elements within the iframe
                         try:
-                            await video.click()
-                            logger.info(f"Clicked video element {i+1}")
-                            await asyncio.sleep(2)
-                        except:
-                            pass
-                
-                # Look for play buttons
-                play_buttons = await self._page.query_selector_all("[class*='play'], [id*='play'], button")
-                if play_buttons:
-                    logger.info(f"Found {len(play_buttons)} potential play buttons")
-                    for i, button in enumerate(play_buttons[:3]):
-                        try:
-                            await button.click()
-                            logger.info(f"Clicked play button {i+1}")
-                            await asyncio.sleep(2)
-                        except:
-                            pass
+                            # Look for video elements within iframe
+                            video_elements = await iframe_frame.query_selector_all("video")
+                            if video_elements:
+                                logger.info(f"Found {len(video_elements)} video elements in iframe")
+                                for i, video in enumerate(video_elements[:2]):
+                                    try:
+                                        await video.click()
+                                        logger.info(f"Clicked video element {i+1} in iframe")
+                                        await asyncio.sleep(3)
+                                    except:
+                                        pass
+                            
+                            # Look for play buttons within iframe
+                            play_buttons = await iframe_frame.query_selector_all("[class*='play'], [id*='play'], button")
+                            if play_buttons:
+                                logger.info(f"Found {len(play_buttons)} potential play buttons in iframe")
+                                for i, button in enumerate(play_buttons[:3]):
+                                    try:
+                                        await button.click()
+                                        logger.info(f"Clicked play button {i+1} in iframe")
+                                        await asyncio.sleep(3)
+                                    except:
+                                        pass
+                        except Exception as e:
+                            logger.warning(f"Error interacting with iframe content: {str(e)}")
+                    else:
+                        logger.warning("Could not access iframe content frame")
+                else:
+                    logger.warning("Could not find iframe element")
             except Exception as e:
-                logger.warning(f"Error interacting with page: {str(e)}")
+                logger.warning(f"Error accessing iframe: {str(e)}")
             
-            # Wait a bit more after interactions
-            await asyncio.sleep(5)
+            # Wait additional time for API calls to be made
+            await asyncio.sleep(10)
             
-            logger.info(f"Captured {len(hls_requests)} potential HLS requests")
+            logger.info(f"Captured {len(api_requests)} API requests and {len(hls_requests)} HLS requests")
             
-            # Test the captured URLs
+            # Test the captured URLs with proper authentication headers
             async with aiohttp.ClientSession() as session:
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Referer": vidembed_url,
-                }
-                
+                # First, test HLS URLs captured from API responses
                 for url in hls_requests:
                     try:
-                        logger.info(f"Testing captured URL: {url}")
-                        async with session.get(url, headers=headers, timeout=10) as response:
+                        logger.info(f"Testing HLS URL: {url}")
+                        headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            "Referer": vidembed_url,
+                            "Origin": "https://vidembed.re",
+                        }
+                        
+                        async with session.get(url, headers=headers, timeout=15) as response:
                             if response.status == 200:
                                 content = await response.text()
                                 if content.startswith("#EXTM3U"):
