@@ -652,7 +652,12 @@ def api_playlist():
     )
 
 async def get_schedule():
-    return await free_sky.schedule()
+    try:
+        return await free_sky.schedule()
+    except Exception as e:
+        logger.warning(f"Error getting schedule from upstream: {str(e)}")
+        # Return fallback empty schedule
+        return {}
 
 @fastapi_app.get("/logo/{logo}")
 @fastapi_app.get("/api/logo/{logo}")
@@ -835,6 +840,11 @@ async def epg_xml():
     try:
         schedule_data = await get_schedule()
         
+        # Handle empty schedule data gracefully
+        if not schedule_data:
+            logger.info("No schedule data available, generating minimal EPG")
+            schedule_data = {}
+        
         # Create XML EPG format
         xml_content = generate_epg_xml(schedule_data)
         
@@ -852,10 +862,41 @@ async def epg_xml():
         )
     except Exception as e:
         logger.error(f"Error generating EPG XML: {str(e)}")
-        return JSONResponse(
-            content={"error": "Failed to generate EPG XML"},
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        # Return a basic EPG XML instead of JSON error
+        fallback_xml = generate_fallback_epg_xml()
+        return Response(
+            content=fallback_xml,
+            media_type="application/xml",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache", 
+                "Expires": "0",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*"
+            }
         )
+
+def generate_fallback_epg_xml():
+    """Generate a minimal fallback EPG XML when schedule data is unavailable."""
+    from xml.sax.saxutils import escape
+    
+    xml_lines = ['<?xml version="1.0" encoding="UTF-8"?>']
+    xml_lines.append('<tv>')
+    
+    # Get all channels for the channel list
+    channels = get_channels()
+    
+    # Add channel definitions only
+    for channel in channels[:50]:  # Limit to first 50 channels for fallback
+        xml_lines.append(f'  <channel id="{escape(channel.id)}">')
+        xml_lines.append(f'    <display-name>{escape(channel.name)}</display-name>')
+        if channel.logo:
+            xml_lines.append(f'    <icon src="{escape(channel.logo)}" />')
+        xml_lines.append('  </channel>')
+    
+    xml_lines.append('</tv>')
+    return '\n'.join(xml_lines)
 
 def generate_epg_xml(schedule_data):
     """Generate XML EPG format from schedule data."""

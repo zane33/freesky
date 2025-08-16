@@ -65,23 +65,64 @@ def playlist() -> rx.Component:
                                 # variant="soft",
                                 color_scheme="gray",
                             ),
+                            rx.button(
+                                "Download EPG",
+                                rx.icon("calendar", margin_right="0.5rem"),
+                                on_click=rx.redirect(f"{api_url}/epg.xml", is_external=True),
+                                size="3",
+                                color_scheme="blue",
+                            ),
                             width="100%",
                             justify="center",
                             spacing="4",
                             margin_bottom="1rem",
                         ),
 
-                        rx.box(
-                            rx.text(
-                                f"{api_url}/playlist.m3u8",
-                                font_family="mono",
-                                font_size="sm",
+                        rx.vstack(
+                            rx.box(
+                                rx.text(
+                                    f"{api_url}/playlist.m3u8",
+                                    font_family="mono",
+                                    font_size="sm",
+                                ),
+                                padding="0.75rem",  
+                                background="gray.100",
+                                border_radius="md",
+                                width="100%",
+                                text_align="center",
                             ),
-                            padding="0.75rem",  
-                            background="gray.100",
-                            border_radius="md",
+                            rx.hstack(
+                                rx.text("EPG XML:", font_weight="medium", font_size="sm"),
+                                rx.button(
+                                    "Copy EPG Link",
+                                    rx.icon("clipboard", margin_right="0.5rem"),
+                                    on_click=[
+                                        rx.set_clipboard(f"{api_url}/epg.xml"),
+                                        rx.toast("EPG XML URL copied to clipboard!"),
+                                    ],
+                                    size="1",
+                                    variant="soft",
+                                    color_scheme="blue",
+                                ),
+                                width="100%",
+                                justify="center",
+                                align="center",
+                                spacing="2",
+                            ),
+                            rx.box(
+                                rx.text(
+                                    f"{api_url}/epg.xml",
+                                    font_family="mono",
+                                    font_size="sm",
+                                ),
+                                padding="0.75rem",  
+                                background="blue.50",
+                                border_radius="md",
+                                width="100%",
+                                text_align="center",
+                            ),
+                            spacing="2",
                             width="100%",
-                            text_align="center",
                         ),
 
                         rx.divider(margin_y="1rem"),

@@ -507,5 +507,18 @@ class StepDaddyHybrid:
         return data
 
     async def schedule(self):
-        response = await self._session.get(f"{self._base_url}/schedule/schedule-generated.php", headers=self._headers())
-        return response.json() 
+        try:
+            response = await self._session.get(f"{self._base_url}/schedule/schedule-generated.php", headers=self._headers())
+            if response.status_code == 200:
+                content = response.text.strip()
+                if content and content.startswith('{'):
+                    return response.json()
+                else:
+                    logger.warning(f"Schedule endpoint returned non-JSON content: {content[:100]}...")
+                    return {}
+            else:
+                logger.warning(f"Schedule endpoint returned status {response.status_code}")
+                return {}
+        except Exception as e:
+            logger.error(f"Error fetching schedule: {str(e)}")
+            return {} 
