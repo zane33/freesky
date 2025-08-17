@@ -25,7 +25,7 @@ if not api_url:
         # We're running locally - use localhost
         api_url = f"http://localhost:{frontend_port}"
 backend_uri = os.environ.get("BACKEND_URI", f"http://{host_ip}:{backend_port}")  # Backend service
-daddylive_uri = os.environ.get("DADDYLIVE_URI", "https://thedaddy.click")
+daddylive_uri = os.environ.get("DADDYLIVE_URI", "https://thedaddy.top")
 proxy_content = os.environ.get("PROXY_CONTENT", "TRUE").lower() == "true"
 socks5 = os.environ.get("SOCKS5", "")
 

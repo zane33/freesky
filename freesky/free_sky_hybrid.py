@@ -69,8 +69,8 @@ class StepDaddyHybrid:
         async with self._load_lock:
             channels = []
             try:
-                logger.debug(f"Starting channel load from {self._base_url}/24-7-channels.php")
-                response = await self._session.get(f"{self._base_url}/24-7-channels.php", headers=self._headers())
+                logger.debug(f"Starting channel load from {self._base_url}/cast/24-7-channels.php")
+                response = await self._session.get(f"{self._base_url}/cast/24-7-channels.php", headers=self._headers())
                 
                 logger.debug(f"Got response with status {response.status_code}")
                 if response.status_code != 200:
@@ -146,7 +146,7 @@ class StepDaddyHybrid:
         """
         try:
             # First, get the channel page to determine architecture
-            channel_page_url = f"{self._base_url}/stream/stream-{channel_id}.php"
+            channel_page_url = f"{self._base_url}/cast/stream-{channel_id}.php"
             response = await self._session.get(channel_page_url, headers=self._headers())
             
             if response.status_code != 200:
@@ -508,7 +508,7 @@ class StepDaddyHybrid:
 
     async def schedule(self):
         try:
-            response = await self._session.get(f"{self._base_url}/schedule/schedule-generated.php", headers=self._headers())
+            response = await self._session.get(f"{self._base_url}/cast/schedule/schedule-generated.php", headers=self._headers())
             if response.status_code == 200:
                 content = response.text.strip()
                 if content and content.startswith('{'):

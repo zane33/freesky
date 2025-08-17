@@ -42,7 +42,7 @@ ENV PORT=${PORT:-3000} \
     BACKEND_PORT=${BACKEND_PORT:-8005} \
     BACKEND_URI=${BACKEND_URI:-http://0.0.0.0:${BACKEND_PORT:-8005}} \
     API_URL=${API_URL:-http://0.0.0.0:${PORT:-3000}} \
-    DADDYLIVE_URI=${DADDYLIVE_URI:-"https://thedaddy.click"} \
+    DADDYLIVE_URI=${DADDYLIVE_URI:-"https://thedaddy.top"} \
     PROXY_CONTENT=${PROXY_CONTENT:-TRUE} \
     SOCKS5=${SOCKS5:-""} \
     REFLEX_ENV=prod
@@ -74,13 +74,27 @@ RUN echo "Building frontend with API_URL=$API_URL" && \
 # Final image with only necessary files
 FROM python:3.13-slim
 
-# Install Caddy, redis server, and Node.js/npm inside final image
+# Install Caddy, redis server, Node.js/npm, and Playwright system dependencies inside final image
 RUN apt-get update -y && apt-get install -y \
     caddy \
     redis-server \
     curl \
     gnupg \
     dos2unix \
+    libnspr4 \
+    libnss3 \
+    libdbus-1-3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libxkbcommon0 \
+    libatspi2.0-0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -94,7 +108,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
     BACKEND_PORT=${BACKEND_PORT:-8005} \
     BACKEND_URI=${BACKEND_URI:-http://0.0.0.0:${BACKEND_PORT:-8005}} \
     API_URL=${API_URL:-${BACKEND_URI}:${PORT:-3000}} \
-    DADDYLIVE_URI=${DADDYLIVE_URI:-"https://thedaddy.click"} \
+    DADDYLIVE_URI=${DADDYLIVE_URI:-"https://thedaddy.top"} \
     REDIS_URL=redis://0.0.0.0 \
     PYTHONUNBUFFERED=1 \
     PROXY_CONTENT=${PROXY_CONTENT:-TRUE} \
