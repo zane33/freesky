@@ -14,7 +14,7 @@ STREAMING_SERVICES = {
         "features": ["live_tv", "sports", "news"],
         "api_endpoints": {
             "channels": "/24-7-channels.php",
-            "stream": "/cast/stream-{channel_id}.php"
+            "stream": "/stream/stream-{channel_id}.php"
         }
     },
     
