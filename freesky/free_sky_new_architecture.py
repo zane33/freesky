@@ -143,9 +143,9 @@ class StepDaddyNew:
         """New streaming method for dlhd.click with vidembed.re integration"""
         try:
             # Step 1: Initial Stream Request
-            url = f"{self._base_url}/stream/stream-{channel_id}.php"
+            url = f"{self._base_url}/cast/stream-{channel_id}.php"
             if len(channel_id) > 3:
-                url = f"{self._base_url}/stream/bet.php?id=bet{channel_id}"
+                url = f"{self._base_url}/cast/bet.php?id=bet{channel_id}"
             
             # Use semaphore to limit concurrent stream requests
             semaphore = self._get_stream_semaphore()
