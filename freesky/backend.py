@@ -319,7 +319,7 @@ async def stream(channel_id: str):
                 # Use multi-service streamer to try multiple upstream feeds with faster timeout
                 stream_data = await asyncio.wait_for(
                     multi_streamer.get_stream(channel_id),
-                    timeout=10.0  # Reduced from 35s to 10s for faster response
+                    timeout=25.0  # Balanced timeout - reduced from 35s but increased from 10s
                 )
                 
                 if not stream_data:
