@@ -227,7 +227,7 @@ class VidembedExtractor:
                             "Origin": "https://vidembed.re",
                         }
                         
-                        async with session.get(url, headers=headers, timeout=15) as response:
+                        async with session.get(url, headers=headers, timeout=8) as response:
                             if response.status == 200:
                                 content = await response.text()
                                 if content.startswith("#EXTM3U"):

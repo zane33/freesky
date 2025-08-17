@@ -7,6 +7,8 @@ from freesky.free_sky import Channel
 media_player = MediaPlayer.create
 
 
+
+
 class WatchState(rx.State):
     is_loaded: bool = False
     _cache_buster: int = 0
@@ -34,6 +36,37 @@ class WatchState(rx.State):
         from rxconfig import config
         return f"{config.api_url}/api/stream/{self.route_channel_id}.m3u8"
 
+    def copy_url_to_clipboard(self):
+        """Copy URL to clipboard using JavaScript."""
+        url = self.url
+        return rx.call_script(f"""
+            async function copyToClipboard() {{
+                const text = '{url}';
+                try {{
+                    if (navigator.clipboard && window.isSecureContext) {{
+                        await navigator.clipboard.writeText(text);
+                        return true;
+                    }} else {{
+                        const textArea = document.createElement('textarea');
+                        textArea.value = text;
+                        textArea.style.position = 'fixed';
+                        textArea.style.left = '-999999px';
+                        textArea.style.top = '-999999px';
+                        document.body.appendChild(textArea);
+                        textArea.focus();
+                        textArea.select();
+                        const result = document.execCommand('copy');
+                        document.body.removeChild(textArea);
+                        return result;
+                    }}
+                }} catch (err) {{
+                    console.error('Failed to copy text: ', err);
+                    return false;
+                }}
+            }}
+            copyToClipboard();
+        """)
+
 
 def uri_card() -> rx.Component:
     return rx.card(
@@ -42,8 +75,8 @@ def uri_card() -> rx.Component:
                 rx.text(WatchState.url),
                 rx.icon("link-2", size=20),
                 on_click=[
-                    rx.set_clipboard(WatchState.url),
-                    rx.toast("Copied to clipboard!"),
+                    WatchState.copy_url_to_clipboard,
+                    rx.toast("URI copied to clipboard"),
                 ],
                 size="1",
                 variant="surface",
@@ -54,7 +87,7 @@ def uri_card() -> rx.Component:
                 rx.text("VLC"),
                 rx.icon("external-link", size=15),
                 on_click=[
-                    rx.set_clipboard(WatchState.url),
+                    WatchState.copy_url_to_clipboard,
                     rx.toast("Stream URL copied! Open VLC → Media → Open Network Stream and paste the URL"),
                 ],
                 size="1",
@@ -156,8 +189,8 @@ def watch() -> rx.Component:
                                             ),
                                             rx.icon("link-2", size=20),
                                             on_click=[
-                                                rx.set_clipboard(WatchState.url),
-                                                rx.toast("Copied to clipboard!"),
+                                                WatchState.copy_url_to_clipboard,
+                                                rx.toast("URI copied to clipboard"),
                                             ],
                                             size="1",
                                             variant="surface",
@@ -169,7 +202,7 @@ def watch() -> rx.Component:
                                                 rx.text("VLC"),
                                                 rx.icon("external-link", size=15),
                                                 on_click=[
-                                                    rx.set_clipboard(WatchState.url),
+                                                    WatchState.copy_url_to_clipboard,
                                                     rx.toast("Stream URL copied! Open VLC → Media → Open Network Stream and paste the URL"),
                                                 ],
                                                 size="1",

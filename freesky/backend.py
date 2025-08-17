@@ -50,25 +50,25 @@ fastapi_app = FastAPI(
 # This client is used for non-streaming requests (logos, keys, etc.)
 client = httpx.AsyncClient(
     http2=True,
-    timeout=httpx.Timeout(30.0, connect=10.0),
+    timeout=httpx.Timeout(45.0, connect=15.0),  # Increased timeouts for stability
     limits=httpx.Limits(
-        max_keepalive_connections=5,  # Reduced from 10 to 5
-        max_connections=25,            # Reduced from 50 to 25
-        keepalive_expiry=30.0         # Shorter keepalive
+        max_keepalive_connections=20,  # Increased from 5 to 20
+        max_connections=100,           # Increased from 25 to 100
+        keepalive_expiry=60.0         # Longer keepalive for better reuse
     ),
     follow_redirects=True
 )
 
-# Function to create isolated HTTP clients for each streaming session
+# Function to create optimized HTTP clients for streaming sessions
 def create_isolated_stream_client():
-    """Create a new HTTP client for each streaming session to ensure complete isolation"""
+    """Create an optimized HTTP client for streaming with better performance"""
     return httpx.AsyncClient(
-        http2=False,  # Disable HTTP/2 for simpler connection handling
-        timeout=httpx.Timeout(30.0, connect=10.0),  # Reduced timeout from 60 to 30 seconds
+        http2=True,   # Enable HTTP/2 for better streaming performance
+        timeout=httpx.Timeout(60.0, connect=15.0),  # Increased timeouts for streaming
         limits=httpx.Limits(
-            max_keepalive_connections=0,  # No connection reuse - every request gets new connection
-            max_connections=1,            # Only one connection per client
-            keepalive_expiry=0.0          # No keepalive - close immediately after use
+            max_keepalive_connections=5,  # Allow some connection reuse for efficiency
+            max_connections=10,           # Increased connection pool
+            keepalive_expiry=30.0         # Moderate keepalive for performance
         ),
         follow_redirects=True
     )
@@ -95,14 +95,54 @@ class LRUCache(OrderedDict):
             del self[oldest]
 
 # Cache with size limit and TTL optimized for streaming
-stream_cache = LRUCache(maxsize=max_concurrent_streams * 5)  # Reduced from 10 to 5
-cache_ttl = 20  # Reduced from 30 to 20 seconds for live streaming freshness
+stream_cache = LRUCache(maxsize=max_concurrent_streams * 10)  # Increased cache size for better performance
+cache_ttl = 60  # Increased from 20 to 60 seconds to reduce regeneration frequency
 
 # Track active tasks and streaming sessions for cleanup
 active_tasks: Dict[str, asyncio.Task] = {}
 active_streams: Dict[str, Dict[str, float]] = {}  # Track M3U8 requests per channel with timestamps
 active_content_sessions: Dict[str, Dict[str, float]] = {}  # Track actual video streaming sessions
 session_to_channel: Dict[str, str] = {}  # Map session IDs to channel IDs
+
+async def prefetch_popular_stream(channel_id: str):
+    """Prefetch stream to keep cache warm for popular channels"""
+    try:
+        await asyncio.sleep(45)  # Wait 45s then refresh cache
+        cache_key = f"stream_{channel_id}"
+        current_time = time.time()
+        
+        # Check if cache needs refresh
+        if cache_key in stream_cache:
+            cached_data, cache_time = stream_cache[cache_key]
+            if current_time - cache_time < cache_ttl:
+                return  # Still fresh
+        
+        # Prefetch new stream data
+        logger.debug(f"Prefetching stream for popular channel {channel_id}")
+        stream_data = await asyncio.wait_for(
+            multi_streamer.get_stream(channel_id),
+            timeout=8.0  # Quick prefetch timeout
+        )
+        
+        if stream_data and stream_data.startswith("VIDEMBED_URL:"):
+            vidembed_url = stream_data.replace("VIDEMBED_URL:", "")
+            try:
+                hls_data = await asyncio.wait_for(
+                    extract_hls_from_vidembed(vidembed_url),
+                    timeout=6.0  # Quick HLS extraction
+                )
+                if hls_data:
+                    stream_data = _process_stream_content(hls_data, vidembed_url)
+            except asyncio.TimeoutError:
+                pass  # Use vidembed URL as fallback
+        
+        if stream_data:
+            stream_cache[cache_key] = (stream_data, current_time)
+            logger.debug(f"Successfully prefetched stream for channel {channel_id}")
+            
+    except Exception as e:
+        logger.debug(f"Prefetch failed for channel {channel_id}: {str(e)}")
+        # Silent failure for prefetch
 
 def _process_stream_content(content: str, referer: str) -> str:
     """Process stream content for proxying"""
@@ -276,10 +316,10 @@ async def stream(channel_id: str):
             try:
                 logger.info(f"Generating new stream for channel {channel_id} for client {client_id}")
                 
-                # Use multi-service streamer to try multiple upstream feeds with shorter timeout
+                # Use multi-service streamer to try multiple upstream feeds with faster timeout
                 stream_data = await asyncio.wait_for(
                     multi_streamer.get_stream(channel_id),
-                    timeout=35.0  # Increased for vidembed iframe authentication
+                    timeout=10.0  # Reduced from 35s to 10s for faster response
                 )
                 
                 if not stream_data:
@@ -298,7 +338,7 @@ async def stream(channel_id: str):
                         # Extract HLS stream from vidembed with timeout
                         hls_data = await asyncio.wait_for(
                             extract_hls_from_vidembed(vidembed_url),
-                            timeout=30.0  # 30 second timeout for HLS extraction (iframe setup needs time)
+                            timeout=8.0  # Reduced from 30s to 8s for faster response
                         )
                         
                         if hls_data:
@@ -322,13 +362,14 @@ async def stream(channel_id: str):
                 stream_cache[cache_key] = (stream_data, current_time)
                 logger.info(f"Successfully generated and cached stream for channel {channel_id}")
                 
+                # Schedule prefetch for this channel to keep it warm
+                asyncio.create_task(prefetch_popular_stream(channel_id))
+                
                 return Response(
                     content=stream_data,
                     media_type="application/vnd.apple.mpegurl",
                     headers={
-                        "Cache-Control": "no-cache, no-store, must-revalidate",
-                        "Pragma": "no-cache",
-                        "Expires": "0",
+                        "Cache-Control": "max-age=30, public",  # Allow 30s caching for performance
                         "Accept-Ranges": "bytes",
                         "X-Stream-Source": "generated"
                     }
@@ -440,11 +481,11 @@ async def content(path: str, request: Request):
                     logger.info(f"Creating isolated connection for stream session {session_id}")
                     
                     # Add timeout wrapper to prevent hanging connections
-                    async with asyncio.timeout(25.0):  # 25 second timeout for entire stream
-                        async with isolated_client.stream("GET", free_sky.content_url(path), timeout=25) as response:
+                    async with asyncio.timeout(45.0):  # Increased timeout for better stability
+                        async with isolated_client.stream("GET", free_sky.content_url(path), timeout=45) as response:
                             logger.info(f"Stream session {session_id} established new isolated connection (status: {response.status_code})")
                             
-                            async for chunk in response.aiter_bytes(chunk_size=16 * 1024):  # Increased chunk size for better throughput
+                            async for chunk in response.aiter_bytes(chunk_size=64 * 1024):  # Increased chunk size from 16KB to 64KB
                                 chunk_count += 1
                                 current_chunk_time = time.time()
                                 
@@ -458,7 +499,7 @@ async def content(path: str, request: Request):
                                 
                     logger.info(f"Stream session {session_id} completed normally after {chunk_count} chunks")
                 except asyncio.TimeoutError:
-                    logger.warning(f"Stream session {session_id} timed out after 25 seconds")
+                    logger.warning(f"Stream session {session_id} timed out after 45 seconds")
                     raise
                 except Exception as e:
                     logger.error(f"Error in isolated proxy stream for session {session_id}: {str(e)}")

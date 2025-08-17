@@ -65,6 +65,25 @@ export function Player({ title, src }) {
         playsInline
         autoplay
         muted
+        load='eager'
+        preload='auto'
+        crossorigin='anonymous'
+        // Enhanced buffering for better live stream performance
+        preferNativeHLS={false}
+        // Reduce rebuffering by allowing larger buffer
+        storage={{
+          hlsLiveBackBufferLength: 30,  // Keep 30s of buffer behind playhead
+          hlsLiveSyncDurationCount: 3,  // Stay closer to live edge
+          hlsLiveMaxLatencyDurationCount: 10,  // Max latency before sync
+          maxBufferLength: 60,  // Total buffer size: 60 seconds
+          maxMaxBufferLength: 120,  // Emergency buffer: 2 minutes
+          manifestLoadingTimeOut: 10000,  // 10s timeout for manifests
+          manifestLoadingMaxRetry: 3,
+          levelLoadingTimeOut: 10000,  // 10s timeout for segments
+          levelLoadingMaxRetry: 2,
+          fragLoadingTimeOut: 20000,  // 20s timeout for fragments
+          fragLoadingMaxRetry: 3
+        }}
       >
         <MediaProvider>
           <Poster className="vds-poster" />
