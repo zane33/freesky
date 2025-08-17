@@ -25,7 +25,7 @@ services:
       - API_URL=${API_URL:-}  # Let rxconfig determine this dynamically
       
       # External Services
-      - DADDYLIVE_URI=${DADDYLIVE_URI:-https://dlhd.click}
+      - DADDYLIVE_URI=${DADDYLIVE_URI:-https://thedaddy.top}
       
       # Application Settings
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
