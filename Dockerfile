@@ -106,6 +106,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
 WORKDIR /app
 COPY --from=builder /app /app
 COPY --from=builder /srv /srv
+COPY --from=builder /root/.cache/ms-playwright /root/.cache/ms-playwright
 
 # Convert start.sh to Unix line endings and make it executable in the final image
 RUN dos2unix /app/start.sh && chmod +x /app/start.sh
