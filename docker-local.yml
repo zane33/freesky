@@ -21,7 +21,7 @@ services:
       - BACKEND_PORT=${BACKEND_PORT:-8005}
       - HOST_IP=${HOST_IP:-0.0.0.0}  # Dynamic host IP, will use 0.0.0.0 if not set
       - DOCKER_HOST_IP=${DOCKER_HOST_IP:-localhost}  # External hostname/IP for client-facing URLs
-      - BACKEND_URI=${BACKEND_URI:-}  # Let rxconfig determine this dynamically
+      - BACKEND_URI=${BACKEND_URI:-http://localhost:8005}  # Backend service URL
       - API_URL=${API_URL:-}  # Let rxconfig determine this dynamically
       
       # External Services
@@ -30,8 +30,8 @@ services:
       # Application Settings
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
       - SOCKS5=${SOCKS5:-}
-      - WORKERS=${WORKERS:-3}  # Reduced from 6 to 3 workers
-      - MAX_CONCURRENT_STREAMS=${MAX_CONCURRENT_STREAMS:-10}  # Configurable concurrent streaming limit
+      - WORKERS=${WORKERS:-4}  # Optimized worker count for streaming
+      - MAX_CONCURRENT_STREAMS=${MAX_CONCURRENT_STREAMS:-25}  # Increased concurrent streaming limit
       
       # Reflex Framework Settings
       - REFLEX_ENV=prod
@@ -42,13 +42,13 @@ services:
       - HTTPS_PROXY=${HTTPS_PROXY:-}
       - NO_PROXY=localhost,127.0.0.1
     
-    # Resource Limits
+    # Resource Limits (increased for better streaming performance)
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G  # Increased from 1G to 2G for better performance
         reservations:
-          memory: 512M
+          memory: 1G  # Increased from 512M to 1G
     
     # Restart Policy
     restart: unless-stopped

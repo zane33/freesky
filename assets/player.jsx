@@ -68,21 +68,29 @@ export function Player({ title, src }) {
         load='eager'
         preload='auto'
         crossorigin='anonymous'
-        // Enhanced buffering for better live stream performance
+        // Aggressive buffering for optimal live stream performance
         preferNativeHLS={false}
-        // Reduce rebuffering by allowing larger buffer
+        // Large buffers to prevent rebuffering under network fluctuations
         storage={{
-          hlsLiveBackBufferLength: 30,  // Keep 30s of buffer behind playhead
-          hlsLiveSyncDurationCount: 3,  // Stay closer to live edge
-          hlsLiveMaxLatencyDurationCount: 10,  // Max latency before sync
-          maxBufferLength: 60,  // Total buffer size: 60 seconds
-          maxMaxBufferLength: 120,  // Emergency buffer: 2 minutes
-          manifestLoadingTimeOut: 10000,  // 10s timeout for manifests
-          manifestLoadingMaxRetry: 3,
-          levelLoadingTimeOut: 10000,  // 10s timeout for segments
-          levelLoadingMaxRetry: 2,
-          fragLoadingTimeOut: 20000,  // 20s timeout for fragments
-          fragLoadingMaxRetry: 3
+          hlsLiveBackBufferLength: 60,  // Keep 60s of buffer behind playhead
+          hlsLiveSyncDurationCount: 5,  // More segments for smoother playback
+          hlsLiveMaxLatencyDurationCount: 15,  // Higher latency tolerance
+          maxBufferLength: 180,  // Large buffer: 3 minutes
+          maxMaxBufferLength: 300,  // Emergency buffer: 5 minutes
+          manifestLoadingTimeOut: 5000,  // Faster manifest timeout for quicker retries
+          manifestLoadingMaxRetry: 2,   // Fewer retries for faster failover
+          levelLoadingTimeOut: 8000,    // Faster segment timeout
+          levelLoadingMaxRetry: 1,      // Single retry for faster failover
+          fragLoadingTimeOut: 15000,    // Reduced fragment timeout
+          fragLoadingMaxRetry: 2,       // Fewer fragment retries
+          startFragPrefetch: true,      // Enable fragment prefetching
+          testBandwidth: false,         // Disable bandwidth testing for faster startup
+          startLevel: -1,               // Let player choose best quality automatically
+          capLevelToPlayerSize: false,  // Don't limit quality based on player size
+          maxStarvationDelay: 4,        // Quick starvation recovery
+          maxLoadingDelay: 4,           // Quick loading recovery
+          liveSyncDuration: 2,          // Faster sync to live edge
+          liveMaxLatencyDuration: 8     // Max latency before seeking to live
         }}
       >
         <MediaProvider>

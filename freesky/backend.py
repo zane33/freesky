@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from .utils import urlsafe_base64_decode, encrypt
 from .vidembed_extractor import extract_hls_from_vidembed
 from .multi_service_streamer import multi_streamer
+from .stream_monitor import stream_monitor
 import json
 from urllib.parse import urlparse, urlunparse
 from collections import OrderedDict
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 # Get environment variables
 frontend_port = int(os.environ.get("PORT", "3000"))
 backend_port = int(os.environ.get("BACKEND_PORT", "8005"))
-max_concurrent_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "5"))  # Reduced from 10 to 5
+max_concurrent_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "25"))  # Increased from 5 to 25 for better throughput
 api_url = os.environ.get("API_URL", f"http://0.0.0.0:{frontend_port}")  # Use frontend port for client-facing URLs
 
 # Parse API_URL to create WebSocket URL with backend port
@@ -46,32 +47,30 @@ fastapi_app = FastAPI(
 
 # CORS is handled by Caddy reverse proxy to prevent duplicate headers
 
-# Create HTTP client with settings optimized for isolated connections per stream
+# Create HTTP client with settings optimized for high-performance streaming
 # This client is used for non-streaming requests (logos, keys, etc.)
 client = httpx.AsyncClient(
     http2=True,
-    timeout=httpx.Timeout(45.0, connect=10.0),  # Balanced timeouts
+    timeout=httpx.Timeout(30.0, connect=5.0),  # Faster connection timeouts
     limits=httpx.Limits(
-        max_keepalive_connections=50,  # Increased from 20 to 50
-        max_connections=200,           # Increased from 100 to 200 for high load
-        keepalive_expiry=90.0         # Longer keepalive for better reuse
+        max_keepalive_connections=100,  # Increased for better connection reuse
+        max_connections=500,            # Significantly increased for high load
+        keepalive_expiry=120.0          # Longer keepalive for better reuse
     ),
     follow_redirects=True
 )
 
-# Function to create optimized HTTP clients for streaming sessions
-def create_isolated_stream_client():
-    """Create an optimized HTTP client for streaming with better performance"""
-    return httpx.AsyncClient(
-        http2=True,   # Enable HTTP/2 for better streaming performance
-        timeout=httpx.Timeout(60.0, connect=10.0),  # Balanced timeouts for streaming
-        limits=httpx.Limits(
-            max_keepalive_connections=20,  # Increased for better reuse
-            max_connections=50,           # Significantly increased connection pool
-            keepalive_expiry=60.0         # Longer keepalive for better performance
-        ),
-        follow_redirects=True
-    )
+# Global persistent streaming client for better connection reuse
+streaming_client = httpx.AsyncClient(
+    http2=True,   # Enable HTTP/2 for better streaming performance
+    timeout=httpx.Timeout(45.0, connect=3.0),  # Aggressive timeouts for fast streams
+    limits=httpx.Limits(
+        max_keepalive_connections=200,  # Large connection pool for persistent connections
+        max_connections=1000,           # Very high limit for concurrent streaming
+        keepalive_expiry=180.0          # Long keepalive for persistent streaming
+    ),
+    follow_redirects=True
+)
 
 free_sky = StepDaddy()
 
@@ -95,14 +94,152 @@ class LRUCache(OrderedDict):
             del self[oldest]
 
 # Cache with size limit and TTL optimized for streaming
-stream_cache = LRUCache(maxsize=max_concurrent_streams * 10)  # Increased cache size for better performance
-cache_ttl = 60  # Increased from 20 to 60 seconds to reduce regeneration frequency
+stream_cache = LRUCache(maxsize=max_concurrent_streams * 15)  # Further increased cache size
+cache_ttl = 90  # Increased to 90 seconds for longer-lived cache entries
+
+# Advanced segment prefetching cache
+segment_cache = LRUCache(maxsize=500)  # Cache for prefetched segments
+segment_cache_ttl = 300  # 5 minutes for segments
 
 # Track active tasks and streaming sessions for cleanup
 active_tasks: Dict[str, asyncio.Task] = {}
 active_streams: Dict[str, Dict[str, float]] = {}  # Track M3U8 requests per channel with timestamps
 active_content_sessions: Dict[str, Dict[str, float]] = {}  # Track actual video streaming sessions
 session_to_channel: Dict[str, str] = {}  # Map session IDs to channel IDs
+
+async def _get_stream_parallel(channel_id: str):
+    """Get stream using parallel approach to multiple services with monitoring"""
+    start_time = time.time()
+    
+    try:
+        # Check if channel should be skipped due to recent failures
+        if stream_monitor.should_skip_channel(channel_id):
+            logger.warning(f"Skipping channel {channel_id} due to recent failures")
+            stream_monitor.record_stream_attempt(channel_id, False, 0.0)
+            return None
+        
+        # Create multiple tasks for different streaming approaches
+        tasks = []
+        
+        # Task 1: Primary DLHD service
+        tasks.append(asyncio.create_task(
+            multi_streamer.get_stream(channel_id, "DLHD"),
+            name="dlhd_primary"
+        ))
+        
+        # Task 2: Direct channel processing (bypass multi-streamer)
+        tasks.append(asyncio.create_task(
+            free_sky.stream(channel_id),
+            name="direct_stream"
+        ))
+        
+        # Task 3: Try alternative services if enabled
+        if len(multi_streamer.enabled_services) > 1:
+            for service in multi_streamer.enabled_services[1:2]:  # Try one alternative
+                tasks.append(asyncio.create_task(
+                    multi_streamer.get_stream(channel_id, service),
+                    name=f"alt_{service.lower()}"
+                ))
+        
+        # Wait for first successful result with shorter timeout for faster failover
+        done, pending = await asyncio.wait(
+            tasks, 
+            return_when=asyncio.FIRST_COMPLETED,
+            timeout=8.0  # Reduced from 10s for faster failover
+        )
+        
+        # Cancel remaining tasks
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+        # Return first successful result
+        for task in done:
+            try:
+                result = await task
+                if result:
+                    response_time = time.time() - start_time
+                    stream_monitor.record_stream_attempt(channel_id, True, response_time)
+                    logger.info(f"Parallel stream success from {task.get_name()} in {response_time:.2f}s")
+                    return result
+            except Exception as e:
+                logger.debug(f"Parallel task {task.get_name()} failed: {str(e)}")
+        
+        # If all parallel attempts failed, try sequential fallback
+        logger.warning("All parallel attempts failed, trying sequential fallback")
+        fallback_result = await multi_streamer.get_stream(channel_id)
+        
+        if fallback_result:
+            response_time = time.time() - start_time
+            stream_monitor.record_stream_attempt(channel_id, True, response_time)
+            return fallback_result
+        else:
+            stream_monitor.record_stream_attempt(channel_id, False, 0.0)
+            return None
+        
+    except Exception as e:
+        logger.error(f"Error in parallel stream fetch: {str(e)}")
+        stream_monitor.record_stream_attempt(channel_id, False, 0.0)
+        # Final fallback to original method
+        try:
+            fallback_result = await multi_streamer.get_stream(channel_id)
+            if fallback_result:
+                response_time = time.time() - start_time
+                stream_monitor.record_stream_attempt(channel_id, True, response_time)
+            return fallback_result
+        except:
+            return None
+
+async def prefetch_segments(m3u8_content: str, channel_id: str):
+    """Prefetch the first few segments of a stream for faster playback"""
+    try:
+        lines = m3u8_content.split('\n')
+        segment_urls = []
+        
+        # Extract the first 3 segments for prefetching
+        for line in lines:
+            if line.startswith('/api/content/') and len(segment_urls) < 3:
+                segment_urls.append(line.strip())
+        
+        if not segment_urls:
+            return
+        
+        logger.info(f"Prefetching {len(segment_urls)} segments for channel {channel_id}")
+        
+        # Prefetch segments concurrently
+        async def prefetch_segment(segment_url: str):
+            try:
+                segment_key = f"seg_{hash(segment_url)}"
+                current_time = time.time()
+                
+                # Check if already cached
+                if segment_key in segment_cache:
+                    cached_data, cache_time = segment_cache[segment_key]
+                    if current_time - cache_time < segment_cache_ttl:
+                        return
+                
+                # Use the streaming client to prefetch
+                full_url = f"{api_url}{segment_url}"
+                response = await streaming_client.get(full_url, timeout=5.0)
+                
+                if response.status_code == 200:
+                    segment_cache[segment_key] = (response.content, current_time)
+                    logger.debug(f"Prefetched segment {segment_url[:50]}...")
+                    
+            except Exception as e:
+                logger.debug(f"Failed to prefetch segment {segment_url}: {str(e)}")
+        
+        # Prefetch in parallel but don't wait for completion
+        tasks = [asyncio.create_task(prefetch_segment(url)) for url in segment_urls]
+        
+        # Don't await - let prefetching happen in background
+        asyncio.gather(*tasks, return_exceptions=True)
+        
+    except Exception as e:
+        logger.debug(f"Error in segment prefetching: {str(e)}")
 
 async def prefetch_popular_stream(channel_id: str):
     """Prefetch stream to keep cache warm for popular channels"""
@@ -168,9 +305,9 @@ def _process_stream_content(content: str, referer: str) -> str:
     else:
         return content
 
-# Concurrency control for streaming with configurable limits
+# Concurrency control for streaming with high-performance limits
 _stream_semaphore = asyncio.Semaphore(max_concurrent_streams)
-_content_semaphore = asyncio.Semaphore(max_concurrent_streams * 5)  # Increased to 5x for better segment throughput
+_content_semaphore = asyncio.Semaphore(max_concurrent_streams * 10)  # Increased to 10x for much better segment throughput
 
 logger.info("Backend initialized with connection pooling")
 
@@ -234,14 +371,22 @@ async def shutdown_event():
     # Clear task registry
     active_tasks.clear()
     
-    # Close HTTP client with timeout
+    # Close HTTP clients with timeout
     try:
         await asyncio.wait_for(client.aclose(), timeout=10.0)
-        logger.info("HTTP client closed successfully")
+        logger.info("Main HTTP client closed successfully")
     except asyncio.TimeoutError:
-        logger.warning("HTTP client close timed out")
+        logger.warning("Main HTTP client close timed out")
     except Exception as e:
-        logger.error(f"Error closing HTTP client: {e}")
+        logger.error(f"Error closing main HTTP client: {e}")
+    
+    try:
+        await asyncio.wait_for(streaming_client.aclose(), timeout=10.0)
+        logger.info("Streaming HTTP client closed successfully")
+    except asyncio.TimeoutError:
+        logger.warning("Streaming HTTP client close timed out")
+    except Exception as e:
+        logger.error(f"Error closing streaming HTTP client: {e}")
     
     logger.info("Shutdown procedure completed")
 
@@ -316,10 +461,10 @@ async def stream(channel_id: str):
             try:
                 logger.info(f"Generating new stream for channel {channel_id} for client {client_id}")
                 
-                # Use multi-service streamer to try multiple upstream feeds with faster timeout
+                # Use parallel multi-service streaming for faster response
                 stream_data = await asyncio.wait_for(
-                    multi_streamer.get_stream(channel_id),
-                    timeout=25.0  # Balanced timeout - reduced from 35s but increased from 10s
+                    _get_stream_parallel(channel_id),
+                    timeout=15.0  # Aggressive timeout for parallel approach
                 )
                 
                 if not stream_data:
@@ -335,10 +480,10 @@ async def stream(channel_id: str):
                     logger.info(f"Extracting HLS from vidembed URL for channel {channel_id}")
                     
                     try:
-                        # Extract HLS stream from vidembed with timeout
+                        # Extract HLS stream from vidembed with aggressive timeout
                         hls_data = await asyncio.wait_for(
                             extract_hls_from_vidembed(vidembed_url),
-                            timeout=8.0  # Reduced from 30s to 8s for faster response
+                            timeout=4.0  # Very aggressive timeout for immediate fallback
                         )
                         
                         if hls_data:
@@ -364,6 +509,10 @@ async def stream(channel_id: str):
                 
                 # Schedule prefetch for this channel to keep it warm
                 asyncio.create_task(prefetch_popular_stream(channel_id))
+                
+                # Start segment prefetching for faster playback
+                if stream_data and stream_data.startswith('#EXTM3U'):
+                    asyncio.create_task(prefetch_segments(stream_data, channel_id))
                 
                 return Response(
                     content=stream_data,
@@ -474,23 +623,22 @@ async def content(path: str, request: Request):
             async def proxy_stream():
                 last_heartbeat = time.time()
                 chunk_count = 0
-                # Create isolated client for this specific streaming session
-                isolated_client = create_isolated_stream_client()
                 
                 try:
-                    logger.info(f"Creating isolated connection for stream session {session_id}")
+                    logger.info(f"Using persistent connection pool for stream session {session_id}")
                     
-                    # Add timeout wrapper to prevent hanging connections
-                    async with asyncio.timeout(45.0):  # Increased timeout for better stability
-                        async with isolated_client.stream("GET", free_sky.content_url(path), timeout=45) as response:
-                            logger.info(f"Stream session {session_id} established new isolated connection (status: {response.status_code})")
+                    # Use persistent streaming client with aggressive timeout
+                    async with asyncio.timeout(30.0):  # Reduced timeout for faster failure detection
+                        async with streaming_client.stream("GET", free_sky.content_url(path), timeout=30.0) as response:
+                            logger.info(f"Stream session {session_id} established connection (status: {response.status_code})")
                             
-                            async for chunk in response.aiter_bytes(chunk_size=256 * 1024):  # Increased chunk size to 256KB for better throughput
+                            # Use larger chunk size for better throughput
+                            async for chunk in response.aiter_bytes(chunk_size=512 * 1024):  # 512KB chunks for optimal performance
                                 chunk_count += 1
                                 current_chunk_time = time.time()
                                 
-                                # Update session timestamp every 3 seconds for real-time tracking
-                                if current_chunk_time - last_heartbeat > 3:
+                                # Update session timestamp less frequently to reduce overhead
+                                if current_chunk_time - last_heartbeat > 5:
                                     if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
                                         active_content_sessions[channel_id][session_id] = current_chunk_time
                                         last_heartbeat = current_chunk_time
@@ -499,19 +647,12 @@ async def content(path: str, request: Request):
                                 
                     logger.info(f"Stream session {session_id} completed normally after {chunk_count} chunks")
                 except asyncio.TimeoutError:
-                    logger.warning(f"Stream session {session_id} timed out after 45 seconds")
+                    logger.warning(f"Stream session {session_id} timed out after 30 seconds")
                     raise
                 except Exception as e:
-                    logger.error(f"Error in isolated proxy stream for session {session_id}: {str(e)}")
+                    logger.error(f"Error in persistent proxy stream for session {session_id}: {str(e)}")
                     raise
                 finally:
-                    # Always close the isolated client to ensure no connection reuse
-                    try:
-                        await isolated_client.aclose()
-                        logger.debug(f"Closed isolated client for session {session_id}")
-                    except Exception as e:
-                        logger.error(f"Error closing isolated client for session {session_id}: {str(e)}")
-                    
                     # Clean up session tracking when streaming actually ends
                     if session_id and channel_id:
                         if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
@@ -784,25 +925,33 @@ async def health():
         if not active_content_sessions[channel_id]:
             del active_content_sessions[channel_id]
     
+    # Clean up old stream monitoring metrics
+    stream_monitor.cleanup_old_metrics(24)  # Clean up metrics older than 24 hours
+    
     # Calculate real streaming statistics from content sessions
     total_active_content_streams = sum(len(sessions) for sessions in active_content_sessions.values())
     total_m3u8_requests = sum(len(clients) for clients in active_streams.values())
+    
+    # Get stream monitoring metrics
+    monitor_metrics = stream_monitor.get_metrics_summary()
     
     return {
         "status": "healthy",
         "channels_count": len(free_sky.channels),
         "cache_size": len(stream_cache),
+        "segment_cache_size": len(segment_cache),
         "active_channels": len(active_content_sessions),  # Channels with active video streaming
         "total_active_streams": total_active_content_streams,  # Real video streaming sessions
         "total_m3u8_requests": total_m3u8_requests,  # Playlist requests (for debugging)
         "max_concurrent_streams": max_concurrent_streams,
-        "content_semaphore_limit": max_concurrent_streams * 2,  # Content streaming capacity
+        "content_semaphore_limit": max_concurrent_streams * 10,  # Content streaming capacity
         "stream_utilization": f"{(total_active_content_streams / max_concurrent_streams) * 100:.1f}%",
         "content_sessions_per_channel": {ch: len(sessions) for ch, sessions in active_content_sessions.items()},
         "multithreading_mode": "full_concurrency",  # Every request = separate thread
         "session_tracking": "per_request",  # No IP-based limitations
-        "connection_isolation": "per_stream",  # Each stream gets isolated HTTP client
-        "connection_reuse": "disabled",  # No connection pooling for streams
+        "connection_pooling": "persistent",  # Persistent connection pooling enabled
+        "parallel_streaming": "enabled",  # Parallel stream fetching enabled
+        "stream_monitoring": monitor_metrics,  # Stream health monitoring
         "uptime": time.time()
     }
 

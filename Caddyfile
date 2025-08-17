@@ -5,12 +5,23 @@ log {
 	level DEBUG
 }
 
-# Basic settings - compress all except streaming endpoints
+# Optimized compression settings - exclude streaming endpoints
 @compress {
     not path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /_event/* /logo/* /watch/*
 }
-encode @compress gzip
+encode @compress {
+    gzip 6          # Balanced compression level
+    zstd            # Enable zstd for better compression
+}
 root * /srv
+
+# Cache static assets aggressively
+@static_assets {
+    path *.js *.css *.woff *.woff2 *.ttf *.png *.jpg *.jpeg *.gif *.ico *.svg
+}
+header @static_assets {
+    Cache-Control "public, max-age=31536000, immutable"
+}
 
 # Streaming endpoints need permissive headers for external players
 @streaming {
@@ -77,6 +88,14 @@ handle @api_stream {
 		flush_interval -1
 		header_up X-Real-IP {remote_host}
 		header_down -Server
+		# Optimize for M3U8 delivery
+		transport http {
+			read_buffer 8192      # Smaller buffer for playlist delivery
+			write_buffer 8192
+			max_response_header 8KB
+			dial_timeout 2s       # Fast timeout for playlists
+			response_header_timeout 5s
+		}
 	}
 }
 
@@ -104,6 +123,14 @@ handle @api_content {
 		flush_interval -1
 		header_up X-Real-IP {remote_host}
 		header_down -Server
+		# Optimize for streaming
+		transport http {
+			read_buffer 16384     # 16KB read buffer
+			write_buffer 16384    # 16KB write buffer
+			max_response_header 16KB
+			dial_timeout 3s
+			response_header_timeout 10s
+		}
 	}
 }
 

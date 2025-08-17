@@ -161,9 +161,9 @@ class VidembedExtractor:
             # Set page content to include the iframe
             await self._page.set_content(iframe_html)
             
-            # Wait for iframe to load
+            # Wait for iframe to load (reduced time for speed)
             logger.info("Waiting for iframe to load...")
-            await asyncio.sleep(10)
+            await asyncio.sleep(3)  # Reduced from 10 to 3 seconds
             
             # Switch to iframe context to interact within the proper origin
             try:
@@ -173,8 +173,8 @@ class VidembedExtractor:
                     if iframe_frame:
                         logger.info("Successfully accessed iframe context")
                         
-                        # Wait for the iframe content to fully load
-                        await asyncio.sleep(5)
+                        # Wait for the iframe content to fully load (reduced)
+                        await asyncio.sleep(2)  # Reduced from 5 to 2 seconds
                         
                         # Try to interact with elements within the iframe
                         try:
@@ -198,7 +198,7 @@ class VidembedExtractor:
                                     try:
                                         await button.click()
                                         logger.info(f"Clicked play button {i+1} in iframe")
-                                        await asyncio.sleep(3)
+                                        await asyncio.sleep(1)  # Reduced interaction delay
                                     except:
                                         pass
                         except Exception as e:
@@ -210,8 +210,8 @@ class VidembedExtractor:
             except Exception as e:
                 logger.warning(f"Error accessing iframe: {str(e)}")
             
-            # Wait additional time for API calls to be made
-            await asyncio.sleep(10)
+            # Wait reduced time for API calls to be made
+            await asyncio.sleep(4)  # Reduced from 10 to 4 seconds
             
             logger.info(f"Captured {len(api_requests)} API requests and {len(hls_requests)} HLS requests")
             

@@ -36,9 +36,9 @@ class StepDaddyHybrid:
         max_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "10"))
         
         session_config = {
-            "timeout": 15,  # Reduced from 45s to 15s for faster stream generation
+            "timeout": 8,   # Aggressive timeout for very fast stream generation
             "impersonate": "chrome110",
-            "max_redirects": 3,  # Reduced redirects to speed up requests
+            "max_redirects": 2,  # Minimal redirects for speed
         }
         
         if socks5:
