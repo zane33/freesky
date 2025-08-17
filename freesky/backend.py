@@ -50,11 +50,11 @@ fastapi_app = FastAPI(
 # This client is used for non-streaming requests (logos, keys, etc.)
 client = httpx.AsyncClient(
     http2=True,
-    timeout=httpx.Timeout(45.0, connect=15.0),  # Increased timeouts for stability
+    timeout=httpx.Timeout(45.0, connect=10.0),  # Balanced timeouts
     limits=httpx.Limits(
-        max_keepalive_connections=20,  # Increased from 5 to 20
-        max_connections=100,           # Increased from 25 to 100
-        keepalive_expiry=60.0         # Longer keepalive for better reuse
+        max_keepalive_connections=50,  # Increased from 20 to 50
+        max_connections=200,           # Increased from 100 to 200 for high load
+        keepalive_expiry=90.0         # Longer keepalive for better reuse
     ),
     follow_redirects=True
 )
@@ -64,11 +64,11 @@ def create_isolated_stream_client():
     """Create an optimized HTTP client for streaming with better performance"""
     return httpx.AsyncClient(
         http2=True,   # Enable HTTP/2 for better streaming performance
-        timeout=httpx.Timeout(60.0, connect=15.0),  # Increased timeouts for streaming
+        timeout=httpx.Timeout(60.0, connect=10.0),  # Balanced timeouts for streaming
         limits=httpx.Limits(
-            max_keepalive_connections=5,  # Allow some connection reuse for efficiency
-            max_connections=10,           # Increased connection pool
-            keepalive_expiry=30.0         # Moderate keepalive for performance
+            max_keepalive_connections=20,  # Increased for better reuse
+            max_connections=50,           # Significantly increased connection pool
+            keepalive_expiry=60.0         # Longer keepalive for better performance
         ),
         follow_redirects=True
     )
@@ -170,7 +170,7 @@ def _process_stream_content(content: str, referer: str) -> str:
 
 # Concurrency control for streaming with configurable limits
 _stream_semaphore = asyncio.Semaphore(max_concurrent_streams)
-_content_semaphore = asyncio.Semaphore(max_concurrent_streams)  # Reduced from 2x to 1x
+_content_semaphore = asyncio.Semaphore(max_concurrent_streams * 5)  # Increased to 5x for better segment throughput
 
 logger.info("Backend initialized with connection pooling")
 
@@ -485,7 +485,7 @@ async def content(path: str, request: Request):
                         async with isolated_client.stream("GET", free_sky.content_url(path), timeout=45) as response:
                             logger.info(f"Stream session {session_id} established new isolated connection (status: {response.status_code})")
                             
-                            async for chunk in response.aiter_bytes(chunk_size=64 * 1024):  # Increased chunk size from 16KB to 64KB
+                            async for chunk in response.aiter_bytes(chunk_size=256 * 1024):  # Increased chunk size to 256KB for better throughput
                                 chunk_count += 1
                                 current_chunk_time = time.time()
                                 
