@@ -36,9 +36,9 @@ class StepDaddyHybrid:
         max_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "10"))
         
         session_config = {
-            "timeout": 8,   # Aggressive timeout for very fast stream generation
+            "timeout": 15,   # Increased timeout for reliability
             "impersonate": "chrome110",
-            "max_redirects": 2,  # Minimal redirects for speed
+            "max_redirects": 10,  # Increased to handle more redirects
         }
         
         if socks5:
@@ -70,7 +70,12 @@ class StepDaddyHybrid:
             channels = []
             try:
                 logger.debug(f"Starting channel load from {self._base_url}/stream/24-7-channels.php")
-                response = await self._session.get(f"{self._base_url}/stream/24-7-channels.php", headers=self._headers())
+                response = await self._session.get(
+                    f"{self._base_url}/stream/24-7-channels.php", 
+                    headers=self._headers(),
+                    allow_redirects=True,
+                    max_redirects=10
+                )
                 
                 logger.debug(f"Got response with status {response.status_code}")
                 if response.status_code != 200:
@@ -107,6 +112,23 @@ class StepDaddyHybrid:
                 logger.info(f"Successfully processed {len(channels)} channels")
             except Exception as e:
                 logger.error(f"Error loading channels: {str(e)}", exc_info=True)
+                # Try to load fallback channels if primary source fails
+                try:
+                    logger.info("Attempting to load fallback channels...")
+                    fallback_path = os.path.join(os.path.dirname(__file__), 'fallback_channels.json')
+                    if os.path.exists(fallback_path):
+                        with open(fallback_path, 'r') as f:
+                            fallback_data = json.load(f)
+                            for ch in fallback_data:
+                                channels.append(Channel(
+                                    id=ch.get('id', ''),
+                                    name=ch.get('name', 'Unknown'),
+                                    tags=ch.get('tags', []),
+                                    logo=ch.get('logo', '/missing.png')
+                                ))
+                        logger.info(f"Loaded {len(channels)} fallback channels")
+                except Exception as fb_error:
+                    logger.error(f"Failed to load fallback channels: {str(fb_error)}")
             finally:
                 if channels:
                     logger.debug(f"Updating channels list with {len(channels)} channels")
