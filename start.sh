@@ -18,21 +18,23 @@ if ! curl -s --connect-timeout 10 "${DADDYLIVE_URI:-https://thedaddy.click}" >/d
     echo "Warning: Cannot connect to content provider at ${DADDYLIVE_URI:-https://thedaddy.click}"
 fi
 
-# Check if frontend exists and matches current configuration
+# Always force frontend rebuild to ensure correct API_URL
 FRONTEND_CONFIG_FILE="/srv/.config.json"
-CURRENT_API_URL="${API_URL:-http://localhost:${PORT:-3001}}"
-NEEDS_REBUILD=false
 
-if [ ! -f "$FRONTEND_CONFIG_FILE" ]; then
-    echo "Frontend configuration not found, will compile frontend..."
-    NEEDS_REBUILD=true
-else
-    STORED_API_URL=$(cat "$FRONTEND_CONFIG_FILE" 2>/dev/null | grep -o '"api_url":"[^"]*"' | cut -d'"' -f4)
-    if [ "$STORED_API_URL" != "$CURRENT_API_URL" ]; then
-        echo "API URL changed from $STORED_API_URL to $CURRENT_API_URL, will recompile frontend..."
-        NEEDS_REBUILD=true
-    fi
-fi
+# Use the exact API_URL from environment, this is critical for container networking
+CURRENT_API_URL="${API_URL}"
+NEEDS_REBUILD=true
+
+echo "Environment variables:"
+echo "  API_URL=${API_URL}"
+echo "  DOCKER_HOST_IP=${DOCKER_HOST_IP}"
+echo "  PORT=${PORT}"
+echo "  BACKEND_PORT=${BACKEND_PORT}"
+
+echo "Using API_URL for frontend compilation: $CURRENT_API_URL"
+
+# Clean any existing frontend
+rm -rf /srv/* 2>/dev/null || true
 
 # Compile frontend if needed
 if [ "$NEEDS_REBUILD" = true ]; then
@@ -50,9 +52,17 @@ if [ "$NEEDS_REBUILD" = true ]; then
             echo "Moving compiled frontend to /srv..."
             rm -rf /srv/*
             cp -r .web/_static/* /srv/
+            
+            # Inject correct WebSocket URL into any JavaScript files as backup
+            # Convert API_URL to WebSocket URL (http://host:port -> ws://host:port/_event)
+            WS_URL=$(echo "$CURRENT_API_URL" | sed 's|^http://|ws://|')/_event
+            echo "Injecting WebSocket URL: $WS_URL"
+            find /srv -name "*.js" -type f -exec sed -i "s|ws://[^/]*:[0-9]*/_event|$WS_URL|g" {} \; 2>/dev/null || true
+            find /srv -name "*.js" -type f -exec sed -i "s|ws://localhost:3000/_event|$WS_URL|g" {} \; 2>/dev/null || true
+            
             # Save configuration for future comparison
             echo "{\"api_url\":\"$CURRENT_API_URL\"}" > "$FRONTEND_CONFIG_FILE"
-            echo "Frontend compiled and deployed successfully"
+            echo "Frontend compiled and deployed successfully with WebSocket URL: $WS_URL"
         else
             echo "Warning: Frontend compilation completed but no static files found"
         fi

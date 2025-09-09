@@ -4,6 +4,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        PORT: 3001
+        API_URL: http://192.168.3.148:3001
+        BACKEND_PORT: 8005
     
     # Replace with actual container ID/name or comment out for default networking
     network_mode: "container:transmission-openvpn"
