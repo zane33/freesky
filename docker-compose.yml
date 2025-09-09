@@ -17,7 +17,7 @@ services:
     
     environment:
       # Application Configuration
-      - PORT=${PORT:-3000}
+      - PORT=${PORT:-3001}
       - BACKEND_PORT=${BACKEND_PORT:-8005}
       - HOST_IP=${HOST_IP:-0.0.0.0}  # Dynamic host IP, will use 0.0.0.0 if not set
       - DOCKER_HOST_IP=${DOCKER_HOST_IP:-localhost}  # External hostname/IP for client-facing URLs
