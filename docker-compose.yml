@@ -6,23 +6,23 @@ services:
       dockerfile: Dockerfile
     
     # Replace with actual container ID/name or comment out for default networking
-    network_mode: "container:transmission-openvpn"
+    #network_mode: "container:transmission-openvpn"
     
     # Ports are not needed when using container networking
     # Comment out if using container networking
-    #ports:
-    #  - "${PORT:-3000}:${PORT:-3000}"
-    #  - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
-    #  - "2019:2019"  # Expose Caddy admin port for debugging
+    ports:
+      - "3001:3001"
+      - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
+      - "2019:2019"  # Expose Caddy admin port for debugging
     
     environment:
       # Application Configuration
-      - PORT=${PORT:-3001}
+      - PORT=3001
       - BACKEND_PORT=${BACKEND_PORT:-8005}
       - HOST_IP=${HOST_IP:-0.0.0.0}  # Dynamic host IP, will use 0.0.0.0 if not set
-      - DOCKER_HOST_IP=${DOCKER_HOST_IP:-localhost}  # External hostname/IP for client-facing URLs
+      - DOCKER_HOST_IP=192.168.3.148  # External hostname/IP for client-facing URLs
       - BACKEND_URI=${BACKEND_URI:-}  # Let rxconfig determine this dynamically
-      - API_URL=${API_URL:-}  # Let rxconfig determine this dynamically
+      - API_URL=http://192.168.3.148:3001  # Explicitly set for correct WebSocket connection
       
       # External Services
       - DADDYLIVE_URI=${DADDYLIVE_URI:-https://thedaddy.top}
