@@ -18,12 +18,10 @@ if ! curl -s --connect-timeout 10 "${DADDYLIVE_URI:-https://thedaddy.click}" >/d
     echo "Warning: Cannot connect to content provider at ${DADDYLIVE_URI:-https://thedaddy.click}"
 fi
 
-# Always force frontend rebuild to ensure correct API_URL
 FRONTEND_CONFIG_FILE="/srv/.config.json"
 
 # Use the exact API_URL from environment, this is critical for container networking
 CURRENT_API_URL="${API_URL}"
-NEEDS_REBUILD=true
 
 echo "Environment variables:"
 echo "  API_URL=${API_URL}"
@@ -31,46 +29,19 @@ echo "  DOCKER_HOST_IP=${DOCKER_HOST_IP}"
 echo "  PORT=${PORT}"
 echo "  BACKEND_PORT=${BACKEND_PORT}"
 
-echo "Using API_URL for frontend compilation: $CURRENT_API_URL"
-
-# Clean any existing frontend
-rm -rf /srv/* 2>/dev/null || true
-
-# Compile frontend if needed
-if [ "$NEEDS_REBUILD" = true ]; then
-    echo "Compiling frontend with API_URL=$CURRENT_API_URL..."
-    cd /app
-    
-    # Set environment for compilation
-    export REFLEX_ENV=prod
-    export REFLEX_SKIP_COMPILE=0
-    
-    # Try to compile frontend
-    if timeout 120 reflex export --no-zip --frontend-only 2>&1 | tee /tmp/reflex_export.log; then
-        # Move compiled frontend to serving directory
-        if [ -d ".web/_static" ]; then
-            echo "Moving compiled frontend to /srv..."
-            rm -rf /srv/*
-            cp -r .web/_static/* /srv/
-            
-            # Inject correct WebSocket URL into any JavaScript files as backup
-            # Convert API_URL to WebSocket URL (http://host:port -> ws://host:port/_event)
-            WS_URL=$(echo "$CURRENT_API_URL" | sed 's|^http://|ws://|')/_event
-            echo "Injecting WebSocket URL: $WS_URL"
-            find /srv -name "*.js" -type f -exec sed -i "s|ws://[^/]*:[0-9]*/_event|$WS_URL|g" {} \; 2>/dev/null || true
-            find /srv -name "*.js" -type f -exec sed -i "s|ws://localhost:3000/_event|$WS_URL|g" {} \; 2>/dev/null || true
-            
-            # Save configuration for future comparison
-            echo "{\"api_url\":\"$CURRENT_API_URL\"}" > "$FRONTEND_CONFIG_FILE"
-            echo "Frontend compiled and deployed successfully with WebSocket URL: $WS_URL"
-        else
-            echo "Warning: Frontend compilation completed but no static files found"
-        fi
-    else
-        echo "Warning: Frontend compilation failed or timed out"
-        echo "Check /tmp/reflex_export.log for details"
-        # Create a fallback HTML page
-        cat > /srv/index.html << EOF
+# ponytail: no runtime rebuild. The Dockerfile already builds the frontend into
+# /srv and then deletes .web (node_modules), so `reflex export` here can only
+# fail — and it used to wipe /srv first, leaving Caddy with nothing to serve.
+# Runtime API_URL is handled by the sed injection below.
+if [ -f /srv/index.html ]; then
+    WS_URL=$(echo "$CURRENT_API_URL" | sed 's|^http://|ws://|')/_event
+    echo "Injecting WebSocket URL: $WS_URL"
+    find /srv -name "*.js" -type f -exec sed -i "s|ws://[^/]*:[0-9]*/_event|$WS_URL|g" {} \; 2>/dev/null || true
+    echo "{\"api_url\":\"$CURRENT_API_URL\"}" > "$FRONTEND_CONFIG_FILE"
+    echo "Frontend ready with WebSocket URL: $WS_URL"
+else
+    echo "ERROR: /srv/index.html missing - frontend build failed at image build time"
+    cat > /srv/index.html << EOF
 <!DOCTYPE html>
 <html>
 <head>
@@ -93,9 +64,6 @@ if [ "$NEEDS_REBUILD" = true ]; then
 </body>
 </html>
 EOF
-    fi
-else
-    echo "Frontend already compiled with correct configuration"
 fi
 
 # Set environment variables to prevent recompilation at runtime
