@@ -24,9 +24,11 @@ WORKDIR /app
 
 # Install python app requirements and reflex in the container
 COPY requirements.txt .
-RUN pip install -r requirements.txt && \
-    python -c "import pydantic; print('PYDANTIC_INSTALLED=' + pydantic.VERSION)" && \
-    python -c "import reflex; print('REFLEX_IMPORT_OK')"
+# Distinct exit codes so the failing step is identifiable from Portainer's error
+# summary alone (it does not surface build stdout).
+RUN pip install -r requirements.txt || exit 21; \
+    python -c "import pydantic,sys; print(pydantic.VERSION); sys.exit(0 if pydantic.VERSION.startswith('2.10.') else 22)" || exit 22; \
+    python -c "import reflex" || exit 23
 
 # Install Playwright browsers for vidembed iframe authentication (without system dependencies)
 RUN playwright install chromium
