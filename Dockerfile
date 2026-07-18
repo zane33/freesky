@@ -48,28 +48,23 @@ ENV PORT=${PORT:-3000} \
     REFLEX_ENV=prod
 
 # Initialize Reflex and build frontend
+# ponytail: no `|| minimal frontend` fallback. It swallowed the real rolldown
+# error and shipped a "successful" image serving a 152-byte stub. Fail loudly.
 RUN echo "Building frontend with API_URL=$API_URL" && \
-    echo "Current directory: $(pwd)" && \
-    echo "Node.js version: $(node --version)" && \
-    echo "npm version: $(npm --version)" && \
     echo "Reflex version: $(reflex --version)" && \
     mkdir -p /srv && \
-    (cd /app && \
-     reflex init && \
-     cd .web && \
-     npm config set strict-ssl false && \
-     npm config set registry https://registry.npmjs.org/ && \
-     (npm install --legacy-peer-deps || npm install --legacy-peer-deps --verbose) && \
-     cd .. && \
-     reflex export --frontend-only --no-zip && \
-     mv .web/build/client/* /srv/ && \
-     rm -rf .web && \
-     echo "Frontend build successful - contents of /srv:" && \
-     ls -la /srv/) || \
-    (echo "Frontend build failed, creating minimal frontend" && \
-     mkdir -p /srv && \
-     echo "<html><body><h1>freesky</h1><p>Frontend build failed, but backend is running.</p><p>Check the Docker build logs for more information.</p></body></html>" > /srv/index.html && \
-     echo "Minimal frontend created")
+    cd /app && \
+    reflex init && \
+    cd .web && \
+    npm config set strict-ssl false && \
+    npm config set registry https://registry.npmjs.org/ && \
+    npm install --legacy-peer-deps && \
+    cd .. && \
+    reflex export --frontend-only --no-zip && \
+    mv .web/build/client/* /srv/ && \
+    rm -rf .web && \
+    echo "Frontend build successful - contents of /srv:" && \
+    ls -la /srv/
 
 # Final image with only necessary files
 FROM python:3.13-slim
