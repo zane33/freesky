@@ -1,8 +1,10 @@
 reflex==0.8.28
 curl-cffi==0.11.4
-httpx[http2]==0.28.1
+# fastapi/uvicorn/httpx are reflex dependencies too — left unpinned so reflex's own
+# constraints resolve. Pinning them to 0.8.0-era versions made the resolve impossible.
+httpx[http2]
 python-dateutil==2.9.0
-uvicorn[standard]==0.32.1
+uvicorn[standard]
 aiohttp==3.10.11
-fastapi==0.115.6
+fastapi
 playwright==1.54.0
