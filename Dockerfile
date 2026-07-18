@@ -24,7 +24,9 @@ WORKDIR /app
 
 # Install python app requirements and reflex in the container
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install -r requirements.txt && \
+    python -c "import pydantic; print('PYDANTIC_INSTALLED=' + pydantic.VERSION)" && \
+    python -c "import reflex; print('REFLEX_IMPORT_OK')"
 
 # Install Playwright browsers for vidembed iframe authentication (without system dependencies)
 RUN playwright install chromium

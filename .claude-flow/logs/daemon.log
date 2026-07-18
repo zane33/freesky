@@ -9,3 +9,10 @@
 [2026-07-18T09:23:06.041Z] [INFO] Lifecycle monitor active (workspace-removal, ttl=43200s)
 [2026-07-18T09:23:06.042Z] [INFO] Daemon started (PID: 48784, CPUs: 10, workers: 7, maxCpuLoad: 8, minFreeMemoryPercent: 5%)
 [2026-07-18T09:23:06.042Z] [INFO] Worker map deferred: Memory too low: 1.1% free
+[2026-07-18T09:25:06.041Z] [INFO] Worker audit deferred: Memory too low: 2.3% free
+[2026-07-18T09:27:06.038Z] [INFO] Worker optimize deferred: Memory too low: 0.9% free
+[2026-07-18T09:29:06.035Z] [INFO] Worker consolidate deferred: Memory too low: 2.2% free
+[2026-07-18T09:31:06.113Z] [INFO] Worker testgaps deferred: Memory too low: 2.8% free
+[2026-07-18T09:33:06.113Z] [INFO] Worker backup deferred: Memory too low: 2.7% free
+[2026-07-18T09:35:06.113Z] [INFO] Worker harness deferred: Memory too low: 2.2% free
+[2026-07-18T09:35:06.113Z] [INFO] Worker audit deferred: Memory too low: 2.2% free
