@@ -24,9 +24,17 @@ WORKDIR /app
 
 # Install python app requirements and reflex in the container
 COPY requirements.txt .
-RUN pip install -r requirements.txt && \
-    (python -c "import reflex" > /app/diag.txt 2>&1 || true) && \
-    pip freeze > /app/versions.txt
+RUN pip install -r requirements.txt
+
+# reflex 0.8.0's pydantic_v1_patch aliases sys.modules["pydantic"] -> pydantic.v1, then
+# imports sqlmodel, whose module-scope `from pydantic._internal._fields import ...`
+# resolves through that alias and dies (pydantic.v1 has no _internal). Pre-importing it
+# at interpreter startup caches the submodule so the alias is never traversed.
+# ponytail: sitecustomize shim; delete once reflex is upgraded past the v1 patch.
+RUN python -c "import sysconfig, pathlib; \
+    (pathlib.Path(sysconfig.get_paths()['purelib']) / 'sitecustomize.py') \
+    .write_text('import pydantic._internal._fields\n')" && \
+    python -c "import reflex" || exit 23
 
 # Install Playwright browsers for vidembed iframe authentication (without system dependencies)
 RUN playwright install chromium
