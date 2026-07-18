@@ -29,7 +29,7 @@ services:
       - API_URL=http://192.168.3.148:3001  # Explicitly set for correct WebSocket connection
       
       # External Services
-      - DADDYLIVE_URI=${DADDYLIVE_URI:-https://thedaddy.top}
+      - DADDYLIVE_URI=${DADDYLIVE_URI:-https://dlhd.st}
       
       # Application Settings
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}

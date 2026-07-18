@@ -9,7 +9,7 @@ echo "🐳 Building optimized freesky Docker container..."
 PORT=${PORT:-3000}
 BACKEND_PORT=${BACKEND_PORT:-8005}
 API_URL=${API_URL:-"http://0.0.0.0:${PORT}"}
-DADDYLIVE_URI=${DADDYLIVE_URI:-"https://thedaddy.click"}
+DADDYLIVE_URI=${DADDYLIVE_URI:-"https://dlhd.st"}
 PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
 SOCKS5=${SOCKS5:-""}
 

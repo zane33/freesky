@@ -53,7 +53,7 @@ class DLHDStreamer(BaseStreamer):
     
     def __init__(self):
         super().__init__("DLHD")
-        self.base_url = "https://thedaddy.click"
+        self.base_url = "https://dlhd.st"
     
     async def get_stream_url(self, channel_id: str) -> Optional[str]:
         """Get stream URL using your existing hybrid approach"""

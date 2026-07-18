@@ -14,8 +14,8 @@ fi
 
 # Test connection to DADDYLIVE_URI
 echo "Testing connection to content provider..."
-if ! curl -s --connect-timeout 10 "${DADDYLIVE_URI:-https://thedaddy.click}" >/dev/null; then
-    echo "Warning: Cannot connect to content provider at ${DADDYLIVE_URI:-https://thedaddy.click}"
+if ! curl -s --connect-timeout 10 "${DADDYLIVE_URI:-https://dlhd.st}" >/dev/null; then
+    echo "Warning: Cannot connect to content provider at ${DADDYLIVE_URI:-https://dlhd.st}"
 fi
 
 FRONTEND_CONFIG_FILE="/srv/.config.json"

@@ -14,7 +14,7 @@ set API_URL=%API_URL%
 if "%API_URL%"=="" set API_URL=http://0.0.0.0:%PORT%
 
 set DADDYLIVE_URI=%DADDYLIVE_URI%
-if "%DADDYLIVE_URI%"=="" set DADDYLIVE_URI=https://thedaddy.click
+if "%DADDYLIVE_URI%"=="" set DADDYLIVE_URI=https://dlhd.st
 
 set PROXY_CONTENT=%PROXY_CONTENT%
 if "%PROXY_CONTENT%"=="" set PROXY_CONTENT=TRUE

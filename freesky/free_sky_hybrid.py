@@ -2,6 +2,7 @@
 """
 Hybrid streaming architecture that handles both old and new dlhd.click patterns
 """
+import html
 import json
 import os
 import re
@@ -69,9 +70,9 @@ class StepDaddyHybrid:
         async with self._load_lock:
             channels = []
             try:
-                logger.debug(f"Starting channel load from {self._base_url}/stream/24-7-channels.php")
+                logger.debug(f"Starting channel load from {self._base_url}/24-7-channels.php")
                 response = await self._session.get(
-                    f"{self._base_url}/stream/24-7-channels.php", 
+                    f"{self._base_url}/24-7-channels.php",
                     headers=self._headers(),
                     allow_redirects=True,
                     max_redirects=10
@@ -82,17 +83,20 @@ class StepDaddyHybrid:
                     logger.error(f"Failed to fetch channels: HTTP {response.status_code}")
                     return
 
-                logger.debug("Looking for channels block in response")
-                channels_block = re.compile("<center><h1(.+?)tab-2", re.MULTILINE | re.DOTALL).findall(str(response.text))
+                # ponytail: upstream moved to /watch.php?id=N cards; old
+                # "<center><h1 ... tab-2" block + <strong> markup is gone.
+                logger.debug("Extracting channel cards from response")
+                channels_data = re.findall(
+                    r'href="/watch\.php\?id=(\d+)"[^>]*?>\s*<div class="card__title">(.*?)</div>',
+                    str(response.text),
+                    re.DOTALL,
+                )
+                logger.debug(f"Found {len(channels_data)} raw channel entries")
 
-                if not channels_block:
-                    logger.error("No channels block found in response")
+                if not channels_data:
+                    logger.error("No channel cards found in response")
                     logger.debug(f"Response text: {response.text[:500]}...")
                     return
-
-                logger.debug("Found channels block, extracting channel data")
-                channels_data = re.compile("href=\"(.*)\" target(.*)<strong>(.*)</strong>").findall(channels_block[0])
-                logger.debug(f"Found {len(channels_data)} raw channel entries")
 
                 # Process channels concurrently for better performance
                 tasks = []
@@ -145,15 +149,16 @@ class StepDaddyHybrid:
             return None
 
     def _get_channel(self, channel_data) -> Channel:
-        channel_id = channel_data[0].split('-')[1].replace('.php', '')
-        channel_name = channel_data[2]
+        # channel_data is (id, name) from the /watch.php?id=N card markup
+        channel_id = channel_data[0]
+        channel_name = html.unescape(channel_data[1]).strip()
         if channel_id == "666":
             channel_name = "Nick Music"
         if channel_id == "609":
             channel_name = "Yas TV UAE"
-        if channel_data[2] == "#0 Spain":
+        if channel_name == "#0 Spain":
             channel_name = "Movistar Plus+"
-        elif channel_data[2] == "#Vamos Spain":
+        elif channel_name == "#Vamos Spain":
             channel_name = "Vamos Spain"
         clean_channel_name = re.sub(r"\s*\(.*?\)", "", channel_name)
         meta = self._meta.get(clean_channel_name, {})
@@ -168,7 +173,7 @@ class StepDaddyHybrid:
         """
         try:
             # First, get the channel page to determine architecture
-            channel_page_url = f"{self._base_url}/stream/stream-{channel_id}.php"
+            channel_page_url = f"{self._base_url}/watch.php?id={channel_id}"
             response = await self._session.get(channel_page_url, headers=self._headers())
             
             if response.status_code != 200:

@@ -7,7 +7,7 @@ Inspired by Kodi addons from https://github.com/LoopAddon/repository.the-loop
 STREAMING_SERVICES = {
     "DLHD": {
         "name": "DaddyLive HD",
-        "base_url": "https://thedaddy.click",
+        "base_url": "https://dlhd.st",
         "enabled": True,
         "priority": 1,
         "description": "Your existing DLHD streaming service",
