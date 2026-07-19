@@ -11,6 +11,7 @@ import logging
 import asyncio
 from urllib.parse import quote, urlparse
 from curl_cffi import AsyncSession
+from dataclasses import dataclass
 from typing import List
 from .utils import encrypt, decrypt, urlsafe_base64, extract_and_decode_var
 from .token_validator import TokenValidator, extract_viable_streams
@@ -24,7 +25,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class Channel(rx.Base):
+@dataclass
+class Channel:
     id: str
     name: str
     tags: List[str]

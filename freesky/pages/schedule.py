@@ -123,6 +123,11 @@ class ScheduleState(rx.State):
     def set_switch(self, value: bool):
         self.switch = value
 
+    # reflex 0.9 no longer auto-generates set_* handlers (state_auto_setters=False)
+    @rx.event
+    def set_search_query(self, value: str):
+        self.search_query = value
+
     @rx.var
     def filtered_events(self) -> List[EventItem]:
         now = datetime.now(ZoneInfo("UTC")) - timedelta(minutes=30)
