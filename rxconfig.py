@@ -56,7 +56,10 @@ config = rx.Config(
     proxy_content=proxy_content,
     socks5=socks5,
     host_ip=host_ip,
-    frontend_port=frontend_port,
+    # NOTE: no frontend_port here. reflex 0.9 rejects `reflex run --backend-only`
+    # ("Cannot specify --frontend-port when not running frontend") when the config
+    # sets it, and start.sh runs backend-only with Caddy serving /srv. The local
+    # `frontend_port` var above still drives api_url, which is what clients use.
     # Configure CSP headers with broader permissions for development
     frontend_headers={
         "Content-Security-Policy": (
