@@ -5,8 +5,8 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        PORT: 3001
-        API_URL: http://192.168.3.148:3001
+        PORT: 3000
+        API_URL: http://192.168.3.148:3000
         BACKEND_PORT: 8005
     
     # Replace with actual container ID/name or comment out for default networking
@@ -15,18 +15,18 @@ services:
     # Ports are not needed when using container networking
     # Comment out if using container networking
     #ports:
-    #  - "3001:3001"
+    #  - "3000:3000"
     #  - "${BACKEND_PORT:-8005}:${BACKEND_PORT:-8005}"
     #  - "2019:2019"  # Expose Caddy admin port for debugging
     
     environment:
       # Application Configuration
-      - PORT=3001
+      - PORT=3000
       - BACKEND_PORT=${BACKEND_PORT:-8005}
       - HOST_IP=${HOST_IP:-0.0.0.0}  # Dynamic host IP, will use 0.0.0.0 if not set
       - DOCKER_HOST_IP=192.168.3.148  # External hostname/IP for client-facing URLs
       - BACKEND_URI=${BACKEND_URI:-}  # Let rxconfig determine this dynamically
-      - API_URL=http://192.168.3.148:3001  # Explicitly set for correct WebSocket connection
+      - API_URL=http://192.168.3.148:3000  # Explicitly set for correct WebSocket connection
       
       # External Services
       - DADDYLIVE_URI=${DADDYLIVE_URI:-https://dlhd.st}
@@ -59,7 +59,9 @@ services:
     
     # Health Check
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-3000}/health", "||", "exit", "1"]
+      # CMD-SHELL, not CMD: exec form has no shell, so "||" and "exit" were passed
+      # to curl as extra URLs and the check failed even when the app was healthy.
+      test: ["CMD-SHELL", "curl -f http://localhost:${PORT:-3000}/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

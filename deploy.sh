@@ -67,7 +67,7 @@ deploy_standalone() {
         print_info "Creating .env file from template..."
         cp .env.example .env
         sed -i "s/DOCKER_HOST_IP=192.168.1.100/DOCKER_HOST_IP=$HOST_IP/g" .env
-        sed -i "s/API_URL=http:\/\/192.168.1.100:3001/API_URL=http:\/\/$HOST_IP:3001/g" .env
+        sed -i "s/API_URL=http:\/\/192.168.1.100:3000/API_URL=http:\/\/$HOST_IP:3000/g" .env
     fi
     
     # Deploy using standalone compose file
@@ -79,13 +79,13 @@ deploy_standalone() {
     sleep 10
     
     # Check health
-    if curl -sf "http://$HOST_IP:3001/health" >/dev/null 2>&1; then
+    if curl -sf "http://$HOST_IP:3000/health" >/dev/null 2>&1; then
         print_success "FreeSky deployed successfully!"
         print_info "Access URLs:"
-        print_info "  Frontend: http://$HOST_IP:3001"
-        print_info "  API: http://$HOST_IP:3001/api/"
-        print_info "  Channels: http://$HOST_IP:3001/channels"
-        print_info "  Playlist: http://$HOST_IP:3001/playlist.m3u8"
+        print_info "  Frontend: http://$HOST_IP:3000"
+        print_info "  API: http://$HOST_IP:3000/api/"
+        print_info "  Channels: http://$HOST_IP:3000/channels"
+        print_info "  Playlist: http://$HOST_IP:3000/playlist.m3u8"
     else
         print_error "Health check failed. Check logs with: docker-compose -f docker-compose.standalone.yml logs"
     fi
@@ -111,7 +111,7 @@ deploy_with_transmission() {
         print_info "Creating .env file for transmission deployment..."
         cp .env.example .env
         sed -i "s/DOCKER_HOST_IP=192.168.1.100/DOCKER_HOST_IP=$TRANSMISSION_IP/g" .env
-        sed -i "s/API_URL=http:\/\/192.168.1.100:3001/API_URL=http:\/\/$TRANSMISSION_IP:3001/g" .env
+        sed -i "s/API_URL=http:\/\/192.168.1.100:3000/API_URL=http:\/\/$TRANSMISSION_IP:3000/g" .env
     fi
     
     # Deploy using main compose file
