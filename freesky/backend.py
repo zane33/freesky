@@ -141,33 +141,48 @@ async def _get_stream_parallel(channel_id: str):
                     name=f"alt_{service.lower()}"
                 ))
         
-        # Wait for first successful result with shorter timeout for faster failover
-        done, pending = await asyncio.wait(
-            tasks, 
-            return_when=asyncio.FIRST_COMPLETED,
-            timeout=8.0  # Reduced from 10s for faster failover
-        )
-        
-        # Cancel remaining tasks
+        # Wait for the first task that actually SUCCEEDS, not the first that finishes.
+        # FIRST_COMPLETED alone cancelled the healthy task whenever a dead service
+        # errored out first, so every channel 404'd on the fastest failure.
+        pending = set(tasks)
+        deadline = time.time() + 8.0
+
+        while pending:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+
+            done, pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=remaining
+            )
+            if not done:
+                break  # timed out
+
+            for task in done:
+                try:
+                    result = await task
+                except Exception as e:
+                    logger.debug(f"Parallel task {task.get_name()} failed: {str(e)}")
+                    continue
+                if result:
+                    for other in pending:
+                        other.cancel()
+                    response_time = time.time() - start_time
+                    stream_monitor.record_stream_attempt(channel_id, True, response_time)
+                    logger.info(f"Parallel stream success from {task.get_name()} in {response_time:.2f}s")
+                    return result
+
+        # Nothing succeeded within the deadline — drop whatever is still running.
         for task in pending:
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-        
-        # Return first successful result
-        for task in done:
-            try:
-                result = await task
-                if result:
-                    response_time = time.time() - start_time
-                    stream_monitor.record_stream_attempt(channel_id, True, response_time)
-                    logger.info(f"Parallel stream success from {task.get_name()} in {response_time:.2f}s")
-                    return result
-            except Exception as e:
-                logger.debug(f"Parallel task {task.get_name()} failed: {str(e)}")
-        
+
+
         # If all parallel attempts failed, try sequential fallback
         logger.warning("All parallel attempts failed, trying sequential fallback")
         fallback_result = await multi_streamer.get_stream(channel_id)

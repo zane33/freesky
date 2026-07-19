@@ -2,6 +2,7 @@
 """
 Hybrid streaming architecture that handles both old and new dlhd.click patterns
 """
+import base64
 import html
 import json
 import os
@@ -9,7 +10,7 @@ import re
 import reflex as rx
 import logging
 import asyncio
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 from curl_cffi import AsyncSession
 from dataclasses import dataclass
 from typing import List
@@ -169,10 +170,75 @@ class StepDaddyHybrid:
             logo = f"/api/logo/{urlsafe_base64(logo)}"
         return Channel(id=channel_id, name=channel_name, tags=meta.get("tags", []), logo=logo)
 
+    # ponytail: hosts are discovered from the pages, never hardcoded. Upstream has already
+    # moved twice (vidembed.re, fnjplay.xyz -> both dead); following the iframe chain
+    # survives the next move without a code change.
+    _IFRAME_RE = re.compile(r'<iframe[^>]+src=["\']([^"\']+)["\']', re.I)
+    _ATOB_RE = re.compile(r"atob\(\s*['\"]([A-Za-z0-9+/=]+)['\"]\s*\)")
+
+    async def _resolve_via_iframe_chain(self, channel_id: str, max_hops: int = 4):
+        """
+        Follow the live upstream chain to an HLS playlist.
+
+        As of 2026-07 it is: /watch.php?id=N -> /stream/stream-N.php -> <player-host>
+        /premiumtv/daddy2.php?id=N, whose Clappr config carries the m3u8 URL inside
+        window.atob('<base64>'). Each hop needs the previous page as Referer.
+        """
+        url = f"{self._base_url}/watch.php?id={channel_id}"
+        referer = self._base_url
+
+        for _ in range(max_hops):
+            response = await self._session.get(url, headers=self._headers(referer))
+            if response.status_code != 200:
+                raise ValueError(f"HTTP {response.status_code} fetching {url}")
+
+            for encoded in self._ATOB_RE.findall(response.text):
+                try:
+                    candidate = base64.b64decode(encoded).decode()
+                except Exception:
+                    continue  # not every atob() on the page is the stream URL
+                if candidate.startswith("http") and ".m3u8" in candidate:
+                    logger.info(f"Resolved channel {channel_id} to {candidate}")
+                    return await self._fetch_playlist(candidate, url)
+
+            # Skip templated srcs like "' + url + '" that appear in inline scripts.
+            next_src = next(
+                (s for s in self._IFRAME_RE.findall(response.text)
+                 if "://" in s or s.startswith("/")),
+                None,
+            )
+            if not next_src:
+                break
+            referer, url = url, urljoin(url, next_src)
+
+        raise ValueError(f"No stream URL found in iframe chain for channel {channel_id}")
+
+    async def _fetch_playlist(self, m3u8_url: str, referer: str):
+        """Fetch an HLS playlist and rewrite it for the proxy."""
+        response = await self._session.get(m3u8_url, headers=self._headers(referer))
+        if response.status_code != 200 or not response.text.startswith("#EXTM3U"):
+            raise ValueError(f"Bad playlist from {m3u8_url}: HTTP {response.status_code}")
+
+        # Variant/segment URIs are relative to the playlist, but _process_stream_content
+        # only proxies lines starting with "http" — left alone, the player would resolve
+        # them against /api/stream/ on our own host and 404.
+        absolute = "\n".join(
+            urljoin(m3u8_url, line) if line and not line.startswith("#") else line
+            for line in response.text.split("\n")
+        )
+        return self._process_stream_content(absolute, m3u8_url)
+
     async def stream(self, channel_id: str):
         """
         Handle channel streaming with proper vidembed.re architecture detection and fallback
         """
+        # Current upstream path first; the vidembed/old-arch handlers below stay as
+        # fallback in case a channel is still served the previous way.
+        try:
+            return await self._resolve_via_iframe_chain(channel_id)
+        except Exception as chain_error:
+            logger.warning(f"Iframe chain failed for channel {channel_id}: {chain_error}")
+
         try:
             # First, get the channel page to determine architecture
             channel_page_url = f"{self._base_url}/watch.php?id={channel_id}"
