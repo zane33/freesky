@@ -3,42 +3,42 @@
   "startedAt": "2026-07-19T00:20:38.345Z",
   "workers": {
     "map": {
-      "runCount": 12,
-      "successCount": 12,
+      "runCount": 13,
+      "successCount": 13,
       "failureCount": 0,
-      "averageDurationMs": 3.6666666666666665,
-      "lastRun": "2026-07-19T03:05:38.574Z",
-      "lastStartedAt": "2026-07-19T03:05:38.573Z",
-      "nextRun": "2026-07-19T03:20:38.574Z",
+      "averageDurationMs": 3.5384615384615383,
+      "lastRun": "2026-07-19T03:20:38.592Z",
+      "lastStartedAt": "2026-07-19T03:20:38.590Z",
+      "nextRun": "2026-07-19T03:35:38.592Z",
       "isRunning": false
     },
     "audit": {
-      "runCount": 18,
-      "successCount": 18,
+      "runCount": 19,
+      "successCount": 19,
       "failureCount": 0,
-      "averageDurationMs": 3.2777777777777777,
-      "lastRun": "2026-07-19T03:12:38.614Z",
-      "lastStartedAt": "2026-07-19T03:12:38.612Z",
-      "nextRun": "2026-07-19T03:12:38.598Z",
+      "averageDurationMs": 3.1578947368421053,
+      "lastRun": "2026-07-19T03:22:38.622Z",
+      "lastStartedAt": "2026-07-19T03:22:38.621Z",
+      "nextRun": "2026-07-19T03:32:38.623Z",
       "isRunning": false
     },
     "optimize": {
-      "runCount": 12,
-      "successCount": 12,
+      "runCount": 13,
+      "successCount": 13,
       "failureCount": 0,
-      "averageDurationMs": 3.9166666666666665,
-      "lastRun": "2026-07-19T03:09:38.585Z",
-      "lastStartedAt": "2026-07-19T03:09:38.580Z",
-      "nextRun": "2026-07-19T03:24:38.586Z",
+      "averageDurationMs": 3.769230769230769,
+      "lastRun": "2026-07-19T03:24:38.605Z",
+      "lastStartedAt": "2026-07-19T03:24:38.603Z",
+      "nextRun": "2026-07-19T03:39:38.606Z",
       "isRunning": false
     },
     "consolidate": {
-      "runCount": 6,
-      "successCount": 6,
+      "runCount": 7,
+      "successCount": 7,
       "failureCount": 0,
-      "averageDurationMs": 5,
-      "lastRun": "2026-07-19T02:56:38.604Z",
-      "lastStartedAt": "2026-07-19T02:56:38.599Z",
+      "averageDurationMs": 4.428571428571429,
+      "lastRun": "2026-07-19T03:26:38.586Z",
+      "lastStartedAt": "2026-07-19T03:26:38.585Z",
       "nextRun": "2026-07-19T03:26:38.565Z",
       "isRunning": false
     },
@@ -175,5 +175,5 @@
       }
     ]
   },
-  "savedAt": "2026-07-19T03:12:38.614Z"
+  "savedAt": "2026-07-19T03:26:38.586Z"
 }

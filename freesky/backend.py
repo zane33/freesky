@@ -15,7 +15,7 @@ from .vidembed_extractor import extract_hls_from_vidembed
 from .multi_service_streamer import multi_streamer
 from .stream_monitor import stream_monitor
 import json
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 from collections import OrderedDict
 
 # Set up logging
@@ -608,8 +608,25 @@ async def content_options(path: str):
         }
     )
 
+def _upstream_headers(ref: str = None) -> dict:
+    """Headers for CDN fetches. The CDN 403s any request whose Referer is not the
+    embedding player page, so replay the one baked into the URL by the rewriter."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0",
+    }
+    if ref:
+        try:
+            referer = free_sky.content_url(ref)
+            headers["Referer"] = referer
+            headers["Origin"] = f"{urlparse(referer).scheme}://{urlparse(referer).netloc}"
+        except Exception as ref_error:
+            logger.warning(f"Could not decode content referer: {ref_error}")
+    return headers
+
+
+@fastapi_app.get("/api/content/{path}/{ref}")
 @fastapi_app.get("/api/content/{path}")
-async def content(path: str, request: Request):
+async def content(path: str, request: Request, ref: str = None):
     current_time = time.time()
     session_id = None
     channel_id = None
@@ -634,7 +651,34 @@ async def content(path: str, request: Request):
         # Use dedicated content semaphore for higher throughput
         async with _content_semaphore:
             logger.debug(f"Proxying content: {path[:100]}...")  # Truncate for cleaner logs
-            
+
+            upstream_url = free_sky.content_url(path)
+            upstream_headers = _upstream_headers(ref)
+
+            # A nested playlist has to be rewritten, not streamed through: its segment
+            # URLs are on a CDN that 403s any cross-origin browser fetch, so the player
+            # can only reach them via this proxy.
+            if ".m3u8" in upstream_url.split("?")[0]:
+                nested = await streaming_client.get(upstream_url, headers=upstream_headers, timeout=30.0)
+                if nested.status_code != 200:
+                    raise ValueError(f"Upstream returned HTTP {nested.status_code}")
+                referer = free_sky.content_url(ref) if ref else upstream_url
+                rewritten = free_sky._process_stream_content(
+                    "\n".join(
+                        urljoin(upstream_url, line) if line and not line.startswith("#") else line
+                        for line in nested.text.split("\n")
+                    ),
+                    referer,
+                )
+                return Response(
+                    content=rewritten,
+                    media_type="application/vnd.apple.mpegurl",
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                    },
+                )
+
             async def proxy_stream():
                 last_heartbeat = time.time()
                 chunk_count = 0
@@ -644,9 +688,13 @@ async def content(path: str, request: Request):
                     
                     # Use persistent streaming client with aggressive timeout
                     async with asyncio.timeout(30.0):  # Reduced timeout for faster failure detection
-                        async with streaming_client.stream("GET", free_sky.content_url(path), timeout=30.0) as response:
+                        async with streaming_client.stream("GET", upstream_url, headers=upstream_headers, timeout=30.0) as response:
                             logger.info(f"Stream session {session_id} established connection (status: {response.status_code})")
-                            
+                            if response.status_code != 200:
+                                # Surfacing this beats streaming an empty 200 body, which
+                                # looked like success and hid the 403 entirely.
+                                raise ValueError(f"Upstream returned HTTP {response.status_code}")
+
                             # Use larger chunk size for better throughput
                             async for chunk in response.aiter_bytes(chunk_size=512 * 1024):  # 512KB chunks for optimal performance
                                 chunk_count += 1

@@ -1,4 +1,5 @@
 import React from 'react';
+import Hls from 'hls.js';
 import '@vidstack/react/player/styles/default/theme.css';
 import '@vidstack/react/player/styles/default/layouts/audio.css';
 import '@vidstack/react/player/styles/default/layouts/video.css';
@@ -36,7 +37,66 @@ function InjectCSS() {
   return <style dangerouslySetInnerHTML={{ __html: css }} />;
 }
 
+// hls.js tuning for live streams. This has to be applied to the provider — vidstack's
+// `storage` prop is for persisted player state (volume, quality) and silently swallowed
+// this config, leaving the player spinning after the manifest loaded.
+const hlsConfig = {
+  liveBackBufferLength: 60,
+  liveSyncDurationCount: 5,
+  liveMaxLatencyDurationCount: 15,
+  maxBufferLength: 180,
+  maxMaxBufferLength: 300,
+  manifestLoadingTimeOut: 5000,
+  manifestLoadingMaxRetry: 2,
+  levelLoadingTimeOut: 8000,
+  levelLoadingMaxRetry: 1,
+  fragLoadingTimeOut: 15000,
+  fragLoadingMaxRetry: 2,
+  startFragPrefetch: true,
+  testBandwidth: false,
+  startLevel: -1,
+  capLevelToPlayerSize: false,
+  maxStarvationDelay: 4,
+  maxLoadingDelay: 4,
+  liveSyncDuration: 2,
+  liveMaxLatencyDuration: 8,
+};
+
 export function Player({ title, src }) {
+  const hlsRef = React.useRef(null);
+
+  const handleProviderChange = (provider) => {
+    if (provider?.type === 'hls') {
+      provider.config = { ...provider.config, ...hlsConfig };
+    }
+  };
+
+  // ponytail: Chrome answers "maybe" to canPlayType('application/vnd.apple.mpegurl')
+  // while being unable to actually play HLS. vidstack trusts that probe, picks its
+  // native video provider even with preferNativeHLS={false}, and the player spins
+  // forever. When we land on the native provider for an HLS source, drive hls.js
+  // ourselves. Remove this once vidstack's detection stops trusting "maybe".
+  const handleProviderSetup = (provider) => {
+    if (provider?.type !== 'video' || !src || !src.includes('.m3u8')) return;
+    if (!Hls.isSupported()) return;
+
+    const video = provider.video;
+    if (!video) return;
+
+    if (hlsRef.current) hlsRef.current.destroy();
+    const hls = new Hls(hlsConfig);
+    hlsRef.current = hls;
+    hls.loadSource(src);
+    hls.attachMedia(video);
+  };
+
+  React.useEffect(() => () => {
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+  }, []);
+
   const handleCanPlay = () => {
     console.log('Video can start playing');
   };
@@ -68,30 +128,13 @@ export function Player({ title, src }) {
         load='eager'
         preload='auto'
         crossorigin='anonymous'
-        // Aggressive buffering for optimal live stream performance
         preferNativeHLS={false}
-        // Large buffers to prevent rebuffering under network fluctuations
-        storage={{
-          hlsLiveBackBufferLength: 60,  // Keep 60s of buffer behind playhead
-          hlsLiveSyncDurationCount: 5,  // More segments for smoother playback
-          hlsLiveMaxLatencyDurationCount: 15,  // Higher latency tolerance
-          maxBufferLength: 180,  // Large buffer: 3 minutes
-          maxMaxBufferLength: 300,  // Emergency buffer: 5 minutes
-          manifestLoadingTimeOut: 5000,  // Faster manifest timeout for quicker retries
-          manifestLoadingMaxRetry: 2,   // Fewer retries for faster failover
-          levelLoadingTimeOut: 8000,    // Faster segment timeout
-          levelLoadingMaxRetry: 1,      // Single retry for faster failover
-          fragLoadingTimeOut: 15000,    // Reduced fragment timeout
-          fragLoadingMaxRetry: 2,       // Fewer fragment retries
-          startFragPrefetch: true,      // Enable fragment prefetching
-          testBandwidth: false,         // Disable bandwidth testing for faster startup
-          startLevel: -1,               // Let player choose best quality automatically
-          capLevelToPlayerSize: false,  // Don't limit quality based on player size
-          maxStarvationDelay: 4,        // Quick starvation recovery
-          maxLoadingDelay: 4,           // Quick loading recovery
-          liveSyncDuration: 2,          // Faster sync to live edge
-          liveMaxLatencyDuration: 8     // Max latency before seeking to live
-        }}
+        onProviderChange={handleProviderChange}
+        onProviderSetup={handleProviderSetup}
+        onCanPlay={handleCanPlay}
+        onWaiting={handleWaiting}
+        onError={handleError}
+        onStalled={handleStalled}
       >
         <MediaProvider>
           <Poster className="vds-poster" />

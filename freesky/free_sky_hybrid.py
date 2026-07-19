@@ -176,7 +176,7 @@ class StepDaddyHybrid:
     _IFRAME_RE = re.compile(r'<iframe[^>]+src=["\']([^"\']+)["\']', re.I)
     _ATOB_RE = re.compile(r"atob\(\s*['\"]([A-Za-z0-9+/=]+)['\"]\s*\)")
 
-    async def _resolve_via_iframe_chain(self, channel_id: str, max_hops: int = 4):
+    async def _resolve_via_iframe_chain(self, channel_id: str, max_hops: int = 4, max_pages: int = 8):
         """
         Follow the live upstream chain to an HLS playlist.
 
@@ -184,13 +184,24 @@ class StepDaddyHybrid:
         /premiumtv/daddy2.php?id=N, whose Clappr config carries the m3u8 URL inside
         window.atob('<base64>'). Each hop needs the previous page as Referer.
         """
-        url = f"{self._base_url}/watch.php?id={channel_id}"
-        referer = self._base_url
+        # Breadth-first, not first-iframe-wins: the watch page leads with an ad banner
+        # iframe, so following only the first link walks into an ad network.
+        queue = [(f"{self._base_url}/watch.php?id={channel_id}", self._base_url, 0)]
+        seen = set()
 
-        for _ in range(max_hops):
-            response = await self._session.get(url, headers=self._headers(referer))
+        while queue and len(seen) < max_pages:
+            url, referer, depth = queue.pop(0)
+            if url in seen or depth > max_hops:
+                continue
+            seen.add(url)
+
+            try:
+                response = await self._session.get(url, headers=self._headers(referer))
+            except Exception as e:
+                logger.debug(f"Hop failed for {url}: {e}")
+                continue
             if response.status_code != 200:
-                raise ValueError(f"HTTP {response.status_code} fetching {url}")
+                continue
 
             for encoded in self._ATOB_RE.findall(response.text):
                 try:
@@ -201,15 +212,10 @@ class StepDaddyHybrid:
                     logger.info(f"Resolved channel {channel_id} to {candidate}")
                     return await self._fetch_playlist(candidate, url)
 
-            # Skip templated srcs like "' + url + '" that appear in inline scripts.
-            next_src = next(
-                (s for s in self._IFRAME_RE.findall(response.text)
-                 if "://" in s or s.startswith("/")),
-                None,
-            )
-            if not next_src:
-                break
-            referer, url = url, urljoin(url, next_src)
+            for src in self._IFRAME_RE.findall(response.text):
+                # Skip templated srcs like "' + url + '" that appear in inline scripts.
+                if "://" in src or src.startswith("/"):
+                    queue.append((urljoin(url, src), url, depth + 1))
 
         raise ValueError(f"No stream URL found in iframe chain for channel {channel_id}")
 
@@ -226,7 +232,9 @@ class StepDaddyHybrid:
             urljoin(m3u8_url, line) if line and not line.startswith("#") else line
             for line in response.text.split("\n")
         )
-        return self._process_stream_content(absolute, m3u8_url)
+        # Rewrite against the player page, not the CDN URL: the CDN 403s any request
+        # whose Referer is not the embedding page, and our proxy has to replay it.
+        return self._process_stream_content(absolute, referer)
 
     async def stream(self, channel_id: str):
         """
@@ -532,7 +540,11 @@ class StepDaddyHybrid:
                     # Validate token if present
                     try:
                         token_analysis = TokenValidator.analyze_token_security(line)
-                        if not token_analysis.get('valid', True):  # Default to True if no tokens
+                        # Drop a URL only when the token parsed and is genuinely expired.
+                        # "error" means the analyzer could not read a token at all — the
+                        # current CDN puts expiry in the path, not query params, so
+                        # treating unparseable as invalid emptied every playlist.
+                        if not token_analysis.get('valid', True) and 'error' not in token_analysis:
                             logger.debug(f"Skipping expired stream: {line}")
                             continue  # Skip expired streams
                         elif token_analysis.get('expires_in_seconds', float('inf')) < 3600:  # Less than 1 hour
@@ -541,8 +553,9 @@ class StepDaddyHybrid:
                         logger.debug(f"Token validation error for {line}: {str(validation_error)}")
                     
                     if config.proxy_content:
-                        # Proxy content URLs
-                        line = f"/api/content/{encrypt(line)}"
+                        # Proxy content URLs, carrying the referer the CDN demands —
+                        # same two-segment shape /api/key/ already uses.
+                        line = f"/api/content/{encrypt(line)}/{encrypt(referer)}"
                 elif line.startswith('#EXT-X-KEY:'):
                     # Process encryption keys
                     original_url = re.search(r'URI="(.*?)"', line)
