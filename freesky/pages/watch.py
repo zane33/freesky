@@ -1,9 +1,10 @@
 import reflex as rx
+from urllib.parse import urlparse
 from rxconfig import config
 from freesky import backend
 from freesky.components import navbar, MediaPlayer
 from freesky.free_sky import Channel
-from freesky.auth_state import require_login
+from freesky.auth_state import require_login, AuthState
 
 media_player = MediaPlayer.create
 
@@ -13,6 +14,7 @@ media_player = MediaPlayer.create
 class WatchState(rx.State):
     is_loaded: bool = False
     _cache_buster: int = 0
+    url: str = ""
 
     @rx.event
     async def on_load(self):
@@ -23,6 +25,27 @@ class WatchState(rx.State):
         self.is_loaded = False
         # Increment cache buster to ensure proper component refresh
         self._cache_buster += 1
+
+        # Build the stream URL from the address the browser actually used, and
+        # carry the viewer's token. The old version used the build-time
+        # config.api_url with no token, so through NAT or a hostname the player
+        # requested an unreachable LAN address and, off the trusted network, would
+        # have been rejected as unauthenticated anyway.
+        origin = ""
+        try:
+            parsed = urlparse(str(self.router.url))
+            if parsed.scheme and parsed.netloc:
+                origin = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            pass
+        base = (origin or config.api_url).rstrip("/")
+        token = ""
+        try:
+            token = (await self.get_state(AuthState)).stream_token
+        except Exception:
+            pass
+        suffix = f"?token={token}" if token else ""
+        self.url = f"{base}/api/stream/{self.route_channel_id}.m3u8{suffix}"
 
     @rx.var
     def route_channel_id(self) -> str:
@@ -35,10 +58,6 @@ class WatchState(rx.State):
         self.is_loaded = True
         return channel
 
-    @rx.var
-    def url(self) -> str:
-        from rxconfig import config
-        return f"{config.api_url}/api/stream/{self.route_channel_id}.m3u8"
 
     def copy_url_to_clipboard(self):
         """Copy URL to clipboard using JavaScript."""

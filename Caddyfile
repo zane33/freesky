@@ -1,4 +1,13 @@
-:{$PORT}
+# Listen address. Defaults to plain HTTP on :3000.
+#   HTTP  (default)      SITE_ADDRESS=":3000"
+#   HTTPS self-signed    SITE_ADDRESS="https://:3000"   CADDY_TLS="tls internal"
+#   HTTPS own cert       SITE_ADDRESS="https://:3000"   CADDY_TLS="tls /app/data/certs/cert.pem /app/data/certs/key.pem"
+#   HTTPS real domain    SITE_ADDRESS="tv.example.com"  CADDY_TLS=""   (Caddy gets a
+#                        Let's Encrypt cert automatically; needs ports 80+443 reachable)
+{$SITE_ADDRESS::3000}
+
+# Empty by default, so plain HTTP stays the default behaviour.
+{$CADDY_TLS}
 
 log {
 	format json

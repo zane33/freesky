@@ -20,6 +20,37 @@ fi
 
 FRONTEND_CONFIG_FILE="/srv/.config.json"
 
+# --- TLS -------------------------------------------------------------------
+# ENABLE_HTTPS=true serves the app over HTTPS on the same port. Drop your own
+# cert.pem/key.pem into the certs dir to use a real certificate; otherwise a
+# self-signed one is generated once and reused. A cert FILE (rather than Caddy's
+# `tls internal`) is used deliberately: internal issuance needs a hostname up
+# front, and this app is reached by LAN IP, NAT'd port and hostname alike, so the
+# cert has to be valid for whatever address the client happened to use.
+CERT_DIR="${CERT_DIR:-/app/data/certs}"
+if [ "$(echo "${ENABLE_HTTPS:-false}" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+    mkdir -p "$CERT_DIR"
+    if [ ! -f "$CERT_DIR/cert.pem" ] || [ ! -f "$CERT_DIR/key.pem" ]; then
+        echo "No certificate found in $CERT_DIR - generating a self-signed one"
+        # subjectAltName covers localhost plus any address, so the same cert works
+        # however the box is reached. Browsers still warn (it is not CA-signed).
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
+            -subj "/CN=${TLS_CN:-freesky}" \
+            -addext "subjectAltName=DNS:localhost,DNS:*,IP:127.0.0.1,IP:0.0.0.0" \
+            >/dev/null 2>&1 && echo "Self-signed certificate created" \
+            || echo "WARNING: certificate generation failed; HTTPS may not start"
+    else
+        echo "Using certificate from $CERT_DIR"
+    fi
+    export SITE_ADDRESS="https://:${PORT}"
+    export CADDY_TLS="tls $CERT_DIR/cert.pem $CERT_DIR/key.pem"
+    echo "HTTPS enabled on port ${PORT}"
+else
+    export SITE_ADDRESS="${SITE_ADDRESS:-:${PORT}}"
+    export CADDY_TLS="${CADDY_TLS:-}"
+fi
+
 # Use the exact API_URL from environment, this is critical for container networking
 CURRENT_API_URL="${API_URL}"
 
