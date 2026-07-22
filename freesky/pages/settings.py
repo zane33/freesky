@@ -36,6 +36,10 @@ class SettingsState(rx.State):
     trusted_networks: str = ""
     network_error: str = ""
 
+    # Playlist URL revealed for one user at a time (see copy_playlist_url)
+    revealed_user: str = ""
+    revealed_url: str = ""
+
     # Per-channel upstream source pins, {channel_id: player}
     sources: dict = {}
 
@@ -185,13 +189,32 @@ class SettingsState(rx.State):
 
     @rx.event
     def copy_playlist_url(self, username: str):
+        """Reveal the user's playlist URL, and copy it where that's possible.
+
+        navigator.clipboard only exists in a secure context (HTTPS or localhost).
+        This app is normally reached over plain HTTP on a LAN address, where the
+        copy silently does nothing — so the URL is displayed for manual selection
+        and the clipboard write is a bonus, not the mechanism.
+        """
         token = users.token_for(username)
         if not token:
+            self.revealed_user = ""
+            self.revealed_url = ""
             return rx.toast("User not found")
-        return [
-            rx.set_clipboard(f"{api_url}/playlist.m3u8?token={token}"),
-            rx.toast(f"Playlist URL for {username} copied — paste into Dispatcharr"),
-        ]
+        url = f"{api_url}/playlist.m3u8?token={token}"
+        # Toggle off if the same row is clicked again.
+        if self.revealed_user == username:
+            self.revealed_user = ""
+            self.revealed_url = ""
+            return
+        self.revealed_user = username
+        self.revealed_url = url
+        return rx.set_clipboard(url)
+
+    @rx.event
+    def hide_playlist_url(self):
+        self.revealed_user = ""
+        self.revealed_url = ""
 
     @rx.event
     def set_trusted_networks(self, value: str):
@@ -229,38 +252,69 @@ class SettingsState(rx.State):
 
 
 def user_row(user: dict) -> rx.Component:
-    return rx.hstack(
-        rx.badge(
-            user["role"],
-            color_scheme=rx.cond(user["role"] == "admin", "red", "gray"),
-            variant="soft",
+    revealed = SettingsState.revealed_user == user["username"]
+    return rx.vstack(
+        rx.hstack(
+            rx.badge(
+                user["role"],
+                color_scheme=rx.cond(user["role"] == "admin", "red", "gray"),
+                variant="soft",
+            ),
+            rx.text(user["username"], size="3", weight="medium"),
+            rx.text(user["email"], size="1", color="gray", flex="1", no_of_lines=1),
+            rx.button(
+                rx.icon("link", size=14),
+                rx.cond(revealed, "Hide URL", "Playlist URL"),
+                on_click=lambda: SettingsState.copy_playlist_url(user["username"]),
+                size="1",
+                variant="soft",
+            ),
+            rx.button(
+                rx.icon("rotate-cw", size=14),
+                on_click=lambda: SettingsState.rotate_user_token(user["username"]),
+                size="1",
+                variant="soft",
+                color_scheme="amber",
+                title="Issue a new playlist URL and revoke the old one",
+            ),
+            rx.button(
+                rx.icon("trash-2", size=14),
+                on_click=lambda: SettingsState.remove_user(user["username"]),
+                size="1",
+                variant="soft",
+                color_scheme="red",
+            ),
+            align="center",
+            spacing="2",
+            width="100%",
         ),
-        rx.text(user["username"], size="3", weight="medium"),
-        rx.text(user["email"], size="1", color="gray", flex="1", no_of_lines=1),
-        rx.button(
-            rx.icon("clipboard", size=14),
-            "Playlist URL",
-            on_click=lambda: SettingsState.copy_playlist_url(user["username"]),
-            size="1",
-            variant="soft",
+        # Shown rather than only copied: navigator.clipboard is unavailable over
+        # plain HTTP on a LAN address, so the copy is silently a no-op there.
+        rx.cond(
+            revealed,
+            rx.vstack(
+                rx.text(
+                    "Select and copy this into Dispatcharr:",
+                    size="1",
+                    color="gray",
+                ),
+                rx.input(
+                    value=SettingsState.revealed_url,
+                    read_only=True,
+                    on_click=rx.call_script(
+                        "document.activeElement && document.activeElement.select()"
+                    ),
+                    font_family="mono",
+                    font_size="12px",
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+                padding_bottom="0.5rem",
+            ),
+            rx.fragment(),
         ),
-        rx.button(
-            rx.icon("rotate-cw", size=14),
-            on_click=lambda: SettingsState.rotate_user_token(user["username"]),
-            size="1",
-            variant="soft",
-            color_scheme="amber",
-            title="Issue a new playlist URL and revoke the old one",
-        ),
-        rx.button(
-            rx.icon("trash-2", size=14),
-            on_click=lambda: SettingsState.remove_user(user["username"]),
-            size="1",
-            variant="soft",
-            color_scheme="red",
-        ),
-        align="center",
-        spacing="2",
+        spacing="1",
         width="100%",
         padding_y="0.4rem",
         border_bottom="1px solid var(--gray-4)",
