@@ -117,3 +117,52 @@ REFLEX_SKIP_COMPILE=1
 REDIS_URL=redis://localhost
 PYTHONUNBUFFERED=1
 ``` 
+## HTTPS: playlist URL stopped working after enabling TLS
+
+### Symptom
+`http://<host>:3000/playlist.m3u8?token=...` returns `400 Client sent an HTTP
+request to an HTTPS server`, and the `https://` form is rejected by Dispatcharr,
+ffmpeg, VLC or curl (`curl: (60) SSL certificate problem`).
+
+### Cause
+Two independent faults, both introduced by the first HTTPS implementation:
+
+1. **HTTPS replaced HTTP on the same port.** One TCP port cannot serve both
+   protocols. Every existing `http://` playlist URL — including the one already
+   configured in Dispatcharr — began answering 400.
+2. **The self-signed certificate did not cover the host's IP.** Its SAN was
+   `DNS:localhost, DNS:*, IP:127.0.0.1, IP:0.0.0.0`. A TLS client connecting by
+   IP address matches **only `iPAddress` SAN entries** — a DNS wildcard never
+   covers an IP, and `0.0.0.0` is not the host's address. Verified: with the cert
+   explicitly trusted as a CA, `curl` still failed with exit 60; the same request
+   against a cert carrying `IP:192.168.3.148` returned 200.
+
+### Fix
+`ENABLE_HTTPS=true` now **adds** a TLS listener rather than replacing HTTP:
+
+| Setting | Result |
+|---|---|
+| `ENABLE_HTTPS=false` (default) | HTTP on `PORT` only |
+| `ENABLE_HTTPS=true` | HTTP on `PORT`, **HTTPS on `HTTPS_PORT`** (default 3443) |
+| `ENABLE_HTTPS=true`, `HTTPS_PORT=$PORT` | HTTPS only — the old behaviour |
+
+The certificate's SAN is built from `DOCKER_HOST_IP` plus every entry in
+`TLS_HOSTS` (comma separated), classified into `IP:` or `DNS:` automatically.
+The SAN list is recorded in `data/certs/.san`; if it changes, the self-signed
+cert is regenerated on next start. A cert you supplied yourself (any subject
+other than `CN=freesky`) is never touched.
+
+### Which URL to give each client
+- **Dispatcharr, ffmpeg, VLC, any IPTV player** → use `http://`. They validate
+  certificates and will reject a self-signed one no matter what its SAN says.
+  Fixing that needs a certificate from a real CA, not a SAN change.
+- **Browsers** → `https://` works after clicking through the untrusted-issuer
+  warning once.
+
+### Caddyfile structure
+The server config lives in an `(app)` snippet imported by each site block. A
+`tls` directive cannot appear in a block whose address is plain `http://` —
+Caddy rejects it with *"server listening on [:3000] is HTTP, but attempts to
+configure TLS connection policies"* — so the HTTP and HTTPS listeners must be
+separate blocks. `start.sh` appends the HTTPS block to a copy of the Caddyfile
+at `/tmp/Caddyfile` (a copy, so a `docker restart` cannot stack duplicates).

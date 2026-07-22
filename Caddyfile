@@ -1,195 +1,205 @@
+# Shared server config. Kept in a snippet so it can be served on more than one
+# listener: with ENABLE_HTTPS=true, start.sh appends a second site block for the
+# TLS port that imports this same snippet. A `tls` directive cannot live in a
+# block whose address is plain http:// ("server listening on [:3000] is HTTP, but
+# attempts to configure TLS connection policies"), so the two listeners have to be
+# separate blocks rather than two addresses on one.
+(app) {
+	log {
+		format json
+		level DEBUG
+	}
+
+	# Optimized compression settings - exclude streaming endpoints
+	@compress {
+	    not path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /_event/* /logo/* /watch/*
+	}
+	encode @compress {
+	    gzip 6          # Balanced compression level
+	    zstd            # Enable zstd for better compression
+	}
+	root * /srv
+
+	# Cache static assets aggressively — safe because their filenames are content
+	# hashed (entry.client-C7a1nLPR.js), so a new build produces new names.
+	@static_assets {
+	    path *.js *.css *.woff *.woff2 *.ttf *.png *.jpg *.jpeg *.gif *.ico *.svg
+	}
+	header @static_assets {
+	    Cache-Control "public, max-age=31536000, immutable"
+	}
+
+	# The HTML shell must NOT be cached. It is the one file whose name never changes
+	# while its contents point at the hashed bundles, so a browser holding an old copy
+	# keeps loading the previous build's assets after a redeploy — which is how a
+	# stale tab ended up on an app with no /login route and rendered 404 at the root.
+	@html_shell {
+	    not path *.js *.css *.woff *.woff2 *.ttf *.png *.jpg *.jpeg *.gif *.ico *.svg *.map *.json
+	    not path /api/* /stream/* /content/* /key/* /logo/* /playlist.m3u8 /epg.xml /_event*
+	}
+	header @html_shell {
+	    Cache-Control "no-cache, must-revalidate"
+	}
+
+	# Streaming endpoints need permissive headers for external players
+	@streaming {
+	    path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /playlist.m3u8
+	}
+
+	# Restrictive headers for non-streaming content
+	@non_streaming {
+	    not path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /playlist.m3u8
+	}
+
+	# Security headers for non-streaming content only
+	header @non_streaming {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		X-XSS-Protection "1; mode=block"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+	}
+
+	# Permissive headers for streaming content (for VLC and external players)
+	header @streaming {
+		X-Content-Type-Options nosniff
+		Access-Control-Allow-Origin "*"
+		Access-Control-Allow-Methods "GET, POST, OPTIONS"
+		Access-Control-Allow-Headers "*"
+		Access-Control-Expose-Headers "*"
+		Cache-Control "no-cache, no-store, must-revalidate"
+		Pragma "no-cache"
+		Expires "0"
+	}
+
+	# Handle playlist.m3u8 endpoint first (highest priority)
+	handle /playlist.m3u8 {
+		reverse_proxy localhost:{$BACKEND_PORT}
+	}
+
+	# Handle EPG XML endpoint 
+	handle /epg.xml {
+		reverse_proxy localhost:{$BACKEND_PORT}
+		header {
+			Content-Type "application/xml"
+			Access-Control-Allow-Origin "*"
+			Access-Control-Allow-Methods "GET, OPTIONS"
+			Access-Control-Allow-Headers "*"
+		}
+	}
+
+	# Handle logo requests first (highest priority)
+	handle /logo/* {
+		reverse_proxy localhost:{$BACKEND_PORT}
+	}
+
+	# Handle WebSocket events - match path only, let backend handle WebSocket upgrade
+	@websocket path /_event*
+	handle @websocket {
+		reverse_proxy localhost:{$BACKEND_PORT}
+	}
+
+	# Handle API endpoints - most specific first
+	@api_stream path /api/stream/*
+	handle @api_stream {
+		reverse_proxy localhost:{$BACKEND_PORT} {
+			flush_interval -1
+			header_up X-Real-IP {remote_host}
+			header_down -Server
+			# Resolving a channel can take up to ~13s when the primary player is
+			# down and we fail over to another (see _resolve_via_iframe_chain). A 5s
+			# cap here turned every slow-but-working channel into a 502. Keep it above
+			# the backend's own deadline.
+			transport http {
+				read_buffer 8192      # Smaller buffer for playlist delivery
+				write_buffer 8192
+				max_response_header 8KB
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+
+	@api_logo path /api/logo/*
+	handle @api_logo {
+		reverse_proxy localhost:{$BACKEND_PORT} {
+			flush_interval -1
+			header_up X-Real-IP {remote_host}
+			header_down -Server
+		}
+	}
+
+
+	@api_key path /api/key/*
+	handle @api_key {
+		reverse_proxy localhost:{$BACKEND_PORT} {
+			flush_interval -1
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	@api_content path /api/content/*
+	handle @api_content {
+		reverse_proxy localhost:{$BACKEND_PORT} {
+			flush_interval -1
+			header_up X-Real-IP {remote_host}
+			header_down -Server
+			# A nested playlist under /api/content is fetched from the upstream CDN
+			# before we can answer, so the first hit for a channel can take longer
+			# than a segment read. 10s here returned 502 on cold playlists.
+			transport http {
+				read_buffer 16384     # 16KB read buffer
+				write_buffer 16384    # 16KB write buffer
+				max_response_header 16KB
+				dial_timeout 3s
+				response_header_timeout 35s
+			}
+		}
+	}
+
+	# Handle other API endpoints
+	@api path /api/*
+	handle @api {
+		reverse_proxy localhost:{$BACKEND_PORT}
+	}
+
+	# Handle specific backend endpoints
+	handle /health {
+		reverse_proxy localhost:{$BACKEND_PORT}
+	}
+
+	handle /channels {
+		reverse_proxy localhost:{$BACKEND_PORT}
+	}
+
+	handle /ping {
+		reverse_proxy localhost:{$BACKEND_PORT}
+	}
+
+	# /schedule is a FRONTEND page. Proxying it to the backend served the API's raw
+	# JSON to anyone clicking the Schedule tab. The API lives at /api/schedule, which
+	# the @api matcher above already routes.
+
+	# Handle all other requests
+	handle {
+		# Reflex exports each route as its own directory (/srv/login/index.html), so
+		# the directory index has to be tried explicitly — {path} alone never matches
+		# a directory and every route fell through to the root shell, serving the
+		# Index page's HTML (and its <title>) for /login and /settings.
+		try_files {path} {path}/index.html {path}.html /index.html
+		file_server
+	}
+}
+
 # Listen address. Defaults to plain HTTP on :3000.
 #   HTTP  (default)      SITE_ADDRESS=":3000"
-#   HTTPS self-signed    SITE_ADDRESS="https://:3000"   CADDY_TLS="tls internal"
-#   HTTPS own cert       SITE_ADDRESS="https://:3000"   CADDY_TLS="tls /app/data/certs/cert.pem /app/data/certs/key.pem"
+#   HTTP + HTTPS         ENABLE_HTTPS=true            (HTTP on PORT, TLS on HTTPS_PORT)
+#   HTTPS only           ENABLE_HTTPS=true HTTPS_PORT=$PORT
+#   HTTPS own cert       drop cert.pem/key.pem into ./data/certs
 #   HTTPS real domain    SITE_ADDRESS="tv.example.com"  CADDY_TLS=""   (Caddy gets a
 #                        Let's Encrypt cert automatically; needs ports 80+443 reachable)
-{$SITE_ADDRESS::3000}
-
-# Empty by default, so plain HTTP stays the default behaviour.
-{$CADDY_TLS}
-
-log {
-	format json
-	level DEBUG
-}
-
-# Optimized compression settings - exclude streaming endpoints
-@compress {
-    not path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /_event/* /logo/* /watch/*
-}
-encode @compress {
-    gzip 6          # Balanced compression level
-    zstd            # Enable zstd for better compression
-}
-root * /srv
-
-# Cache static assets aggressively — safe because their filenames are content
-# hashed (entry.client-C7a1nLPR.js), so a new build produces new names.
-@static_assets {
-    path *.js *.css *.woff *.woff2 *.ttf *.png *.jpg *.jpeg *.gif *.ico *.svg
-}
-header @static_assets {
-    Cache-Control "public, max-age=31536000, immutable"
-}
-
-# The HTML shell must NOT be cached. It is the one file whose name never changes
-# while its contents point at the hashed bundles, so a browser holding an old copy
-# keeps loading the previous build's assets after a redeploy — which is how a
-# stale tab ended up on an app with no /login route and rendered 404 at the root.
-@html_shell {
-    not path *.js *.css *.woff *.woff2 *.ttf *.png *.jpg *.jpeg *.gif *.ico *.svg *.map *.json
-    not path /api/* /stream/* /content/* /key/* /logo/* /playlist.m3u8 /epg.xml /_event*
-}
-header @html_shell {
-    Cache-Control "no-cache, must-revalidate"
-}
-
-# Streaming endpoints need permissive headers for external players
-@streaming {
-    path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /playlist.m3u8
-}
-
-# Restrictive headers for non-streaming content
-@non_streaming {
-    not path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /playlist.m3u8
-}
-
-# Security headers for non-streaming content only
-header @non_streaming {
-	X-Content-Type-Options nosniff
-	X-Frame-Options DENY
-	X-XSS-Protection "1; mode=block"
-	Referrer-Policy "strict-origin-when-cross-origin"
-	Permissions-Policy "geolocation=(), microphone=(), camera=()"
-}
-
-# Permissive headers for streaming content (for VLC and external players)
-header @streaming {
-	X-Content-Type-Options nosniff
-	Access-Control-Allow-Origin "*"
-	Access-Control-Allow-Methods "GET, POST, OPTIONS"
-	Access-Control-Allow-Headers "*"
-	Access-Control-Expose-Headers "*"
-	Cache-Control "no-cache, no-store, must-revalidate"
-	Pragma "no-cache"
-	Expires "0"
-}
-
-# Handle playlist.m3u8 endpoint first (highest priority)
-handle /playlist.m3u8 {
-	reverse_proxy localhost:{$BACKEND_PORT}
-}
-
-# Handle EPG XML endpoint 
-handle /epg.xml {
-	reverse_proxy localhost:{$BACKEND_PORT}
-	header {
-		Content-Type "application/xml"
-		Access-Control-Allow-Origin "*"
-		Access-Control-Allow-Methods "GET, OPTIONS"
-		Access-Control-Allow-Headers "*"
-	}
-}
-
-# Handle logo requests first (highest priority)
-handle /logo/* {
-	reverse_proxy localhost:{$BACKEND_PORT}
-}
-
-# Handle WebSocket events - match path only, let backend handle WebSocket upgrade
-@websocket path /_event*
-handle @websocket {
-	reverse_proxy localhost:{$BACKEND_PORT}
-}
-
-# Handle API endpoints - most specific first
-@api_stream path /api/stream/*
-handle @api_stream {
-	reverse_proxy localhost:{$BACKEND_PORT} {
-		flush_interval -1
-		header_up X-Real-IP {remote_host}
-		header_down -Server
-		# Resolving a channel can take up to ~13s when the primary player is
-		# down and we fail over to another (see _resolve_via_iframe_chain). A 5s
-		# cap here turned every slow-but-working channel into a 502. Keep it above
-		# the backend's own deadline.
-		transport http {
-			read_buffer 8192      # Smaller buffer for playlist delivery
-			write_buffer 8192
-			max_response_header 8KB
-			dial_timeout 2s
-			response_header_timeout 20s
-		}
-	}
-}
-
-@api_logo path /api/logo/*
-handle @api_logo {
-	reverse_proxy localhost:{$BACKEND_PORT} {
-		flush_interval -1
-		header_up X-Real-IP {remote_host}
-		header_down -Server
-	}
-}
-
-
-@api_key path /api/key/*
-handle @api_key {
-	reverse_proxy localhost:{$BACKEND_PORT} {
-		flush_interval -1
-		header_up X-Real-IP {remote_host}
-	}
-}
-
-@api_content path /api/content/*
-handle @api_content {
-	reverse_proxy localhost:{$BACKEND_PORT} {
-		flush_interval -1
-		header_up X-Real-IP {remote_host}
-		header_down -Server
-		# A nested playlist under /api/content is fetched from the upstream CDN
-		# before we can answer, so the first hit for a channel can take longer
-		# than a segment read. 10s here returned 502 on cold playlists.
-		transport http {
-			read_buffer 16384     # 16KB read buffer
-			write_buffer 16384    # 16KB write buffer
-			max_response_header 16KB
-			dial_timeout 3s
-			response_header_timeout 35s
-		}
-	}
-}
-
-# Handle other API endpoints
-@api path /api/*
-handle @api {
-	reverse_proxy localhost:{$BACKEND_PORT}
-}
-
-# Handle specific backend endpoints
-handle /health {
-	reverse_proxy localhost:{$BACKEND_PORT}
-}
-
-handle /channels {
-	reverse_proxy localhost:{$BACKEND_PORT}
-}
-
-handle /ping {
-	reverse_proxy localhost:{$BACKEND_PORT}
-}
-
-# /schedule is a FRONTEND page. Proxying it to the backend served the API's raw
-# JSON to anyone clicking the Schedule tab. The API lives at /api/schedule, which
-# the @api matcher above already routes.
-
-# Handle all other requests
-handle {
-	# Reflex exports each route as its own directory (/srv/login/index.html), so
-	# the directory index has to be tried explicitly — {path} alone never matches
-	# a directory and every route fell through to the root shell, serving the
-	# Index page's HTML (and its <title>) for /login and /settings.
-	try_files {path} {path}/index.html {path}.html /index.html
-	file_server
+{$SITE_ADDRESS::3000} {
+	# Empty by default, so plain HTTP stays the default behaviour.
+	{$CADDY_TLS}
+	import app
 }

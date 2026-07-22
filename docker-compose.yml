@@ -44,10 +44,16 @@ services:
       # Leave ADMIN_PASS unset to have a random one generated and printed to the
       # container log on first boot. No weak default ships.
       - ADMIN_PASS=${ADMIN_PASS:-}
-      # HTTPS. Default is plain HTTP; set ENABLE_HTTPS=true to serve TLS on the
-      # same port. start.sh then generates a self-signed cert into ./data/certs on
-      # first run, or uses your own cert.pem/key.pem if you put them there.
+      # HTTPS. Default is plain HTTP. ENABLE_HTTPS=true ADDS a TLS listener on
+      # HTTPS_PORT while PORT keeps serving plain HTTP — one port cannot do both,
+      # and taking HTTP away broke every existing playlist URL. start.sh generates
+      # a self-signed cert into ./data/certs, or uses your own cert.pem/key.pem.
       - ENABLE_HTTPS=${ENABLE_HTTPS:-false}
+      - HTTPS_PORT=${HTTPS_PORT:-3443}
+      # Extra names/IPs to put in the self-signed cert (comma separated).
+      # DOCKER_HOST_IP is included automatically. A client connecting by IP only
+      # matches IP entries, so the address you actually browse to must be here.
+      - TLS_HOSTS=${TLS_HOSTS:-media.authorisedit.co.nz}
       # Advanced overrides, normally left empty — start.sh fills them in. Compose
       # uses ${VAR:-default}, NOT Caddy's ${VAR:default} form; mixing the two here
       # is what produced "invalid interpolation format".

@@ -123,7 +123,7 @@ RUN dos2unix /app/start.sh && chmod +x /app/start.sh
 # Needed until Reflex properly passes SIGTERM on backend.
 STOPSIGNAL SIGKILL
 
-EXPOSE $PORT $BACKEND_PORT
+EXPOSE $PORT $BACKEND_PORT 3443
 
 # Starting the backend with multiple workers
 CMD ["/app/start.sh"]

@@ -21,31 +21,76 @@ fi
 FRONTEND_CONFIG_FILE="/srv/.config.json"
 
 # --- TLS -------------------------------------------------------------------
-# ENABLE_HTTPS=true serves the app over HTTPS on the same port. Drop your own
-# cert.pem/key.pem into the certs dir to use a real certificate; otherwise a
-# self-signed one is generated once and reused. A cert FILE (rather than Caddy's
-# `tls internal`) is used deliberately: internal issuance needs a hostname up
-# front, and this app is reached by LAN IP, NAT'd port and hostname alike, so the
-# cert has to be valid for whatever address the client happened to use.
+# ENABLE_HTTPS=true ADDS an HTTPS listener on HTTPS_PORT alongside the plain HTTP
+# one on PORT. It deliberately does not replace it: one TCP port cannot speak both
+# protocols, so serving TLS on PORT made every existing http:// URL answer
+# "400 Client sent an HTTP request to an HTTPS server" — which is how Dispatcharr
+# and every other player lost the playlist. Set HTTPS_PORT=$PORT to get the old
+# HTTPS-only behaviour on a single port.
+#
+# Drop your own cert.pem/key.pem into the certs dir to use a real certificate;
+# otherwise a self-signed one is generated. A cert FILE (rather than Caddy's `tls
+# internal`) is used deliberately: internal issuance needs a hostname up front,
+# and this app is reached by LAN IP, NAT'd port and hostname alike.
 CERT_DIR="${CERT_DIR:-/app/data/certs}"
+HTTPS_PORT="${HTTPS_PORT:-3443}"
+# Work on a fresh copy: appending the TLS block to /app/Caddyfile in place would
+# stack a duplicate block on every `docker restart` of the same container.
+CADDYFILE=/tmp/Caddyfile
+cp /app/Caddyfile "$CADDYFILE"
 if [ "$(echo "${ENABLE_HTTPS:-false}" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
     mkdir -p "$CERT_DIR"
+
+    # A TLS client connecting by IP matches ONLY iPAddress SANs — a DNS wildcard
+    # does not cover 192.168.3.148, and neither does IP:0.0.0.0. The old cert had
+    # exactly that, so every verifying client (ffmpeg, VLC, Dispatcharr, curl)
+    # rejected it. Build the SAN list from the addresses this box is actually
+    # reached on: DOCKER_HOST_IP plus anything in TLS_HOSTS (comma separated).
+    SAN="DNS:localhost,DNS:*,IP:127.0.0.1"
+    for h in ${DOCKER_HOST_IP:-} ${TLS_HOSTS//,/ }; do
+        [ -n "$h" ] || continue
+        if [[ "$h" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then SAN="$SAN,IP:$h"; else SAN="$SAN,DNS:$h"; fi
+    done
+
+    # Regenerate when the SAN set changes, otherwise a stale cert on the data
+    # volume silently outlives the config that was supposed to fix it.
+    if [ -f "$CERT_DIR/cert.pem" ] && [ -f "$CERT_DIR/key.pem" ] \
+       && [ "$(cat "$CERT_DIR/.san" 2>/dev/null)" != "$SAN" ] \
+       && openssl x509 -in "$CERT_DIR/cert.pem" -noout -subject 2>/dev/null | grep -q "CN *= *${TLS_CN:-freesky}"; then
+        echo "Self-signed certificate does not match current SAN list - regenerating"
+        rm -f "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem"
+    fi
+
     if [ ! -f "$CERT_DIR/cert.pem" ] || [ ! -f "$CERT_DIR/key.pem" ]; then
-        echo "No certificate found in $CERT_DIR - generating a self-signed one"
-        # subjectAltName covers localhost plus any address, so the same cert works
-        # however the box is reached. Browsers still warn (it is not CA-signed).
+        echo "Generating self-signed certificate for $SAN"
         openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
             -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
-            -subj "/CN=${TLS_CN:-freesky}" \
-            -addext "subjectAltName=DNS:localhost,DNS:*,IP:127.0.0.1,IP:0.0.0.0" \
-            >/dev/null 2>&1 && echo "Self-signed certificate created" \
+            -subj "/CN=${TLS_CN:-freesky}" -addext "subjectAltName=$SAN" \
+            >/dev/null 2>&1 \
+            && { echo "$SAN" > "$CERT_DIR/.san"; echo "Self-signed certificate created"; } \
             || echo "WARNING: certificate generation failed; HTTPS may not start"
     else
         echo "Using certificate from $CERT_DIR"
     fi
-    export SITE_ADDRESS="https://:${PORT}"
-    export CADDY_TLS="tls $CERT_DIR/cert.pem $CERT_DIR/key.pem"
-    echo "HTTPS enabled on port ${PORT}"
+
+    if [ "$HTTPS_PORT" = "$PORT" ]; then
+        export SITE_ADDRESS="https://:${PORT}"
+        export CADDY_TLS="tls $CERT_DIR/cert.pem $CERT_DIR/key.pem"
+        echo "HTTPS on port ${PORT} (HTTP disabled - HTTPS_PORT equals PORT)"
+    else
+        # Second listener as its own block: `tls` in a block whose address is
+        # plain http:// is a hard config error, so they cannot share one.
+        export SITE_ADDRESS="http://:${PORT}"
+        export CADDY_TLS=""
+        cat >> "$CADDYFILE" <<EOF
+
+https://:${HTTPS_PORT} {
+	tls $CERT_DIR/cert.pem $CERT_DIR/key.pem
+	import app
+}
+EOF
+        echo "HTTP on port ${PORT}, HTTPS on port ${HTTPS_PORT}"
+    fi
 else
     export SITE_ADDRESS="${SITE_ADDRESS:-:${PORT}}"
     export CADDY_TLS="${CADDY_TLS:-}"
@@ -143,4 +188,4 @@ echo "Backend started successfully"
 
 # Start Caddy in the foreground with explicit configuration
 echo "Starting Caddy..."
-exec caddy run --config /app/Caddyfile --adapter caddyfile 
+exec caddy run --config "$CADDYFILE" --adapter caddyfile
