@@ -64,6 +64,7 @@ const hlsConfig = {
 
 export function Player({ title, src }) {
   const hlsRef = React.useRef(null);
+  const playerRef = React.useRef(null);
 
   const handleProviderChange = (provider) => {
     if (provider?.type === 'hls') {
@@ -113,10 +114,24 @@ export function Player({ title, src }) {
     console.log('Video playback stalled');
   };
 
+  // Browsers only allow autoplay WITH sound once the origin has enough user
+  // interaction; otherwise play() rejects. Hardcoding `muted` bought reliable
+  // autoplay at the cost of every stream starting silent. Instead start unmuted
+  // and only fall back to muted when the browser actually refuses — arriving here
+  // by clicking a channel is usually gesture enough to keep the sound.
+  const handleAutoPlayFail = () => {
+    const player = playerRef.current;
+    if (!player) return;
+    console.log('Unmuted autoplay blocked; retrying muted');
+    player.muted = true;
+    player.play().catch(() => {});
+  };
+
   return (
     <>
       <InjectCSS />
       <MediaPlayer
+        ref={playerRef}
         title={title}
         src={src}
         viewType='video'
@@ -124,7 +139,6 @@ export function Player({ title, src }) {
         logLevel='warn'
         playsInline
         autoplay
-        muted
         load='eager'
         preload='auto'
         crossorigin='anonymous'
@@ -135,6 +149,7 @@ export function Player({ title, src }) {
         onWaiting={handleWaiting}
         onError={handleError}
         onStalled={handleStalled}
+        onAutoPlayFail={handleAutoPlayFail}
       >
         <MediaProvider>
           <Poster className="vds-poster" />

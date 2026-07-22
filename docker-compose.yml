@@ -32,9 +32,26 @@ services:
       - DADDYLIVE_URI=${DADDYLIVE_URI:-https://dlhd.st}
       
       # Application Settings
+      - CHANNEL_PREFS_FILE=/app/data/channel_prefs.json  # Persisted via the ./data volume below
+      - USERS_FILE=/app/data/users.json
+      - APP_SETTINGS_FILE=/app/data/app_settings.json
+      # Seed for the trusted-subnet allowlist on a fresh install; once saved in
+      # Settings the stored value wins. Clients here skip login entirely.
+      - TRUSTED_NETWORKS=${TRUSTED_NETWORKS:-}
+      # First-run bootstrap only — ignored once a user exists, so changing the
+      # admin password in the UI is not undone on restart. CHANGE THESE.
+      - ADMIN_USER=${ADMIN_USER:-admin}
+      # Leave ADMIN_PASS unset to have a random one generated and printed to the
+      # container log on first boot. No weak default ships.
+      - ADMIN_PASS=${ADMIN_PASS:-}
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
       - SOCKS5=${SOCKS5:-}
-      - WORKERS=${WORKERS:-2}  # Reduced from 3 to 2 workers
+      # One async worker. Multiple granian workers each hold a DIFFERENT in-memory
+      # encryption key (utils.py key_bytes = os.urandom at import), so a content
+      # URL minted by one worker fails to decrypt on another; granian was also
+      # cycling worker-1 every ~15s, dropping in-flight streams. A single worker is
+      # I/O-bound and fine for this load, and sidesteps both.
+      - WORKERS=${WORKERS:-1}
       - MAX_CONCURRENT_STREAMS=${MAX_CONCURRENT_STREAMS:-5}  # Reduced from 10 to 5
       
       # Reflex Framework Settings
@@ -46,6 +63,12 @@ services:
       - HTTPS_PROXY=${HTTPS_PROXY:-}
       - NO_PROXY=localhost,127.0.0.1
     
+    # Channel enable/disable choices must outlive the container. So must the logo
+    # cache — without it every restart re-fetches ~900 logos from upstream.
+    volumes:
+      - ./data:/app/data
+      - ./data/logo-cache:/app/logo-cache
+
     # Resource Limits
     deploy:
       resources:

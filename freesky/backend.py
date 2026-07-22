@@ -1,7 +1,9 @@
 import os
 import asyncio
+import glob
 import httpx
 import logging
+import re
 import time
 from functools import lru_cache
 from typing import Optional, Dict, Tuple, Set
@@ -10,10 +12,13 @@ from freesky.free_sky import Channel
 from fastapi import Response, status, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 # CORSMiddleware removed - CORS handled by Caddy
-from .utils import urlsafe_base64_decode, encrypt
+from .utils import urlsafe_base64_decode, encrypt, hls_ext, strip_hls_ext
 from .vidembed_extractor import extract_hls_from_vidembed
 from .multi_service_streamer import multi_streamer
 from .stream_monitor import stream_monitor
+from . import channel_prefs
+from . import users
+from . import app_settings
 import json
 from urllib.parse import urljoin, urlparse, urlunparse
 from collections import OrderedDict
@@ -74,6 +79,25 @@ streaming_client = httpx.AsyncClient(
 
 free_sky = StepDaddy()
 
+# Bootstrap the first admin at import. Reflex owns the ASGI lifespan, so
+# @fastapi_app.on_event("startup") never fires here — doing it at import is what
+# actually runs in the serving process. No-ops once any user exists.
+try:
+    _generated_pw = users.ensure_admin()
+    if _generated_pw:
+        # Printed once, at first boot only. Shown loudly because it is the only
+        # time this value is ever available — it is stored hashed.
+        logger.warning(
+            "=" * 72
+            + f"\n  FIRST RUN: created admin user '{os.environ.get('ADMIN_USER', 'admin')}'"
+            + f"\n  PASSWORD: {_generated_pw}"
+            + "\n  Save it now and change it in Settings. Set ADMIN_PASS to pick your own.\n"
+            + "=" * 72
+        )
+    logger.info(f"{len(users.list_users())} user(s) configured")
+except Exception as e:
+    logger.error(f"Could not bootstrap admin user: {e}")
+
 # Use OrderedDict for LRU cache behavior
 class LRUCache(OrderedDict):
     def __init__(self, maxsize=0, *args, **kwargs):
@@ -120,16 +144,22 @@ async def _get_stream_parallel(channel_id: str):
         
         # Create multiple tasks for different streaming approaches
         tasks = []
-        
-        # Task 1: Primary DLHD service
+        pinned = channel_prefs.source_for(channel_id)
+
+        # Task 1: Primary DLHD service. Skipped when the admin pinned a source —
+        # this path ignores the preference, so racing it would sometimes hand back
+        # a different player than the one that was chosen.
+        if not pinned:
+            tasks.append(asyncio.create_task(
+                multi_streamer.get_stream(channel_id, "DLHD"),
+                name="dlhd_primary"
+            ))
+
+        # Task 2: Direct channel processing (bypass multi-streamer). Honour any
+        # source the admin pinned for this channel — the resolver tries it first
+        # and still falls back to the others if it is down.
         tasks.append(asyncio.create_task(
-            multi_streamer.get_stream(channel_id, "DLHD"),
-            name="dlhd_primary"
-        ))
-        
-        # Task 2: Direct channel processing (bypass multi-streamer)
-        tasks.append(asyncio.create_task(
-            free_sky.stream(channel_id),
+            free_sky.stream(channel_id, prefer=pinned),
             name="direct_stream"
         ))
         
@@ -145,7 +175,11 @@ async def _get_stream_parallel(channel_id: str):
         # FIRST_COMPLETED alone cancelled the healthy task whenever a dead service
         # errored out first, so every channel 404'd on the fastest failure.
         pending = set(tasks)
-        deadline = time.time() + 8.0
+        # 8s cut off channels that resolve correctly but whose first upstream hop
+        # slows to ~7s under load, turning working streams into false 504s. 13s
+        # stays under the outer 15s wait_for while giving the iframe-chain failover
+        # room to try more than one player.
+        deadline = time.time() + 13.0
 
         while pending:
             remaining = deadline - time.time()
@@ -306,7 +340,7 @@ def _process_stream_content(content: str, referer: str) -> str:
         for line in lines:
             if line.startswith('http') and config.proxy_content:
                 # Proxy content URLs
-                line = f"/api/content/{encrypt(line)}"
+                line = f"/api/content/{encrypt(line)}{hls_ext(line)}"
             elif line.startswith('#EXT-X-KEY:'):
                 # Process encryption keys
                 original_url = re.search(r'URI="(.*?)"', line)
@@ -413,12 +447,71 @@ async def add_process_time_header(request: Request, call_next):
     response.headers["X-Process-Time"] = str(process_time)
     return response
 
+
+# Paths that stream content and must carry a valid per-user token. Everything a
+# player fetches after the playlist (segments via /api/content, keys) is covered,
+# because Dispatcharr and VLC send no cookie — the token rides in the URL. Auth is
+# only enforced when at least one user exists, so a fresh install is usable until
+# the admin is bootstrapped.
+_TOKEN_PROTECTED = (
+    "/playlist.m3u8", "/api/playlist.m3u8",
+    "/api/stream/", "/stream/",
+    "/api/content/", "/content/",
+    "/api/key/", "/key/",
+    "/epg.xml", "/api/epg.xml",
+)
+
+
+@fastapi_app.middleware("http")
+async def require_stream_token(request: Request, call_next):
+    path = request.url.path
+    if request.method == "GET" and path.startswith(_TOKEN_PROTECTED):
+        # No users yet → app is unconfigured, don't lock the owner out.
+        if users.list_users():
+            client_ip = app_settings.client_ip_from_headers(
+                request.headers, request.client.host if request.client else ""
+            )
+            # A whitelisted subnet (the LAN) may pull the playlist without a
+            # token, so an existing Dispatcharr source keeps working.
+            if not app_settings.is_trusted_ip(client_ip):
+                token = request.query_params.get("token", "")
+                if users.user_by_token(token) is None:
+                    # Generic 401, no WWW-Authenticate realm and no hint which
+                    # part failed — same response for missing, wrong or revoked.
+                    return Response(status_code=status.HTTP_401_UNAUTHORIZED)
+    return await call_next(request)
+
 # Add OPTIONS handler for streaming endpoints to handle CORS preflight requests
 # OPTIONS handler removed - CORS preflight handled by Caddy
 
+def _authorize_proxied_urls(content: str, token: str) -> str:
+    """Carry the caller's token onto every proxied URL inside a playlist.
+
+    Segments and keys are fetched by the player as separate requests with no
+    cookie, so without this the middleware would 401 everything after the
+    playlist itself. Done here, after generation, so both playlist rewriters are
+    covered by one rule.
+    """
+    if not token:
+        return content
+    out = []
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(("/api/content/", "/api/key/", "/content/", "/key/")) and "token=" not in stripped:
+            sep = "&" if "?" in stripped else "?"
+            line = f"{stripped}{sep}token={token}"
+        elif stripped.startswith("#EXT-X-KEY:") and "/api/key/" in stripped and "token=" not in stripped:
+            line = re.sub(r'URI="([^"]+)"',
+                          lambda m: f'URI="{m.group(1)}{"&" if "?" in m.group(1) else "?"}token={token}"',
+                          line)
+        out.append(line)
+    return "\n".join(out)
+
+
 @fastapi_app.get("/stream/{channel_id}.m3u8")
-@fastapi_app.get("/api/stream/{channel_id}.m3u8") 
-async def stream(channel_id: str):
+@fastapi_app.get("/api/stream/{channel_id}.m3u8")
+async def stream(channel_id: str, request: Request = None):
+    stream_token = request.query_params.get("token") if request else None
     try:
         # Get current time for tracking and caching
         current_time = time.time()
@@ -442,7 +535,7 @@ async def stream(channel_id: str):
             if current_time - cached_time < cache_ttl:
                 logger.info(f"Serving cached stream for channel {channel_id} to client {client_id}")
                 return Response(
-                    content=cached_data,
+                    content=_authorize_proxied_urls(cached_data, stream_token),
                     media_type="application/vnd.apple.mpegurl",
                     headers={
                         "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -461,7 +554,7 @@ async def stream(channel_id: str):
                 if current_time - cached_time < cache_ttl:
                     logger.info(f"Serving freshly cached stream for channel {channel_id} to client {client_id}")
                     return Response(
-                        content=cached_data,
+                        content=_authorize_proxied_urls(cached_data, stream_token),
                         media_type="application/vnd.apple.mpegurl",
                         headers={
                             "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -530,7 +623,7 @@ async def stream(channel_id: str):
                     asyncio.create_task(prefetch_segments(stream_data, channel_id))
                 
                 return Response(
-                    content=stream_data,
+                    content=_authorize_proxied_urls(stream_data, stream_token),
                     media_type="application/vnd.apple.mpegurl",
                     headers={
                         "Cache-Control": "max-age=30, public",  # Allow 30s caching for performance
@@ -630,7 +723,14 @@ async def content(path: str, request: Request, ref: str = None):
     current_time = time.time()
     session_id = None
     channel_id = None
-    
+
+    # The .ts/.m3u8 suffix exists only to satisfy ffmpeg's URL filters; it sits on
+    # whichever component is last, so strip it off both before decrypting.
+    if ref is not None:
+        ref = strip_hls_ext(ref)
+    else:
+        path = strip_hls_ext(path)
+
     try:
         # Extract channel ID from content path for session tracking
         channel_id = extract_channel_from_content_path(path)
@@ -662,6 +762,15 @@ async def content(path: str, request: Request, ref: str = None):
                 nested = await streaming_client.get(upstream_url, headers=upstream_headers, timeout=30.0)
                 if nested.status_code != 200:
                     raise ValueError(f"Upstream returned HTTP {nested.status_code}")
+                # The URL is only a hint: this CDN also serves binary segments from
+                # paths containing ".m3u8", and decoding those as text raised
+                # UnicodeDecodeError -> 500. Trust the body, not the name.
+                if not nested.content.startswith(b"#EXTM3U"):
+                    return Response(
+                        content=nested.content,
+                        media_type=nested.headers.get("content-type", "application/octet-stream"),
+                        headers={"Access-Control-Allow-Origin": "*"},
+                    )
                 referer = free_sky.content_url(ref) if ref else upstream_url
                 rewritten = free_sky._process_stream_content(
                     "\n".join(
@@ -669,6 +778,11 @@ async def content(path: str, request: Request, ref: str = None):
                         for line in nested.text.split("\n")
                     ),
                     referer,
+                )
+                # Carry the caller's token onto this playlist's segment URLs too,
+                # or the auth middleware 401s every segment the player then asks for.
+                rewritten = _authorize_proxied_urls(
+                    rewritten, request.query_params.get("token")
                 )
                 return Response(
                     content=rewritten,
@@ -775,6 +889,9 @@ async def update_channels():
                         logger.info(f"Successfully loaded {len(free_sky.channels)} channels")
                         # Clear stream cache when channels are updated
                         stream_cache.clear()
+                        # Don't block the update loop on it; already-cached logos
+                        # make later passes nearly free.
+                        asyncio.create_task(warm_logo_cache())
                         await asyncio.sleep(update_interval)
                     else:
                         raise Exception("No channels loaded from primary source")
@@ -790,7 +907,7 @@ async def update_channels():
                     logger.info("Loading channels from fallback file...")
                     with open("freesky/fallback_channels.json", "r") as f:
                         fallback_data = json.load(f)
-                        free_sky.channels = [Channel(**channel_data) for channel_data in fallback_data]
+                        free_sky.channels = [Channel.from_dict(channel_data) for channel_data in fallback_data]
                     if free_sky.channels:
                         logger.info(f"Loaded {len(free_sky.channels)} channels from fallback")
                     else:
@@ -822,7 +939,7 @@ def get_channels():
         if os.path.exists("freesky/fallback_channels.json"):
             with open("freesky/fallback_channels.json", "r") as f:
                 fallback_data = json.load(f)
-                channels = [Channel(**channel_data) for channel_data in fallback_data]
+                channels = [Channel.from_dict(channel_data) for channel_data in fallback_data]
             logger.info(f"Loaded {len(channels)} channels from fallback in get_channels()")
             return channels
         else:
@@ -851,10 +968,15 @@ def playlist_options():
     )
 
 @fastapi_app.get("/playlist.m3u8")
-def playlist():
-    """Return the playlist as a response"""
+def playlist(request: Request):
+    """Return the playlist as a response.
+
+    The caller's token is echoed into every stream URL so the player, which
+    sends no cookie, stays authorised for the rest of the session.
+    """
     return Response(
-        content=free_sky.playlist(),
+        content=free_sky.playlist(exclude=channel_prefs.disabled_ids(),
+                                  token=request.query_params.get("token")),
         media_type="application/vnd.apple.mpegurl",
         headers={
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -880,10 +1002,11 @@ def api_playlist_options():
     )
 
 @fastapi_app.get("/api/playlist.m3u8")
-def api_playlist():
+def api_playlist(request: Request):
     """Return the playlist as a response (API endpoint)"""
     return Response(
-        content=free_sky.playlist(),
+        content=free_sky.playlist(exclude=channel_prefs.disabled_ids(),
+                                  token=request.query_params.get("token")),
         media_type="application/vnd.apple.mpegurl",
         headers={
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -904,45 +1027,132 @@ async def get_schedule():
         # Return fallback empty schedule
         return {}
 
+# Logo URLs that returned nothing, so we stop re-probing them on every page view.
+_logo_misses = LRUCache(maxsize=2000)
+
+
+def _missing_logo():
+    """Serve the placeholder image itself, not a JSON 404 that renders as a
+    broken image in players and the channel grid."""
+    if os.path.exists("./assets/missing.png"):
+        return FileResponse("./assets/missing.png", headers={"Cache-Control": "public, max-age=86400"})
+    return Response(status_code=status.HTTP_404_NOT_FOUND)
+
+
+async def _cache_logo(url: str) -> Optional[str]:
+    """Fetch a logo into ./logo-cache and return its path, or None.
+
+    Shared by the HTTP route and the background warmer so both agree on
+    extension fallback and on what counts as a miss.
+    """
+    os.makedirs("./logo-cache", exist_ok=True)
+
+    # Cached under whatever extension actually served, which may differ from the
+    # one requested — FileResponse picks the content-type off that extension, so
+    # storing an SVG as .png would ship it as image/png and render as nothing.
+    file_stem = url.split("/")[-1].rsplit(".", 1)[0]
+    cached = glob.glob(f"./logo-cache/{glob.escape(file_stem)}.*")
+    if cached:
+        return cached[0]
+    if url in _logo_misses:
+        return None
+
+    # Upstream stores logos as .png, .jpg or .svg with no way to tell which from
+    # the channel name, so try the siblings before declaring a miss.
+    candidates = [url]
+    if url.rsplit(".", 1)[-1].lower() in ("png", "jpg", "jpeg", "svg"):
+        url_stem = url.rsplit(".", 1)[0]
+        candidates += [f"{url_stem}.{ext}" for ext in ("jpg", "svg", "png") if f"{url_stem}.{ext}" != url]
+
+    errored = False
+    for candidate in candidates:
+        try:
+            response = await client.get(
+                candidate,
+                headers={"user-agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0"}
+            )
+        except Exception as e:
+            # A timeout is not proof the logo is absent. 900 channels warming a
+            # cold cache at once produces plenty of them, and blacklisting on one
+            # would lose that logo until the next restart.
+            logger.warning(f"Error fetching logo {candidate}: {str(e)}")
+            errored = True
+            continue
+        if response.status_code == 200:
+            ext = candidate.rsplit(".", 1)[-1].lower()
+            cache_path = f"./logo-cache/{file_stem}.{ext}"
+            with open(cache_path, "wb") as f:
+                f.write(response.content)
+            return cache_path
+
+    # Only remember misses upstream actually answered (a real 404). Without this
+    # every page view re-probes 3 dead URLs per logo-less channel; with it applied
+    # to timeouts too, a slow moment would blacklist a perfectly good logo.
+    if not errored:
+        _logo_misses[url] = True
+    return None
+
+
+async def warm_logo_cache():
+    """Pull every channel logo into the cache in the background.
+
+    An IPTV client importing playlist.m3u8 asks for all ~900 tvg-logo URLs at
+    once. Against a cold cache each is an upstream round-trip, so most time out
+    and the client renders no artwork at all. Warming ahead of that turns the
+    import into local file reads. Already-cached logos cost nothing, so this is
+    cheap to re-run.
+    """
+    sem = asyncio.Semaphore(8)  # upstream is not worth hammering
+
+    async def one(url: str):
+        async with sem:
+            try:
+                await _cache_logo(url)
+            except Exception as e:
+                logger.debug(f"Logo warm failed for {url}: {e}")
+
+    urls = []
+    for ch in free_sky.channels:
+        if ch.logo and ch.logo.startswith("/api/logo/"):
+            try:
+                urls.append(urlsafe_base64_decode(ch.logo.rsplit("/", 1)[-1]))
+            except Exception:
+                continue
+    if not urls:
+        return
+    start = time.time()
+    await asyncio.gather(*(one(u) for u in urls), return_exceptions=True)
+    logger.info(f"Logo cache warm complete: {len(urls)} logos in {time.time() - start:.1f}s")
+
+
 @fastapi_app.get("/logo/{logo}")
 @fastapi_app.get("/api/logo/{logo}")
 async def logo(logo: str):
-    logger.debug(f"Logo request received: {logo}")
     try:
         url = urlsafe_base64_decode(logo)
-        logger.debug(f"Decoded URL: {url}")
-        file = url.split("/")[-1]
-        logger.debug(f"Filename: {file}")
     except Exception as e:
         logger.error(f"Error decoding logo URL: {str(e)}")
         return JSONResponse(content={"error": "Invalid logo URL"}, status_code=status.HTTP_400_BAD_REQUEST)
-    
-    if not os.path.exists("./logo-cache"):
-        os.makedirs("./logo-cache")
-    if os.path.exists(f"./logo-cache/{file}"):
-        return FileResponse(
-            f"./logo-cache/{file}",
-            headers={"Cache-Control": "public, max-age=86400"}  # Cache for 24 hours
-        )
-    try:
-        response = await client.get(
-            url, 
-            headers={"user-agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0"}
-        )
-        if response.status_code == 200:
-            with open(f"./logo-cache/{file}", "wb") as f:
-                f.write(response.content)
-            return FileResponse(
-                f"./logo-cache/{file}",
-                headers={"Cache-Control": "public, max-age=86400"}
-            )
-        else:
-            return JSONResponse(content={"error": "Logo not found"}, status_code=status.HTTP_404_NOT_FOUND)
-    except httpx.ConnectTimeout:
-        return JSONResponse(content={"error": "Request timed out"}, status_code=status.HTTP_504_GATEWAY_TIMEOUT)
-    except Exception as e:
-        logger.error(f"Error fetching logo: {str(e)}")
-        return JSONResponse(content={"error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    path = await _cache_logo(url)
+    if path:
+        return FileResponse(path, headers={"Cache-Control": "public, max-age=86400"})
+    return _missing_logo()
+
+@fastapi_app.post("/api/channels/refresh")
+@fastapi_app.post("/channels/refresh")
+async def refresh_channels_endpoint():
+    """Re-scrape the channel list from upstream on demand.
+
+    The list normally refreshes every 5 minutes; this lets the settings page
+    force it (e.g. after the upstream site adds channels) without a restart.
+    """
+    before = len(free_sky.channels)
+    await free_sky.load_channels()
+    stream_cache.clear()
+    asyncio.create_task(warm_logo_cache())
+    return {"status": "ok", "before": before, "after": len(free_sky.channels)}
+
 
 @fastapi_app.get("/ping")
 async def ping():
@@ -1019,6 +1229,7 @@ async def health():
     }
 
 @fastapi_app.get("/channels")
+@fastapi_app.get("/api/channels")
 async def channels_endpoint():
     """Get all channels as JSON."""
     try:

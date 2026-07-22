@@ -24,6 +24,26 @@ def xor(input_bytes):
     return bytes([input_bytes[i] ^ key_bytes[i % len(key_bytes)] for i in range(len(input_bytes))])
 
 
+def hls_ext(url: str) -> str:
+    """The extension a proxied HLS URL must end with.
+
+    ffmpeg 7+ refuses HLS playlists and segments whose URL has no recognised
+    extension (allowed_extensions / allowed_segment_extensions), and our proxy
+    URLs are otherwise just a base64 blob. Anything driving playback through
+    ffmpeg — Dispatcharr, Jellyfin, ffprobe — fails on the whole stream without
+    this, so the extension is load-bearing, not cosmetic.
+    """
+    return ".m3u8" if ".m3u8" in url.split("?")[0].lower() else ".ts"
+
+
+def strip_hls_ext(value: str) -> str:
+    """Undo hls_ext(). Safe because base64url never contains a dot."""
+    for ext in (".m3u8", ".ts"):
+        if value.endswith(ext):
+            return value[: -len(ext)]
+    return value
+
+
 def urlsafe_base64(input_string: str) -> str:
     input_bytes = input_string.encode("utf-8")
     base64_bytes = base64.urlsafe_b64encode(input_bytes)

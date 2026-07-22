@@ -88,13 +88,16 @@ handle @api_stream {
 		flush_interval -1
 		header_up X-Real-IP {remote_host}
 		header_down -Server
-		# Optimize for M3U8 delivery
+		# Resolving a channel can take up to ~13s when the primary player is
+		# down and we fail over to another (see _resolve_via_iframe_chain). A 5s
+		# cap here turned every slow-but-working channel into a 502. Keep it above
+		# the backend's own deadline.
 		transport http {
 			read_buffer 8192      # Smaller buffer for playlist delivery
 			write_buffer 8192
 			max_response_header 8KB
-			dial_timeout 2s       # Fast timeout for playlists
-			response_header_timeout 5s
+			dial_timeout 2s
+			response_header_timeout 20s
 		}
 	}
 }
@@ -123,13 +126,15 @@ handle @api_content {
 		flush_interval -1
 		header_up X-Real-IP {remote_host}
 		header_down -Server
-		# Optimize for streaming
+		# A nested playlist under /api/content is fetched from the upstream CDN
+		# before we can answer, so the first hit for a channel can take longer
+		# than a segment read. 10s here returned 502 on cold playlists.
 		transport http {
 			read_buffer 16384     # 16KB read buffer
 			write_buffer 16384    # 16KB write buffer
 			max_response_header 16KB
 			dial_timeout 3s
-			response_header_timeout 10s
+			response_header_timeout 35s
 		}
 	}
 }

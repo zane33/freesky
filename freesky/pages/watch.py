@@ -3,6 +3,7 @@ from rxconfig import config
 from freesky import backend
 from freesky.components import navbar, MediaPlayer
 from freesky.free_sky import Channel
+from freesky.auth_state import require_login
 
 media_player = MediaPlayer.create
 
@@ -14,8 +15,11 @@ class WatchState(rx.State):
     _cache_buster: int = 0
 
     @rx.event
-    def on_load(self):
+    async def on_load(self):
         """Initialize watch page state on load."""
+        redirect = await require_login(self)
+        if redirect is not None:
+            return redirect
         self.is_loaded = False
         # Increment cache buster to ensure proper component refresh
         self._cache_buster += 1

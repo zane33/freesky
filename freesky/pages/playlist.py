@@ -1,6 +1,7 @@
 import reflex as rx
 from rxconfig import config, api_url
 from freesky.components import navbar
+from freesky.auth_state import AuthState
 
 
 @rx.page("/playlist")
@@ -51,14 +52,14 @@ def playlist() -> rx.Component:
                             rx.button(
                                 "Download Playlist",
                                 rx.icon("download", margin_right="0.5rem"),
-                                on_click=rx.redirect(f"{api_url}/playlist.m3u8", is_external=True),
+                                on_click=rx.redirect(AuthState.playlist_url, is_external=True),
                                 size="3",
                             ),
                             rx.button(
                                 "Copy Link",
                                 rx.icon("clipboard", margin_right="0.5rem"),
                                 on_click=[
-                                    rx.set_clipboard(f"{api_url}/playlist.m3u8"),
+                                    rx.set_clipboard(AuthState.playlist_url),
                                     rx.toast("Playlist URL copied to clipboard!"),
                                 ],
                                 size="3",
@@ -68,7 +69,7 @@ def playlist() -> rx.Component:
                             rx.button(
                                 "Download EPG",
                                 rx.icon("calendar", margin_right="0.5rem"),
-                                on_click=rx.redirect(f"{api_url}/epg.xml", is_external=True),
+                                on_click=rx.redirect(AuthState.epg_url, is_external=True),
                                 size="3",
                                 color_scheme="blue",
                             ),
@@ -81,7 +82,7 @@ def playlist() -> rx.Component:
                         rx.vstack(
                             rx.box(
                                 rx.text(
-                                    f"{api_url}/playlist.m3u8",
+                                    AuthState.playlist_url,
                                     font_family="mono",
                                     font_size="sm",
                                 ),
@@ -97,7 +98,7 @@ def playlist() -> rx.Component:
                                     "Copy EPG Link",
                                     rx.icon("clipboard", margin_right="0.5rem"),
                                     on_click=[
-                                        rx.set_clipboard(f"{api_url}/epg.xml"),
+                                        rx.set_clipboard(AuthState.epg_url),
                                         rx.toast("EPG XML URL copied to clipboard!"),
                                     ],
                                     size="1",
@@ -111,7 +112,7 @@ def playlist() -> rx.Component:
                             ),
                             rx.box(
                                 rx.text(
-                                    f"{api_url}/epg.xml",
+                                    AuthState.epg_url,
                                     font_family="mono",
                                     font_size="sm",
                                 ),

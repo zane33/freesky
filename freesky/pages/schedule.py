@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from dateutil import parser
 from freesky import backend
 from freesky.components import navbar
+from freesky.auth_state import require_login
 
 
 class ChannelItem(TypedDict):
@@ -54,6 +55,9 @@ class ScheduleState(rx.State):
                 self.categories[cat] = True
 
     async def on_load(self):
+        redirect = await require_login(self)
+        if redirect is not None:
+            return redirect
         self.events = []
         categories = {}
         try:

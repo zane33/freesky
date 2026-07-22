@@ -3,9 +3,10 @@ import asyncio
 import time
 from typing import List, Optional
 import freesky.pages
-from freesky import backend
+from freesky import backend, channel_prefs
 from freesky.components import navbar, card
 from freesky.free_sky import Channel
+from freesky.auth_state import require_login
 
 
 class State(rx.State):
@@ -34,11 +35,12 @@ class State(rx.State):
     
     @rx.var
     def filtered_channels(self) -> List[Channel]:
-        """Filter channels based on search query."""
+        """Channels the user has enabled, narrowed by the search query."""
+        disabled = channel_prefs.disabled_ids()
+        channels = [ch for ch in self.channels if ch.id not in disabled]
         if not self.search_query:
-            return self.channels
-        else:
-            return [ch for ch in self.channels if self.search_query.lower() in ch.name.lower()]
+            return channels
+        return [ch for ch in channels if self.search_query.lower() in ch.name.lower()]
     
     @rx.var
     def filtered_channels_count(self) -> int:
@@ -95,7 +97,7 @@ class State(rx.State):
                     if response.status_code == 200:
                         data = response.json()
                         if data.get("channels"):
-                            self.channels = [Channel(**channel_data) for channel_data in data["channels"]]
+                            self.channels = [Channel.from_dict(channel_data) for channel_data in data["channels"]]
                             self.channels_count = len(self.channels)
                             self.connection_status = "connected"
                             self.ws_connected = True
@@ -130,7 +132,7 @@ class State(rx.State):
                     if os.path.exists(fallback_path):
                         with open(fallback_path, "r") as f:
                             fallback_data = json.load(f)
-                            self.channels = [Channel(**channel_data) for channel_data in fallback_data]
+                            self.channels = [Channel.from_dict(channel_data) for channel_data in fallback_data]
                             self.channels_count = len(self.channels)
                             self.connection_status = "connected"
                             self.ws_connected = True
@@ -139,19 +141,17 @@ class State(rx.State):
                             self.is_loading = False
                             return
                     else:
-                        # Last resort: create minimal demo channels
-                        self.channels = [
-                            Channel(id="1", name="ESPN", logo="/missing.png", tags=["sports"]),
-                            Channel(id="2", name="CNN", logo="/missing.png", tags=["news"]),
-                            Channel(id="3", name="HBO", logo="/missing.png", tags=["entertainment"]),
-                            Channel(id="4", name="Discovery Channel", logo="/missing.png", tags=["documentary"]),
-                            Channel(id="5", name="National Geographic", logo="/missing.png", tags=["documentary", "nature"])
-                        ]
-                        self.channels_count = len(self.channels)
-                        self.connection_status = "connected"
+                        # ponytail: no fabricated demo channels. Ids 1-5 (ESPN,
+                        # CNN, ...) don't exist upstream, so they rendered as real
+                        # channels, landed in playlist.m3u8, and made a still-
+                        # loading backend look like a 5-channel service. Report
+                        # the truth and let the caller retry.
+                        self.channels = []
+                        self.channels_count = 0
+                        self.connection_status = "connecting"
                         self.ws_connected = True
-                        self.last_update = "demo mode"
-                        self.error_message = "Backend unavailable, using demo channels"
+                        self.last_update = ""
+                        self.error_message = "Channels not loaded yet - retrying"
                 
         except Exception as e:
             self.connection_status = "error"
@@ -220,6 +220,9 @@ class State(rx.State):
     @rx.event
     async def on_load(self):
         """Initial load when page loads."""
+        redirect = await require_login(self)
+        if redirect is not None:
+            return redirect
         # Set WebSocket as connected since Reflex manages the connection
         self.ws_connected = True
         self.connection_status = "connecting"

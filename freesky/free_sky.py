@@ -26,6 +26,22 @@ class Channel:
     tags: List[str]
     logo: str
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "Channel":
+        """Build from a dict, ignoring keys we don't model.
+
+        fallback_channels.json carried an `is_live` field the dataclass never
+        had; `Channel(**data)` then threw and get_channels() fell back to an
+        empty list, blanking the whole UI. Tolerating extra keys keeps a stray
+        field in saved data from taking the app down.
+        """
+        return cls(
+            id=str(data.get("id", "")),
+            name=data.get("name", "Unknown"),
+            tags=data.get("tags", []),
+            logo=data.get("logo", "/missing.png"),
+        )
+
 
 class StepDaddy:
     def __init__(self):

@@ -14,7 +14,8 @@ from urllib.parse import quote, urljoin, urlparse
 from curl_cffi import AsyncSession
 from dataclasses import dataclass
 from typing import List
-from .utils import encrypt, decrypt, urlsafe_base64, extract_and_decode_var
+from .free_sky import Channel
+from .utils import encrypt, decrypt, urlsafe_base64, extract_and_decode_var, hls_ext
 from .token_validator import TokenValidator, extract_viable_streams
 from rxconfig import config
 
@@ -26,14 +27,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class Channel:
-    id: str
-    name: str
-    tags: List[str]
-    logo: str
-
-
+# ponytail: Channel used to be redefined here with identical fields. Two classes
+# with the same shape are still two types: anything annotated
+# `List[free_sky.Channel]` silently rejected the ones built here, which is how the
+# settings page came up empty while the backend held 900 channels.
 class StepDaddyHybrid:
     def __init__(self):
         socks5 = config.socks5
@@ -165,7 +162,13 @@ class StepDaddyHybrid:
             channel_name = "Vamos Spain"
         clean_channel_name = re.sub(r"\s*\(.*?\)", "", channel_name)
         meta = self._meta.get(clean_channel_name, {})
-        logo = meta.get("logo", "/missing.png")
+        # Upstream publishes per-channel art at {base}/logos/<slug>.<ext>, so channels
+        # added after meta.json was written still get a logo, and it follows
+        # DADDYLIVE_URI when the site moves. meta.json only covers ~2/3 of the list;
+        # it stays as the fallback because upstream misses ~18%.
+        # /api/logo tries the other extensions before giving up.
+        slug = re.sub(r"[^a-z0-9]+", "_", clean_channel_name.lower()).strip("_")
+        logo = meta.get("logo") or f"{self._base_url}/logos/{slug}.png"
         if logo.startswith("http"):
             logo = f"/api/logo/{urlsafe_base64(logo)}"
         return Channel(id=channel_id, name=channel_name, tags=meta.get("tags", []), logo=logo)
@@ -176,48 +179,99 @@ class StepDaddyHybrid:
     _IFRAME_RE = re.compile(r'<iframe[^>]+src=["\']([^"\']+)["\']', re.I)
     _ATOB_RE = re.compile(r"atob\(\s*['\"]([A-Za-z0-9+/=]+)['\"]\s*\)")
 
-    async def _resolve_via_iframe_chain(self, channel_id: str, max_hops: int = 4, max_pages: int = 8):
-        """
-        Follow the live upstream chain to an HLS playlist.
+    # Upstream's watch.php offers several "players", each its own path that leads
+    # to an independent iframe chain. Trying them in order gives real failover:
+    # when one player's CDN feed is offline the next may still be live. Order is
+    # best-first from measurement (stream/watch resolve most reliably); the rest
+    # are tried before giving up. A channel-specific preference can pin one first.
+    PLAYER_PATHS = ["stream", "watch", "cast", "plus", "casting", "player"]
 
-        As of 2026-07 it is: /watch.php?id=N -> /stream/stream-N.php -> <player-host>
-        /premiumtv/daddy2.php?id=N, whose Clappr config carries the m3u8 URL inside
+    async def _resolve_via_iframe_chain(self, channel_id: str, max_hops: int = 4,
+                                        max_pages: int = 8, prefer: str = None,
+                                        budget: float = 9.5):
+        """
+        Follow the live upstream chain to a WORKING HLS playlist, failing over
+        across the available players.
+
+        As of 2026-07 a player chain is: /<player>/stream-N.php -> <player-host>
+        /premiumtv/daddyN.php?id=N, whose Clappr config carries the m3u8 URL inside
         window.atob('<base64>'). Each hop needs the previous page as Referer.
+
+        A candidate m3u8 is only accepted once its body actually starts with
+        #EXTM3U — a URL that resolves but returns "Not found" is treated as a dead
+        source and we move on, which is what makes failover real rather than
+        cosmetic.
         """
-        # Breadth-first, not first-iframe-wins: the watch page leads with an ad banner
-        # iframe, so following only the first link walks into an ad network.
-        queue = [(f"{self._base_url}/watch.php?id={channel_id}", self._base_url, 0)]
-        seen = set()
+        players = list(self.PLAYER_PATHS)
+        if prefer and prefer in players:
+            players.remove(prefer)
+            players.insert(0, prefer)
 
-        while queue and len(seen) < max_pages:
-            url, referer, depth = queue.pop(0)
-            if url in seen or depth > max_hops:
-                continue
-            seen.add(url)
+        watch_url = f"{self._base_url}/watch.php?id={channel_id}"
+        deadline = asyncio.get_event_loop().time() + budget
+        last_error = None
 
-            try:
-                response = await self._session.get(url, headers=self._headers(referer))
-            except Exception as e:
-                logger.debug(f"Hop failed for {url}: {e}")
-                continue
-            if response.status_code != 200:
-                continue
+        for player in players:
+            if asyncio.get_event_loop().time() > deadline:
+                break  # a dead channel shouldn't burn the whole request on every player
+            # Seed each player from its own entry page but keep watch.php as the
+            # referer, mirroring how the site navigates between players.
+            start = f"{self._base_url}/{player}/stream-{channel_id}.php"
+            queue = [(start, watch_url, 0)]
+            seen = set()
+            player_dead = False
 
-            for encoded in self._ATOB_RE.findall(response.text):
+            while queue and len(seen) < max_pages and not player_dead:
+                if asyncio.get_event_loop().time() > deadline:
+                    break
+                url, referer, depth = queue.pop(0)
+                if url in seen or depth > max_hops:
+                    continue
+                seen.add(url)
+
                 try:
-                    candidate = base64.b64decode(encoded).decode()
-                except Exception:
-                    continue  # not every atob() on the page is the stream URL
-                if candidate.startswith("http") and ".m3u8" in candidate:
-                    logger.info(f"Resolved channel {channel_id} to {candidate}")
-                    return await self._fetch_playlist(candidate, url)
+                    # Per-hop cap: several player hosts are dead and hang for the
+                    # full session timeout, which alone would blow the whole budget
+                    # on one bad iframe. Fail that hop fast and try the next player.
+                    response = await asyncio.wait_for(
+                        self._session.get(url, headers=self._headers(referer)),
+                        timeout=4.0,
+                    )
+                except Exception as e:
+                    logger.debug(f"Hop failed for {url}: {e}")
+                    continue
+                if response.status_code != 200:
+                    continue
 
-            for src in self._IFRAME_RE.findall(response.text):
-                # Skip templated srcs like "' + url + '" that appear in inline scripts.
-                if "://" in src or src.startswith("/"):
-                    queue.append((urljoin(url, src), url, depth + 1))
+                for encoded in self._ATOB_RE.findall(response.text):
+                    try:
+                        candidate = base64.b64decode(encoded).decode()
+                    except Exception:
+                        continue  # not every atob() on the page is the stream URL
+                    if candidate.startswith("http") and ".m3u8" in candidate:
+                        try:
+                            result = await self._fetch_playlist(candidate, url)
+                            logger.info(f"Resolved channel {channel_id} via '{player}' player")
+                            return result
+                        except Exception as e:
+                            # We reached this player's CDN and it returned no real
+                            # playlist: the feed is down. Stop crawling this player's
+                            # ad iframes and move straight to the next player.
+                            last_error = e
+                            player_dead = True
+                            logger.debug(f"Player '{player}' feed dead for {channel_id}: {e}")
+                            break
 
-        raise ValueError(f"No stream URL found in iframe chain for channel {channel_id}")
+                if not player_dead:
+                    for src in self._IFRAME_RE.findall(response.text):
+                        # Skip templated srcs like "' + url + '" in inline scripts.
+                        if "://" in src or src.startswith("/"):
+                            queue.append((urljoin(url, src), url, depth + 1))
+
+        raise ValueError(
+            f"No working stream found for channel {channel_id} across "
+            f"{len(players)} players" + (f" (last: {last_error})" if last_error else "")
+        )
 
     async def _fetch_playlist(self, m3u8_url: str, referer: str):
         """Fetch an HLS playlist and rewrite it for the proxy."""
@@ -236,50 +290,18 @@ class StepDaddyHybrid:
         # whose Referer is not the embedding page, and our proxy has to replay it.
         return self._process_stream_content(absolute, referer)
 
-    async def stream(self, channel_id: str):
+    async def stream(self, channel_id: str, prefer: str = None):
         """
-        Handle channel streaming with proper vidembed.re architecture detection and fallback
-        """
-        # Current upstream path first; the vidembed/old-arch handlers below stay as
-        # fallback in case a channel is still served the previous way.
-        try:
-            return await self._resolve_via_iframe_chain(channel_id)
-        except Exception as chain_error:
-            logger.warning(f"Iframe chain failed for channel {channel_id}: {chain_error}")
+        Resolve a channel to a proxied HLS playlist, failing over across upstream
+        players. `prefer` pins one player (see PLAYER_PATHS) to try first.
 
-        try:
-            # First, get the channel page to determine architecture
-            channel_page_url = f"{self._base_url}/watch.php?id={channel_id}"
-            response = await self._session.get(channel_page_url, headers=self._headers())
-            
-            if response.status_code != 200:
-                raise ValueError(f"Failed to access channel page: HTTP {response.status_code}")
-            
-            # Look for vidembed.re iframe in the channel page
-            vidembed_pattern = r'https://vidembed\.re/stream/([a-f0-9-]{36})'
-            vidembed_matches = re.findall(vidembed_pattern, response.text)
-            
-            if vidembed_matches:
-                # Found vidembed.re URL - use new architecture
-                vidembed_uuid = vidembed_matches[0]
-                vidembed_url = f"https://vidembed.re/stream/{vidembed_uuid}"
-                logger.info(f"Found vidembed.re URL for channel {channel_id}: {vidembed_url}")
-                return await self._handle_new_architecture(vidembed_url, channel_page_url)
-            else:
-                # No vidembed.re found, fall back to old architecture
-                logger.info(f"No vidembed.re URL found for channel {channel_id}, using old architecture")
-                iframe_url = f"https://fnjplay.xyz/premiumtv/daddylivehd.php?id={channel_id}"
-                return await self._handle_old_architecture(iframe_url, self._base_url)
-                
-        except Exception as e:
-            logger.error(f"Error in stream architecture detection for channel {channel_id}: {str(e)}")
-            # Final fallback to old architecture
-            try:
-                iframe_url = f"https://fnjplay.xyz/premiumtv/daddylivehd.php?id={channel_id}"
-                return await self._handle_old_architecture(iframe_url, self._base_url)
-            except Exception as fallback_error:
-                logger.error(f"Fallback also failed: {str(fallback_error)}")
-                raise
+        ponytail: the old vidembed.re / fnjplay.xyz fallbacks were removed — both
+        hosts are dead (DNS no longer resolves), so they only added a multi-second
+        stall before the same failure. The iframe chain already tries every live
+        player. `_handle_new_architecture`/`_handle_old_architecture` remain for
+        the multi_service_streamer callers but are no longer on this path.
+        """
+        return await self._resolve_via_iframe_chain(channel_id, prefer=prefer)
 
     async def _handle_new_architecture(self, vidembed_url: str, referer: str):
         """Handle the new vidembed.re architecture with proper iframe-based authentication"""
@@ -453,7 +475,7 @@ class StepDaddyHybrid:
                     original_url = re.search(r'URI="(.*?)"', line).group(1)
                     line = line.replace(original_url, f"/api/key/{encrypt(original_url)}/{encrypt(urlparse(iframe_url).netloc)}")
                 elif line.startswith("http") and config.proxy_content:
-                    line = f"/api/content/{encrypt(line)}"
+                    line = f"/api/content/{encrypt(line)}{hls_ext(line)}"
                 m3u8_data += line + "\n"
             
             return m3u8_data
@@ -554,8 +576,10 @@ class StepDaddyHybrid:
                     
                     if config.proxy_content:
                         # Proxy content URLs, carrying the referer the CDN demands —
-                        # same two-segment shape /api/key/ already uses.
-                        line = f"/api/content/{encrypt(line)}/{encrypt(referer)}"
+                        # same two-segment shape /api/key/ already uses. The trailing
+                        # extension goes on the LAST component, which is what ffmpeg
+                        # inspects.
+                        line = f"/api/content/{encrypt(line)}/{encrypt(referer)}{hls_ext(line)}"
                 elif line.startswith('#EXT-X-KEY:'):
                     # Process encryption keys
                     original_url = re.search(r'URI="(.*?)"', line)
@@ -607,11 +631,22 @@ class StepDaddyHybrid:
     def content_url(path: str):
         return decrypt(path)
 
-    def playlist(self):
+    def playlist(self, exclude: set = None, token: str = None):
+        exclude = exclude or set()
+        # The player fetches each stream URL directly with no cookie, so the
+        # caller's token has to be baked into every line for auth to hold.
+        suffix = f"?token={token}" if token else ""
         data = "#EXTM3U\n"
         for channel in self.channels:
-            entry = f" tvg-logo=\"{channel.logo}\",{channel.name}" if channel.logo else f",{channel.name}"
-            data += f"#EXTINF:-1{entry}\n{config.api_url}/api/stream/{channel.id}.m3u8\n"
+            if channel.id in exclude:
+                continue
+            logo = channel.logo
+            # Relative logo paths are useless to an external player like VLC,
+            # which has no idea what host the playlist came from.
+            if logo and logo.startswith("/"):
+                logo = f"{config.api_url}{logo}"
+            entry = f" tvg-logo=\"{logo}\",{channel.name}" if logo else f",{channel.name}"
+            data += f"#EXTINF:-1{entry}\n{config.api_url}/api/stream/{channel.id}.m3u8{suffix}\n"
         return data
 
     async def schedule(self):

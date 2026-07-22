@@ -6,3 +6,8 @@ assets/external/
 .venv
 __pycache__/
 /.idea/
+freesky/channel_prefs.json
+data/
+logo-cache/
+freesky/users.json
+freesky/app_settings.json
