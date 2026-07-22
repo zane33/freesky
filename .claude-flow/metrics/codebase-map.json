@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-07-19T09:38:53.555Z",
+  "timestamp": "2026-07-22T01:57:14.904Z",
   "projectRoot": "/Users/zane/Documents/GitHub/freesky",
   "structure": {
     "hasPackageJson": false,
@@ -7,5 +7,5 @@
     "hasClaudeConfig": true,
     "hasClaudeFlow": true
   },
-  "scannedAt": 1784453933555
+  "scannedAt": 1784685434904
 }

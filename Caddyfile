@@ -15,12 +15,25 @@ encode @compress {
 }
 root * /srv
 
-# Cache static assets aggressively
+# Cache static assets aggressively — safe because their filenames are content
+# hashed (entry.client-C7a1nLPR.js), so a new build produces new names.
 @static_assets {
     path *.js *.css *.woff *.woff2 *.ttf *.png *.jpg *.jpeg *.gif *.ico *.svg
 }
 header @static_assets {
     Cache-Control "public, max-age=31536000, immutable"
+}
+
+# The HTML shell must NOT be cached. It is the one file whose name never changes
+# while its contents point at the hashed bundles, so a browser holding an old copy
+# keeps loading the previous build's assets after a redeploy — which is how a
+# stale tab ended up on an app with no /login route and rendered 404 at the root.
+@html_shell {
+    not path *.js *.css *.woff *.woff2 *.ttf *.png *.jpg *.jpeg *.gif *.ico *.svg *.map *.json
+    not path /api/* /stream/* /content/* /key/* /logo/* /playlist.m3u8 /epg.xml /_event*
+}
+header @html_shell {
+    Cache-Control "no-cache, must-revalidate"
 }
 
 # Streaming endpoints need permissive headers for external players
@@ -164,7 +177,10 @@ handle /schedule {
 
 # Handle all other requests
 handle {
-	# Try static files first
-	try_files {path} /index.html
+	# Reflex exports each route as its own directory (/srv/login/index.html), so
+	# the directory index has to be tried explicitly — {path} alone never matches
+	# a directory and every route fell through to the root shell, serving the
+	# Index page's HTML (and its <title>) for /login and /settings.
+	try_files {path} {path}/index.html {path}.html /index.html
 	file_server
 }
