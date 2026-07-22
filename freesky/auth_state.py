@@ -5,6 +5,7 @@ login page needs the navbar — importing across those two directly would be a
 cycle.
 """
 import reflex as rx
+from urllib.parse import urlparse
 
 from rxconfig import api_url
 
@@ -64,15 +65,31 @@ class AuthState(rx.State):
         return self.current_user.get("token", "")
 
     @rx.var
+    def origin(self) -> str:
+        """The scheme://host:port this page was actually loaded from.
+
+        Falls back to the configured API_URL only when the router has no URL yet.
+        Using the build-time API_URL directly meant every displayed link showed the
+        LAN address to anyone arriving via NAT, a hostname, or HTTPS.
+        """
+        try:
+            parsed = urlparse(str(self.router.url))
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            pass
+        return api_url
+
+    @rx.var
     def playlist_url(self) -> str:
         """This user's personal playlist URL — paste straight into Dispatcharr."""
         token = self.stream_token
-        return f"{api_url}/playlist.m3u8" + (f"?token={token}" if token else "")
+        return f"{self.origin}/playlist.m3u8" + (f"?token={token}" if token else "")
 
     @rx.var
     def epg_url(self) -> str:
         token = self.stream_token
-        return f"{api_url}/epg.xml" + (f"?token={token}" if token else "")
+        return f"{self.origin}/epg.xml" + (f"?token={token}" if token else "")
 
     @rx.event
     def login(self, form: dict):

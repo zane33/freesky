@@ -4,6 +4,7 @@ Runs in the same process as the FastAPI backend, so it reads and writes
 `channel_prefs` directly instead of going back out over HTTP.
 """
 import reflex as rx
+from urllib.parse import urlparse
 from typing import List
 
 from rxconfig import api_url
@@ -201,7 +202,16 @@ class SettingsState(rx.State):
             self.revealed_user = ""
             self.revealed_url = ""
             return rx.toast("User not found")
-        url = f"{api_url}/playlist.m3u8?token={token}"
+        # Same origin the admin is browsing from, so the copied URL works for
+        # whoever they're handing it to rather than naming the LAN address.
+        origin = api_url
+        try:
+            parsed = urlparse(str(self.router.url))
+            if parsed.scheme and parsed.netloc:
+                origin = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            pass
+        url = f"{origin}/playlist.m3u8?token={token}"
         # Toggle off if the same row is clicked again.
         if self.revealed_user == username:
             self.revealed_user = ""
