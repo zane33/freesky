@@ -1251,17 +1251,26 @@ async def channels_endpoint():
         return {"error": str(e), "channels": [], "count": 0}
 
 def _filter_schedule_to_enabled(schedule: dict) -> dict:
-    """Drop channels the admin disabled, and any event left with none.
+    """Keep only what the user can actually watch.
 
-    The schedule is only useful if it points at channels you can actually watch,
-    so it follows the same enable/disable list as the playlist.
+    A channel qualifies when it is BOTH in the current channel list AND not
+    switched off in settings. Checking only the disabled list wasn't enough: the
+    schedule cites ~280 ids that exist nowhere in the channel list (PPV/event
+    slots), which accounted for ~200 events advertising channels you can neither
+    select nor play. Events left with no qualifying channel are dropped.
     """
     if not isinstance(schedule, dict):
         return {}
-    # No early return when nothing is disabled: events that carry no channel at
-    # all are never watchable, so they are dropped either way. Short-circuiting
-    # made the listing change shape the moment the first channel was switched off.
     disabled = channel_prefs.disabled_ids()
+    known = {c.id for c in (get_channels() or [])}
+    # If channels haven't loaded yet, an empty `known` would blank the whole
+    # schedule; fall back to the disabled list alone until they arrive.
+    enabled = ({c for c in known if c not in disabled} if known else None)
+
+    def keeps(channel_id: str) -> bool:
+        cid = str(channel_id)
+        return cid not in disabled if enabled is None else cid in enabled
+
     out = {}
     for day, categories in schedule.items():
         if not isinstance(categories, dict):
@@ -1272,7 +1281,7 @@ def _filter_schedule_to_enabled(schedule: dict) -> dict:
             for event in events or []:
                 channels = [
                     c for c in (event.get("channels") or [])
-                    if str(c.get("channel_id", "")) not in disabled
+                    if keeps(c.get("channel_id", ""))
                 ]
                 if channels:
                     kept.append({**event, "channels": channels})
