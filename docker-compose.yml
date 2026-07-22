@@ -44,11 +44,14 @@ services:
       # Leave ADMIN_PASS unset to have a random one generated and printed to the
       # container log on first boot. No weak default ships.
       - ADMIN_PASS=${ADMIN_PASS:-}
-      # HTTPS. Default is plain HTTP. For self-signed TLS set:
-      #   SITE_ADDRESS=https://:3000  and  CADDY_TLS=tls internal
-      # To use your own certificate, drop cert.pem/key.pem in ./data/certs and set:
-      #   CADDY_TLS=tls /app/data/certs/cert.pem /app/data/certs/key.pem
-      - SITE_ADDRESS=${SITE_ADDRESS::3000}
+      # HTTPS. Default is plain HTTP; set ENABLE_HTTPS=true to serve TLS on the
+      # same port. start.sh then generates a self-signed cert into ./data/certs on
+      # first run, or uses your own cert.pem/key.pem if you put them there.
+      - ENABLE_HTTPS=${ENABLE_HTTPS:-false}
+      # Advanced overrides, normally left empty — start.sh fills them in. Compose
+      # uses ${VAR:-default}, NOT Caddy's ${VAR:default} form; mixing the two here
+      # is what produced "invalid interpolation format".
+      - SITE_ADDRESS=${SITE_ADDRESS:-}
       - CADDY_TLS=${CADDY_TLS:-}
       # Keeps Caddy's generated CA and any issued certs on the data volume, so a
       # restart doesn't mint a new self-signed CA (or re-hit Let's Encrypt limits).
