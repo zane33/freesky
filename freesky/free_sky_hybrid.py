@@ -649,19 +649,74 @@ class StepDaddyHybrid:
             data += f"#EXTINF:-1{entry}\n{config.api_url}/api/stream/{channel.id}.m3u8{suffix}\n"
         return data
 
+    # The schedule JSON API is domain-gated (403 "Schedule API Available for
+    # allowed Domain only!") and the open .json file is a stale 2025 snapshot, so
+    # the live listings are scraped off the homepage where the site renders them.
+    _SCHED_DAY_RE = re.compile(r'class="schedule__dayTitle"[^>]*>(.*?)</div>', re.S)
+    _SCHED_CAT_RE = re.compile(r'class="card__meta"[^>]*>(.*?)</div>', re.S)
+    _SCHED_EVENT_RE = re.compile(r'class="schedule__event"', re.S)
+    _SCHED_TIME_RE = re.compile(r'class="schedule__time"[^>]*?data-time="([^"]*)"', re.S)
+    _SCHED_TITLE_RE = re.compile(r'class="schedule__eventTitle"[^>]*>(.*?)</span>', re.S)
+    _SCHED_CHAN_RE = re.compile(r'href="/watch\.php\?id=(\d+)"[^>]*>(.*?)</a>', re.S)
+
+    @staticmethod
+    def _sched_text(fragment: str) -> str:
+        return html.unescape(re.sub(r"<[^>]+>", "", fragment)).strip()
+
+    def _parse_schedule(self, page: str) -> dict:
+        """Turn the homepage's schedule markup into {day: {category: [events]}}.
+
+        Walks day/category/event markers in document order and attaches each event
+        to the most recent headings above it — the blocks nest, which regex can't
+        match directly, but their order in the document is unambiguous.
+        """
+        marks = []
+        for m in self._SCHED_DAY_RE.finditer(page):
+            marks.append((m.start(), "day", self._sched_text(m.group(1))))
+        for m in self._SCHED_CAT_RE.finditer(page):
+            marks.append((m.start(), "cat", self._sched_text(m.group(1))))
+        for m in self._SCHED_EVENT_RE.finditer(page):
+            marks.append((m.start(), "event", None))
+        marks.sort(key=lambda x: x[0])
+
+        out, day, cat = {}, None, None
+        for i, (pos, kind, value) in enumerate(marks):
+            if kind == "day":
+                day, cat = value, None
+                out.setdefault(day, {})
+            elif kind == "cat":
+                cat = value
+            elif kind == "event" and day and cat:
+                end = marks[i + 1][0] if i + 1 < len(marks) else len(page)
+                block = page[pos:end]
+                when = self._SCHED_TIME_RE.search(block)
+                title = self._SCHED_TITLE_RE.search(block)
+                if not (when and title):
+                    continue
+                channels = [
+                    {"channel_name": self._sched_text(name), "channel_id": cid}
+                    for cid, name in self._SCHED_CHAN_RE.findall(block)
+                ]
+                out[day].setdefault(cat, []).append({
+                    "time": when.group(1).strip(),
+                    "event": self._sched_text(title.group(1)),
+                    "channels": channels,
+                })
+        return {d: c for d, c in out.items() if c}
+
     async def schedule(self):
         try:
-            response = await self._session.get(f"{self._base_url}/stream/schedule/schedule-generated.php", headers=self._headers())
-            if response.status_code == 200:
-                content = response.text.strip()
-                if content and content.startswith('{'):
-                    return response.json()
-                else:
-                    logger.warning(f"Schedule endpoint returned non-JSON content: {content[:100]}...")
-                    return {}
-            else:
-                logger.warning(f"Schedule endpoint returned status {response.status_code}")
+            response = await self._session.get(self._base_url, headers=self._headers())
+            if response.status_code != 200:
+                logger.warning(f"Schedule page returned status {response.status_code}")
                 return {}
+            parsed = self._parse_schedule(response.text)
+            if not parsed:
+                logger.warning("No schedule entries found in upstream page")
+            else:
+                total = sum(len(e) for c in parsed.values() for e in c.values())
+                logger.info(f"Parsed schedule: {len(parsed)} day(s), {total} events")
+            return parsed
         except Exception as e:
             logger.error(f"Error fetching schedule: {str(e)}")
-            return {} 
+            return {}

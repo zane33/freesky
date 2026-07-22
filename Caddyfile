@@ -171,9 +171,9 @@ handle /ping {
 	reverse_proxy localhost:{$BACKEND_PORT}
 }
 
-handle /schedule {
-	reverse_proxy localhost:{$BACKEND_PORT}
-}
+# /schedule is a FRONTEND page. Proxying it to the backend served the API's raw
+# JSON to anyone clicking the Schedule tab. The API lives at /api/schedule, which
+# the @api matcher above already routes.
 
 # Handle all other requests
 handle {

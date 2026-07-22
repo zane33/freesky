@@ -1250,52 +1250,58 @@ async def channels_endpoint():
         logger.error(f"Error in channels endpoint: {str(e)}")
         return {"error": str(e), "channels": [], "count": 0}
 
+def _filter_schedule_to_enabled(schedule: dict) -> dict:
+    """Drop channels the admin disabled, and any event left with none.
+
+    The schedule is only useful if it points at channels you can actually watch,
+    so it follows the same enable/disable list as the playlist.
+    """
+    if not isinstance(schedule, dict):
+        return {}
+    # No early return when nothing is disabled: events that carry no channel at
+    # all are never watchable, so they are dropped either way. Short-circuiting
+    # made the listing change shape the moment the first channel was switched off.
+    disabled = channel_prefs.disabled_ids()
+    out = {}
+    for day, categories in schedule.items():
+        if not isinstance(categories, dict):
+            continue
+        day_out = {}
+        for category, events in categories.items():
+            kept = []
+            for event in events or []:
+                channels = [
+                    c for c in (event.get("channels") or [])
+                    if str(c.get("channel_id", "")) not in disabled
+                ]
+                if channels:
+                    kept.append({**event, "channels": channels})
+            if kept:
+                day_out[category] = kept
+        if day_out:
+            out[day] = day_out
+    return out
+
+
 @fastapi_app.get("/schedule")
+@fastapi_app.get("/api/schedule")
 async def schedule_endpoint():
-    """Get schedule data as JSON."""
+    """Get schedule data as JSON, limited to enabled channels.
+
+    ponytail: no fabricated fallback. This used to invent a week of "Sports
+    Event 1"/"News Hour 1" entries whenever upstream failed, which looked like a
+    working schedule and hid the fact that there is no data. Report empty.
+    """
     try:
         schedule_data = await get_schedule()
-        return {"schedule": schedule_data, "status": "success"}
     except Exception as e:
         logger.error(f"Error in schedule endpoint: {str(e)}")
-        # Return fallback schedule data
-        from datetime import datetime, timedelta
-        from zoneinfo import ZoneInfo
-        
-        now = datetime.now(ZoneInfo("UTC"))
-        fallback_schedule = {}
-        
-        for day_offset in range(7):  # 7 days
-            day = now + timedelta(days=day_offset)
-            day_key = day.strftime("%d/%m/%Y - %A")
-            fallback_schedule[day_key] = {
-                "Sports": [
-                    {
-                        "event": f"Sports Event {i+1}",
-                        "time": f"{9+i*3}:00",
-                        "channels": [{"channel_name": "ESPN", "channel_id": "1"}]
-                    }
-                    for i in range(3)
-                ],
-                "News": [
-                    {
-                        "event": f"News Hour {i+1}",
-                        "time": f"{10+i*4}:00",
-                        "channels": [{"channel_name": "CNN", "channel_id": "2"}]
-                    }
-                    for i in range(3)
-                ],
-                "Entertainment": [
-                    {
-                        "event": f"Entertainment Show {i+1}",
-                        "time": f"{20+i}:00",
-                        "channels": [{"channel_name": "HBO", "channel_id": "3"}]
-                    }
-                    for i in range(3)
-                ]
-            }
-        
-        return {"schedule": fallback_schedule, "status": "fallback"}
+        return {"schedule": {}, "status": "unavailable", "error": str(e)}
+    filtered = _filter_schedule_to_enabled(schedule_data or {})
+    return {
+        "schedule": filtered,
+        "status": "success" if filtered else "unavailable",
+    }
 
 @fastapi_app.get("/epg.xml")
 @fastapi_app.get("/api/epg.xml")  

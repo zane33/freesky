@@ -26,6 +26,9 @@ class ScheduleState(rx.State):
     categories: Dict[str, bool] = {}
     switch: bool = True
     search_query: str = ""
+    # Distinguishes "still fetching" from "fetched, nothing there". Without it an
+    # empty schedule rendered the loading spinner forever, which looked broken.
+    loaded: bool = False
 
     @staticmethod
     def get_channels(channels: dict) -> List[ChannelItem]:
@@ -61,22 +64,11 @@ class ScheduleState(rx.State):
         self.events = []
         categories = {}
         try:
-            # Try to fetch from the API endpoint first
-            import httpx
-            
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.get("/schedule")
-                    if response.status_code == 200:
-                        data = response.json()
-                        days = data.get("schedule", {})
-                    else:
-                        raise Exception(f"API returned status {response.status_code}")
-            except Exception as api_error:
-                print(f"Schedule API error: {api_error}")
-                # Fall back to direct backend call if API is not available
-                days = await backend.get_schedule()
-            
+            # Same process as the backend, so call it directly. The old code
+            # httpx-GET'd the relative path "/schedule", which can't resolve
+            # without a base URL — it always raised and silently fell through.
+            days = backend._filter_schedule_to_enabled(await backend.get_schedule() or {})
+
             for day in days:
                 name = day.split(" - ")[0]
                 dt = parser.parse(name, dayfirst=True)
@@ -91,37 +83,15 @@ class ScheduleState(rx.State):
                         channels.sort(key=lambda channel: channel["name"])
                         self.events.append(EventItem(name=event["event"], time=time, dt=event_dt, category=category, channels=channels))
         except Exception as e:
-            # Create fallback schedule events
+            # ponytail: no invented events. This used to fabricate 24 hours of
+            # "Sports Event N"/"News Hour N" on ESPN/CNN/HBO, which rendered as a
+            # real schedule and hid the fact that upstream returned nothing.
             print(f"Schedule loading error: {str(e)}")
-            now = datetime.now(ZoneInfo("UTC"))
-            categories = {"Sports": True, "News": True, "Entertainment": True}
-            
-            # Create some sample events
-            for i in range(24):  # 24 hours of programming
-                event_time = now + timedelta(hours=i)
-                if i % 3 == 0:
-                    category = "Sports"
-                    event_name = f"Sports Event {i//3 + 1}"
-                    channels = [ChannelItem(name="ESPN", id="1")]
-                elif i % 3 == 1:
-                    category = "News"
-                    event_name = f"News Hour {i//3 + 1}"
-                    channels = [ChannelItem(name="CNN", id="2")]
-                else:
-                    category = "Entertainment"
-                    event_name = f"Entertainment Show {i//3 + 1}"
-                    channels = [ChannelItem(name="HBO", id="3")]
-                
-                self.events.append(EventItem(
-                    name=event_name,
-                    time=event_time.strftime("%H:%M"),
-                    dt=event_time,
-                    category=category,
-                    channels=channels
-                ))
-        
+            categories = {}
+
         self.categories = dict(sorted(categories.items()))
         self.events.sort(key=lambda event: event["dt"])
+        self.loaded = True
 
     @rx.event
     def set_switch(self, value: bool):
@@ -215,7 +185,27 @@ def schedule() -> rx.Component:
                                 margin_top="0.5rem",
                             ),
                         ),
-                        rx.spinner(size="3"),
+                        rx.cond(
+                            ScheduleState.loaded,
+                            rx.card(
+                                rx.vstack(
+                                    rx.icon("calendar-off", size=32, color="gray"),
+                                    rx.heading("No schedule available", size="5"),
+                                    rx.text(
+                                        "The upstream site restricts its schedule API to "
+                                        "approved domains, so there are no listings to show. "
+                                        "Channels and playback are unaffected.",
+                                        color="gray",
+                                        size="2",
+                                        text_align="center",
+                                    ),
+                                    align="center",
+                                    spacing="3",
+                                ),
+                                padding="2rem",
+                            ),
+                            rx.spinner(size="3"),
+                        ),
                     ),
                     rx.foreach(ScheduleState.filtered_events, event_card),
                 ),
