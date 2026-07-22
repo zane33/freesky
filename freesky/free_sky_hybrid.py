@@ -631,8 +631,13 @@ class StepDaddyHybrid:
     def content_url(path: str):
         return decrypt(path)
 
-    def playlist(self, exclude: set = None, token: str = None):
+    def playlist(self, exclude: set = None, token: str = None, base_url: str = None):
         exclude = exclude or set()
+        # Point back at whatever host:port the caller actually used. Hardcoding
+        # config.api_url handed out LAN addresses to anyone reaching the app
+        # through NAT or a reverse proxy on a different port, so every stream and
+        # logo URL in the playlist was unreachable for them.
+        base = (base_url or config.api_url).rstrip("/")
         # The player fetches each stream URL directly with no cookie, so the
         # caller's token has to be baked into every line for auth to hold.
         suffix = f"?token={token}" if token else ""
@@ -644,9 +649,9 @@ class StepDaddyHybrid:
             # Relative logo paths are useless to an external player like VLC,
             # which has no idea what host the playlist came from.
             if logo and logo.startswith("/"):
-                logo = f"{config.api_url}{logo}"
+                logo = f"{base}{logo}"
             entry = f" tvg-logo=\"{logo}\",{channel.name}" if logo else f",{channel.name}"
-            data += f"#EXTINF:-1{entry}\n{config.api_url}/api/stream/{channel.id}.m3u8{suffix}\n"
+            data += f"#EXTINF:-1{entry}\n{base}/api/stream/{channel.id}.m3u8{suffix}\n"
         return data
 
     # The schedule JSON API is domain-gated (403 "Schedule API Available for

@@ -484,6 +484,28 @@ async def require_stream_token(request: Request, call_next):
 # Add OPTIONS handler for streaming endpoints to handle CORS preflight requests
 # OPTIONS handler removed - CORS preflight handled by Caddy
 
+def _public_base(request: Request) -> str:
+    """The scheme://host:port the client actually used to reach us.
+
+    Prefers the forwarded headers a reverse proxy sets, then the Host header,
+    and only falls back to the configured API_URL. Without this, a client coming
+    in through NAT on a different external port (or any reverse proxy) received a
+    playlist full of internal LAN URLs it could not resolve.
+    """
+    try:
+        headers = request.headers
+        host = headers.get("x-forwarded-host") or headers.get("host")
+        if not host:
+            return api_url
+        proto = headers.get("x-forwarded-proto") or request.url.scheme or "http"
+        # X-Forwarded-* may be a comma-separated chain; the left-most is the client's.
+        host = host.split(",")[0].strip()
+        proto = proto.split(",")[0].strip()
+        return f"{proto}://{host}"
+    except Exception:
+        return api_url
+
+
 def _authorize_proxied_urls(content: str, token: str) -> str:
     """Carry the caller's token onto every proxied URL inside a playlist.
 
@@ -976,7 +998,8 @@ def playlist(request: Request):
     """
     return Response(
         content=free_sky.playlist(exclude=channel_prefs.disabled_ids(),
-                                  token=request.query_params.get("token")),
+                                  token=request.query_params.get("token"),
+                                  base_url=_public_base(request)),
         media_type="application/vnd.apple.mpegurl",
         headers={
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -1006,7 +1029,8 @@ def api_playlist(request: Request):
     """Return the playlist as a response (API endpoint)"""
     return Response(
         content=free_sky.playlist(exclude=channel_prefs.disabled_ids(),
-                                  token=request.query_params.get("token")),
+                                  token=request.query_params.get("token"),
+                                  base_url=_public_base(request)),
         media_type="application/vnd.apple.mpegurl",
         headers={
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
