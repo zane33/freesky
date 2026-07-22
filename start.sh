@@ -34,11 +34,24 @@ echo "  BACKEND_PORT=${BACKEND_PORT}"
 # fail — and it used to wipe /srv first, leaving Caddy with nothing to serve.
 # Runtime API_URL is handled by the sed injection below.
 if [ -f /srv/index.html ]; then
-    WS_URL=$(echo "$CURRENT_API_URL" | sed 's|^http://|ws://|')/_event
-    echo "Injecting WebSocket URL: $WS_URL"
-    find /srv -name "*.js" -type f -exec sed -i "s|ws://[^/]*:[0-9]*/_event|$WS_URL|g" {} \; 2>/dev/null || true
+    # Make the client's URLs ORIGIN-RELATIVE instead of pinning them to API_URL.
+    # reflex-env-*.js holds them as backtick template literals, so swapping the
+    # scheme+host for a ${location...} expression stays valid JS and lets the app
+    # be reached on any address — LAN IP, NAT'd port, hostname, http or https —
+    # without a rebuild or a matching API_URL. There is no wildcard form of
+    # API_URL; this is the equivalent.
+    for f in /srv/assets/reflex-env-*.js; do
+        [ -e "$f" ] || continue
+        sed -i -E \
+            -e 's#`ws://[^/`]+#`${location.origin.replace(/^http/,"ws")}#g' \
+            -e 's#`wss://[^/`]+#`${location.origin.replace(/^http/,"ws")}#g' \
+            -e 's#`http://[^/`]+#`${location.origin}#g' \
+            -e 's#`https://[^/`]+#`${location.origin}#g' \
+            "$f"
+        echo "Rewrote $f to use the browser's own origin"
+    done
     echo "{\"api_url\":\"$CURRENT_API_URL\"}" > "$FRONTEND_CONFIG_FILE"
-    echo "Frontend ready with WebSocket URL: $WS_URL"
+    echo "Frontend will connect back to whatever host it was loaded from"
 else
     echo "ERROR: /srv/index.html missing - frontend build failed at image build time"
     cat > /srv/index.html << EOF

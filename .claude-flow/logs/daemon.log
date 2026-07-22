@@ -1207,3 +1207,5 @@
 [2026-07-22T04:31:14.853Z] [INFO] Worker testgaps completed in 1ms
 [2026-07-22T04:35:14.987Z] [INFO] Starting worker: audit (1/2 concurrent)
 [2026-07-22T04:35:14.987Z] [INFO] Worker audit completed in 0ms
+[2026-07-22T04:38:14.801Z] [INFO] Worker map deferred: Memory too low: 0.6% free
+[2026-07-22T04:42:14.846Z] [INFO] Worker optimize deferred: Memory too low: 1.2% free
