@@ -4,9 +4,14 @@ from rxconfig import config
 from freesky import backend
 from freesky.components import navbar, MediaPlayer
 from freesky.free_sky import Channel
+from freesky.free_sky_hybrid import StepDaddyHybrid
 from freesky.auth_state import require_login, AuthState
 
 media_player = MediaPlayer.create
+
+# The upstream feeds a viewer can force from the watch page. Kept in sync with
+# the resolver's player list so the switcher never offers a feed that can't resolve.
+FEEDS = list(StepDaddyHybrid.PLAYER_PATHS)
 
 
 
@@ -15,6 +20,21 @@ class WatchState(rx.State):
     is_loaded: bool = False
     _cache_buster: int = 0
     url: str = ""
+    # Manual feed override; "" = Auto (audio-aware failover picks the feed).
+    player: str = ""
+    _base: str = ""
+    _token: str = ""
+
+    def _build_url(self):
+        """Compose the stream URL from the stored base/token plus any feed pick."""
+        params = []
+        if self._token:
+            params.append(f"token={self._token}")
+        if self.player:
+            params.append(f"player={self.player}")
+        query = ("?" + "&".join(params)) if params else ""
+        self.url = f"{self._base}/api/stream/{self.route_channel_id}.m3u8{query}"
+        self._cache_buster += 1
 
     @rx.event
     async def on_load(self):
@@ -23,8 +43,7 @@ class WatchState(rx.State):
         if redirect is not None:
             return redirect
         self.is_loaded = False
-        # Increment cache buster to ensure proper component refresh
-        self._cache_buster += 1
+        self.player = ""  # every fresh load starts on Auto
 
         # Build the stream URL from the address the browser actually used, and
         # carry the viewer's token. The old version used the build-time
@@ -38,14 +57,22 @@ class WatchState(rx.State):
                 origin = f"{parsed.scheme}://{parsed.netloc}"
         except Exception:
             pass
-        base = (origin or config.api_url).rstrip("/")
-        token = ""
+        self._base = (origin or config.api_url).rstrip("/")
         try:
-            token = (await self.get_state(AuthState)).stream_token
+            self._token = (await self.get_state(AuthState)).stream_token
         except Exception:
-            pass
-        suffix = f"?token={token}" if token else ""
-        self.url = f"{base}/api/stream/{self.route_channel_id}.m3u8{suffix}"
+            self._token = ""
+        self._build_url()
+
+    @rx.event
+    def set_feed(self, player: str):
+        """Switch the player to a specific upstream feed (or "" for Auto).
+
+        Reloads the stream URL with ?player=, which the backend re-resolves
+        against that feed, bypassing the shared cache.
+        """
+        self.player = player
+        self._build_url()
 
     @rx.var
     def route_channel_id(self) -> str:
@@ -89,6 +116,42 @@ class WatchState(rx.State):
             }}
             copyToClipboard();
         """)
+
+
+def _feed_button(label, value) -> rx.Component:
+    return rx.button(
+        label,
+        size="1",
+        variant=rx.cond(WatchState.player == value, "solid", "soft"),
+        color_scheme=rx.cond(WatchState.player == value, "green", "gray"),
+        on_click=lambda: WatchState.set_feed(value),
+    )
+
+
+def feed_selector() -> rx.Component:
+    """Let the viewer force a specific upstream feed — the quick way to escape a
+    source that's video-only or otherwise broken without leaving the page."""
+    return rx.card(
+        rx.vstack(
+            rx.hstack(
+                rx.icon("radio", size=16),
+                rx.text("Feed", weight="bold", size="2"),
+                rx.text("switch source if audio or video is missing",
+                        size="1", color_scheme="gray"),
+                align="center",
+                spacing="2",
+            ),
+            rx.hstack(
+                _feed_button("Auto", ""),
+                rx.foreach(FEEDS, lambda f: _feed_button(f, f)),
+                wrap="wrap",
+                spacing="2",
+            ),
+            spacing="2",
+        ),
+        margin_top="0.75rem",
+        width="100%",
+    )
 
 
 def uri_card() -> rx.Component:
@@ -274,6 +337,7 @@ def watch() -> rx.Component:
                         ),
                         width="100%",
                     ),
+                    feed_selector(),
                     padding_bottom="0.3rem",
                     width="100%",
                 ),

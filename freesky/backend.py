@@ -131,20 +131,28 @@ active_streams: Dict[str, Dict[str, float]] = {}  # Track M3U8 requests per chan
 active_content_sessions: Dict[str, Dict[str, float]] = {}  # Track actual video streaming sessions
 session_to_channel: Dict[str, str] = {}  # Map session IDs to channel IDs
 
-async def _get_stream_parallel(channel_id: str):
-    """Get stream using parallel approach to multiple services with monitoring"""
+async def _get_stream_parallel(channel_id: str, prefer: str = None):
+    """Get stream using parallel approach to multiple services with monitoring.
+
+    `prefer` forces one upstream feed (see PLAYER_PATHS) — used by the watch
+    page's manual feed switcher to test a specific source. It overrides any
+    admin-pinned source for this request only.
+    """
     start_time = time.time()
-    
+
     try:
         # Check if channel should be skipped due to recent failures
         if stream_monitor.should_skip_channel(channel_id):
             logger.warning(f"Skipping channel {channel_id} due to recent failures")
             stream_monitor.record_stream_attempt(channel_id, False, 0.0)
             return None
-        
+
         # Create multiple tasks for different streaming approaches
         tasks = []
-        pinned = channel_prefs.source_for(channel_id)
+        # A manual feed pick (watch-page switcher) forces exactly one feed; an
+        # admin pin only sets first-try order and still audio-fails-over.
+        manual = bool(prefer)
+        pinned = prefer or channel_prefs.source_for(channel_id)
 
         # Task 1: Primary DLHD service. Skipped when the admin pinned a source —
         # this path ignores the preference, so racing it would sometimes hand back
@@ -157,14 +165,16 @@ async def _get_stream_parallel(channel_id: str):
 
         # Task 2: Direct channel processing (bypass multi-streamer). Honour any
         # source the admin pinned for this channel — the resolver tries it first
-        # and still falls back to the others if it is down.
+        # and still falls back to the others if it is down. A manual pick resolves
+        # ONLY that feed so the viewer hears exactly what it carries.
         tasks.append(asyncio.create_task(
-            free_sky.stream(channel_id, prefer=pinned),
+            free_sky.stream(channel_id, prefer=pinned, single_feed=manual),
             name="direct_stream"
         ))
-        
-        # Task 3: Try alternative services if enabled
-        if len(multi_streamer.enabled_services) > 1:
+
+        # Task 3: Try alternative services if enabled — but never for a manual pick,
+        # which must resolve only the chosen feed.
+        if not manual and len(multi_streamer.enabled_services) > 1:
             for service in multi_streamer.enabled_services[1:2]:  # Try one alternative
                 tasks.append(asyncio.create_task(
                     multi_streamer.get_stream(channel_id, service),
@@ -542,6 +552,10 @@ def _authorize_proxied_urls(content: str, token: str) -> str:
 @fastapi_app.get("/api/stream/{channel_id}.m3u8")
 async def stream(channel_id: str, request: Request = None):
     stream_token = request.query_params.get("token") if request else None
+    # Manual feed override from the watch-page switcher. Bypasses the shared cache
+    # so each pick re-resolves that specific upstream feed instead of returning
+    # whatever feed happens to be cached for this channel.
+    prefer = request.query_params.get("player") if request else None
     try:
         # Get current time for tracking and caching
         current_time = time.time()
@@ -559,8 +573,8 @@ async def stream(channel_id: str, request: Request = None):
         
         # Check cache first
         cache_key = f"stream_{channel_id}"
-        
-        if cache_key in stream_cache:
+
+        if not prefer and cache_key in stream_cache:
             cached_data, cached_time = stream_cache[cache_key]
             if current_time - cached_time < cache_ttl:
                 logger.info(f"Serving cached stream for channel {channel_id} to client {client_id}")
@@ -579,7 +593,7 @@ async def stream(channel_id: str, request: Request = None):
         # Use semaphore to control concurrent stream generation
         async with _stream_semaphore:
             # Double-check cache after acquiring semaphore (another request might have populated it)
-            if cache_key in stream_cache:
+            if not prefer and cache_key in stream_cache:
                 cached_data, cached_time = stream_cache[cache_key]
                 if current_time - cached_time < cache_ttl:
                     logger.info(f"Serving freshly cached stream for channel {channel_id} to client {client_id}")
@@ -601,7 +615,7 @@ async def stream(channel_id: str, request: Request = None):
                 
                 # Use parallel multi-service streaming for faster response
                 stream_data = await asyncio.wait_for(
-                    _get_stream_parallel(channel_id),
+                    _get_stream_parallel(channel_id, prefer=prefer),
                     timeout=15.0  # Aggressive timeout for parallel approach
                 )
                 
@@ -641,9 +655,11 @@ async def stream(channel_id: str, request: Request = None):
                     # Process regular stream data
                     stream_data = _process_stream_content(stream_data, api_url)
                 
-                # Cache the processed stream data
-                stream_cache[cache_key] = (stream_data, current_time)
-                logger.info(f"Successfully generated and cached stream for channel {channel_id}")
+                # Cache the processed stream data — but never a manual feed
+                # override, so it doesn't become the channel's default for everyone.
+                if not prefer:
+                    stream_cache[cache_key] = (stream_data, current_time)
+                logger.info(f"Successfully generated stream for channel {channel_id}")
                 
                 # Schedule prefetch for this channel to keep it warm
                 asyncio.create_task(prefetch_popular_stream(channel_id))

@@ -188,7 +188,7 @@ class StepDaddyHybrid:
 
     async def _resolve_via_iframe_chain(self, channel_id: str, max_hops: int = 4,
                                         max_pages: int = 8, prefer: str = None,
-                                        budget: float = 9.5):
+                                        budget: float = 13.0, single_feed: bool = False):
         """
         Follow the live upstream chain to a WORKING HLS playlist, failing over
         across the available players.
@@ -206,6 +206,11 @@ class StepDaddyHybrid:
         if prefer and prefer in players:
             players.remove(prefer)
             players.insert(0, prefer)
+        # Manual feed pick from the watch-page switcher: resolve ONLY that feed and
+        # play exactly what it carries (even if silent), so the viewer can hear which
+        # sources actually have audio. Auto (single_feed=False) keeps hunting for one.
+        if single_feed and prefer:
+            players = [prefer]
 
         watch_url = f"{self._base_url}/watch.php?id={channel_id}"
         deadline = asyncio.get_event_loop().time() + budget
@@ -263,7 +268,7 @@ class StepDaddyHybrid:
                             player_dead = True
                             logger.debug(f"Player '{player}' feed dead for {channel_id}: {e}")
                             break
-                        if has_audio:
+                        if has_audio or single_feed:
                             logger.info(f"Resolved channel {channel_id} via '{player}' player")
                             return content
                         # Resolved but video-only. Remember it, then try the next
@@ -333,10 +338,11 @@ class StepDaddyHybrid:
         # whose Referer is not the embedding page, and our proxy has to replay it.
         return self._process_stream_content(absolute, referer), has_audio
 
-    async def stream(self, channel_id: str, prefer: str = None):
+    async def stream(self, channel_id: str, prefer: str = None, single_feed: bool = False):
         """
         Resolve a channel to a proxied HLS playlist, failing over across upstream
-        players. `prefer` pins one player (see PLAYER_PATHS) to try first.
+        players. `prefer` pins one player (see PLAYER_PATHS) to try first;
+        `single_feed` (the manual watch-page switcher) resolves ONLY that player.
 
         ponytail: the old vidembed.re / fnjplay.xyz fallbacks were removed — both
         hosts are dead (DNS no longer resolves), so they only added a multi-second
@@ -344,7 +350,7 @@ class StepDaddyHybrid:
         player. `_handle_new_architecture`/`_handle_old_architecture` remain for
         the multi_service_streamer callers but are no longer on this path.
         """
-        return await self._resolve_via_iframe_chain(channel_id, prefer=prefer)
+        return await self._resolve_via_iframe_chain(channel_id, prefer=prefer, single_feed=single_feed)
 
     async def _handle_new_architecture(self, vidembed_url: str, referer: str):
         """Handle the new vidembed.re architecture with proper iframe-based authentication"""
