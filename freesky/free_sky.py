@@ -8,7 +8,7 @@ from urllib.parse import quote, urlparse
 from curl_cffi import AsyncSession
 from dataclasses import dataclass
 from typing import List
-from .utils import encrypt, decrypt, urlsafe_base64, extract_and_decode_var
+from .utils import encrypt, decrypt, urlsafe_base64, extract_and_decode_var, hls_ext
 from rxconfig import config
 
 # Set up logging
@@ -196,8 +196,14 @@ class StepDaddy:
                     if line.startswith("#EXT-X-KEY:"):
                         original_url = re.search(r'URI="(.*?)"', line).group(1)
                         line = line.replace(original_url, f"/api/key/{encrypt(original_url)}/{encrypt(urlparse(source_url).netloc)}")
+                    elif line.startswith("#EXT-X-MEDIA:") and config.proxy_content:
+                        # Separate audio/subtitle rendition playlist lives in URI="...".
+                        # Unproxied, ffmpeg (Dispatcharr) can't fetch audio -> silent stream.
+                        m = re.search(r'URI="(https?://.*?)"', line)
+                        if m:
+                            line = line.replace(m.group(1), f"/api/content/{encrypt(m.group(1))}{hls_ext(m.group(1))}")
                     elif line.startswith("http") and config.proxy_content:
-                        line = f"/api/content/{encrypt(line)}"
+                        line = f"/api/content/{encrypt(line)}{hls_ext(line)}"
                     m3u8_data += line + "\n"
                 return m3u8_data
         except Exception as e:

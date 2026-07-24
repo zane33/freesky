@@ -341,6 +341,14 @@ def _process_stream_content(content: str, referer: str) -> str:
             if line.startswith('http') and config.proxy_content:
                 # Proxy content URLs
                 line = f"/api/content/{encrypt(line)}{hls_ext(line)}"
+            elif line.startswith('#EXT-X-MEDIA:') and config.proxy_content:
+                # Separate audio/subtitle renditions carry their playlist in a
+                # URI="..." attr, not on their own line. Without this, ffmpeg
+                # (Dispatcharr) can't reach the audio track -> video-only stream.
+                m = re.search(r'URI="(https?://.*?)"', line)
+                if m:
+                    uri = m.group(1)
+                    line = line.replace(uri, f"/api/content/{encrypt(uri)}{hls_ext(uri)}")
             elif line.startswith('#EXT-X-KEY:'):
                 # Process encryption keys
                 original_url = re.search(r'URI="(.*?)"', line)

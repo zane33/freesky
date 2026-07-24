@@ -474,6 +474,12 @@ class StepDaddyHybrid:
                 if line.startswith("#EXT-X-KEY:"):
                     original_url = re.search(r'URI="(.*?)"', line).group(1)
                     line = line.replace(original_url, f"/api/key/{encrypt(original_url)}/{encrypt(urlparse(iframe_url).netloc)}")
+                elif line.startswith("#EXT-X-MEDIA:") and config.proxy_content:
+                    # Separate audio/subtitle rendition playlist lives in URI="...";
+                    # unproxied, ffmpeg (Dispatcharr) can't fetch audio -> silent stream.
+                    m = re.search(r'URI="(https?://.*?)"', line)
+                    if m:
+                        line = line.replace(m.group(1), f"/api/content/{encrypt(m.group(1))}{hls_ext(m.group(1))}")
                 elif line.startswith("http") and config.proxy_content:
                     line = f"/api/content/{encrypt(line)}{hls_ext(line)}"
                 m3u8_data += line + "\n"
@@ -580,6 +586,16 @@ class StepDaddyHybrid:
                         # extension goes on the LAST component, which is what ffmpeg
                         # inspects.
                         line = f"/api/content/{encrypt(line)}/{encrypt(referer)}{hls_ext(line)}"
+                elif line.startswith('#EXT-X-MEDIA:') and config.proxy_content:
+                    # A separate audio/subtitle rendition keeps its playlist in a
+                    # URI="..." attr, not on its own line, so the http branch never
+                    # sees it. Unproxied, ffmpeg (Dispatcharr) can't reach the audio
+                    # track and plays video only — the browser fetches it directly
+                    # and sounds fine, which is why this only bites external players.
+                    m = re.search(r'URI="(https?://.*?)"', line)
+                    if m:
+                        uri = m.group(1)
+                        line = line.replace(uri, f"/api/content/{encrypt(uri)}/{encrypt(referer)}{hls_ext(uri)}")
                 elif line.startswith('#EXT-X-KEY:'):
                     # Process encryption keys
                     original_url = re.search(r'URI="(.*?)"', line)
