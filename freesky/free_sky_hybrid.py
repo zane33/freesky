@@ -210,6 +210,10 @@ class StepDaddyHybrid:
         watch_url = f"{self._base_url}/watch.php?id={channel_id}"
         deadline = asyncio.get_event_loop().time() + budget
         last_error = None
+        # A feed that resolves but declares no audio is kept here and only used if
+        # no player with audio turns up — so a silent channel still shows a picture
+        # rather than 404ing, but any feed WITH audio always wins.
+        video_only_fallback = None
 
         for player in players:
             if asyncio.get_event_loop().time() > deadline:
@@ -250,9 +254,7 @@ class StepDaddyHybrid:
                         continue  # not every atob() on the page is the stream URL
                     if candidate.startswith("http") and ".m3u8" in candidate:
                         try:
-                            result = await self._fetch_playlist(candidate, url)
-                            logger.info(f"Resolved channel {channel_id} via '{player}' player")
-                            return result
+                            content, has_audio = await self._fetch_playlist(candidate, url)
                         except Exception as e:
                             # We reached this player's CDN and it returned no real
                             # playlist: the feed is down. Stop crawling this player's
@@ -261,6 +263,16 @@ class StepDaddyHybrid:
                             player_dead = True
                             logger.debug(f"Player '{player}' feed dead for {channel_id}: {e}")
                             break
+                        if has_audio:
+                            logger.info(f"Resolved channel {channel_id} via '{player}' player")
+                            return content
+                        # Resolved but video-only. Remember it, then try the next
+                        # player for one that actually carries sound.
+                        if video_only_fallback is None:
+                            video_only_fallback = content
+                        logger.info(f"Player '{player}' for {channel_id} is video-only; trying next for audio")
+                        player_dead = True
+                        break
 
                 if not player_dead:
                     for src in self._IFRAME_RE.findall(response.text):
@@ -268,17 +280,48 @@ class StepDaddyHybrid:
                         if "://" in src or src.startswith("/"):
                             queue.append((urljoin(url, src), url, depth + 1))
 
+        if video_only_fallback is not None:
+            logger.warning(f"No feed with audio for channel {channel_id}; using video-only fallback")
+            return video_only_fallback
         raise ValueError(
             f"No working stream found for channel {channel_id} across "
             f"{len(players)} players" + (f" (last: {last_error})" if last_error else "")
         )
 
+    # Audio codecs a master playlist can name. If CODECS is present on every
+    # variant and none of these appear, and there's no separate audio rendition,
+    # the feed is genuinely video-only (confirmed against a silent Sky Sports NZ
+    # feed whose segment PMT carried H.264 and nothing else).
+    _AUDIO_CODECS = ("mp4a", "ac-3", "ec-3", "ac3", "ec3", "opus", "flac", "alac", "dts", "mp3")
+
+    @staticmethod
+    def _declares_audio(playlist_text: str) -> bool:
+        """Whether an HLS playlist looks like it carries audio.
+
+        ponytail: judged for free from the master playlist's CODECS / EXT-X-MEDIA,
+        never a segment download. When CODECS is absent — a media playlist, or an
+        upstream that just omits it — we can't tell cheaply, so we assume audio
+        rather than pay a segment probe on every resolve. Upgrade path: probe one
+        segment's PMT if silent media-playlist feeds ever show up.
+        """
+        if "TYPE=AUDIO" in playlist_text:  # a separate audio rendition is declared
+            return True
+        codecs = re.findall(r'CODECS="([^"]*)"', playlist_text)
+        if not codecs:
+            return True  # nothing declared -> can't judge without a segment; assume ok
+        return any(a in group.lower() for group in codecs for a in StepDaddyHybrid._AUDIO_CODECS)
+
     async def _fetch_playlist(self, m3u8_url: str, referer: str):
-        """Fetch an HLS playlist and rewrite it for the proxy."""
+        """Fetch an HLS playlist and rewrite it for the proxy.
+
+        Returns (proxied_playlist, has_audio) so the resolver can fail over off a
+        video-only feed to one that actually has sound.
+        """
         response = await self._session.get(m3u8_url, headers=self._headers(referer))
         if response.status_code != 200 or not response.text.startswith("#EXTM3U"):
             raise ValueError(f"Bad playlist from {m3u8_url}: HTTP {response.status_code}")
 
+        has_audio = self._declares_audio(response.text)
         # Variant/segment URIs are relative to the playlist, but _process_stream_content
         # only proxies lines starting with "http" — left alone, the player would resolve
         # them against /api/stream/ on our own host and 404.
@@ -288,7 +331,7 @@ class StepDaddyHybrid:
         )
         # Rewrite against the player page, not the CDN URL: the CDN 403s any request
         # whose Referer is not the embedding page, and our proxy has to replay it.
-        return self._process_stream_content(absolute, referer)
+        return self._process_stream_content(absolute, referer), has_audio
 
     async def stream(self, channel_id: str, prefer: str = None):
         """

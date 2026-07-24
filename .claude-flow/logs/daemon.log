@@ -1465,3 +1465,10 @@
 [2026-07-24T10:34:28.199Z] [INFO] Worker audit deferred: Memory too low: 1.6% free
 [2026-07-24T10:36:28.194Z] [INFO] Worker optimize deferred: Memory too low: 3.0% free
 [2026-07-24T10:38:28.190Z] [INFO] Worker consolidate deferred: Memory too low: 2.9% free
+[2026-07-24T10:40:28.186Z] [INFO] Worker testgaps deferred: Memory too low: 0.7% free
+[2026-07-24T10:42:28.182Z] [INFO] Worker backup deferred: Memory too low: 1.2% free
+[2026-07-24T10:44:28.259Z] [INFO] Worker harness deferred: Memory too low: 3.1% free
+[2026-07-24T10:44:28.262Z] [INFO] Worker audit deferred: Memory too low: 3.1% free
+[2026-07-24T10:47:28.259Z] [INFO] Worker map deferred: CPU load too high: 10.88
+[2026-07-24T10:51:28.257Z] [INFO] Worker optimize deferred: Memory too low: 3.7% free
+[2026-07-24T10:54:28.255Z] [INFO] Worker audit deferred: Memory too low: 1.0% free
