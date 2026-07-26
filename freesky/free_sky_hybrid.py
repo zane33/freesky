@@ -113,6 +113,12 @@ class StepDaddyHybrid:
                     elif result is not None:
                         channels.append(result)
 
+                # 24-7-channels.php lists only the always-on channels. Event feeds
+                # (DAZN PPV, Event PPV, Backup Stream, ESPN+ ...) exist solely on the
+                # homepage schedule, so without this merge they never reach the
+                # channel list or the playlist however often you hit refresh.
+                channels.extend(await self._load_event_channels({c.id for c in channels}))
+
                 logger.info(f"Successfully processed {len(channels)} channels")
             except Exception as e:
                 logger.error(f"Error loading channels: {str(e)}", exc_info=True)
@@ -139,6 +145,42 @@ class StepDaddyHybrid:
                     self.channels = sorted(channels, key=lambda channel: (channel.name.startswith("18"), channel.name))
                 else:
                     logger.warning("No channels were loaded, keeping existing channels list")
+
+    # Homepage schedule links carry the feed name in title=, e.g.
+    # <a href="/watch.php?id=69" title="DAZN PPV" ...>
+    _EVENT_CHAN_RE = re.compile(r'href="/watch\.php\?id=(\d+)"[^>]*?title="([^"]*)"')
+
+    async def _load_event_channels(self, seen: set):
+        """Channels that only appear on the homepage schedule (PPV/event feeds).
+
+        Returns Channels for every /watch.php id on the homepage whose id isn't
+        already in `seen`. Upstream reuses an id under different titles across
+        events (59 is both "PPV Feed" and "DAZN PPV"), so first title wins.
+        """
+        try:
+            response = await self._session.get(self._base_url, headers=self._headers())
+            if response.status_code != 200:
+                logger.warning(f"Event channel page returned HTTP {response.status_code}")
+                return []
+            extra = {}
+            for channel_id, name in self._EVENT_CHAN_RE.findall(str(response.text)):
+                if channel_id not in seen and channel_id not in extra:
+                    extra[channel_id] = name
+            # Dozens of feeds share a name ("Backup Stream" x130); without the id
+            # they're indistinguishable rows in the UI and the playlist.
+            used = set()
+            channels = []
+            for channel_id, name in extra.items():
+                channel = self._get_channel((channel_id, name))
+                if channel.name in used:
+                    channel.name = f"{channel.name} ({channel_id})"
+                used.add(channel.name)
+                channels.append(channel)
+            logger.info(f"Found {len(channels)} event channels not in the 24/7 list")
+            return channels
+        except Exception as e:
+            logger.error(f"Error loading event channels: {str(e)}")
+            return []
 
     async def _process_channel_data(self, channel_data):
         """Process a single channel data asynchronously"""
