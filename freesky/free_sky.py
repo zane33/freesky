@@ -21,10 +21,29 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Channel:
+    """One playable channel.
+
+    `provider` and `stream_type` carry the DRM routing information. They default
+    to the plain-HLS behaviour every existing construction site expects, so
+    positional `Channel(id, name, tags, logo)` calls keep working untouched.
+
+    Attributes:
+        id: Upstream channel identifier.
+        name: Display name.
+        tags: Category tags used by the UI filters.
+        logo: Logo URL or local proxy path.
+        provider: Name of the DRM provider record in `drm_providers`, or "" for
+            the default HLS path.
+        stream_type: "hls" for a proxied M3U8 playlist, "drm" for a channel that
+            can only be played in-browser through EME/Widevine.
+    """
+
     id: str
     name: str
     tags: List[str]
     logo: str
+    provider: str = ""
+    stream_type: str = "hls"
 
     @classmethod
     def from_dict(cls, data: dict) -> "Channel":
@@ -35,11 +54,16 @@ class Channel:
         empty list, blanking the whole UI. Tolerating extra keys keeps a stray
         field in saved data from taking the app down.
         """
+        stream_type = str(data.get("stream_type", "hls") or "hls").lower()
         return cls(
             id=str(data.get("id", "")),
             name=data.get("name", "Unknown"),
             tags=data.get("tags", []),
             logo=data.get("logo", "/missing.png"),
+            provider=str(data.get("provider", "") or ""),
+            # Anything we don't recognise is treated as plain HLS rather than
+            # blocking playback on a typo in saved channel data.
+            stream_type=stream_type if stream_type in ("hls", "drm") else "hls",
         )
 
 

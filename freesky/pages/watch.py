@@ -1,13 +1,15 @@
 import reflex as rx
 from urllib.parse import urlparse
 from rxconfig import config
-from freesky import backend
+from freesky import backend, drm_providers
 from freesky.components import navbar, MediaPlayer
+from freesky.components.shaka_player import ShakaPlayer
 from freesky.free_sky import Channel
 from freesky.free_sky_hybrid import StepDaddyHybrid
 from freesky.auth_state import require_login, AuthState
 
 media_player = MediaPlayer.create
+shaka_player = ShakaPlayer.create
 
 # The upstream feeds a viewer can force from the watch page. Kept in sync with
 # the resolver's player list so the switcher never offers a feed that can't resolve.
@@ -24,9 +26,52 @@ class WatchState(rx.State):
     player: str = ""
     _base: str = ""
     _token: str = ""
+    # DRM playback. A "drm" channel is played in-browser by Shaka against the
+    # provider's manifest, with EME talking to our same-origin licence proxy.
+    # It deliberately does NOT go through /api/stream/*.m3u8: a Widevine stream
+    # cannot be expressed as a proxied playlist body (see the 409 in backend.py).
+    is_drm: bool = False
+    license_url: str = ""
+    manifest_type: str = "dash"
+    drm_error: str = ""
 
     def _build_url(self):
-        """Compose the stream URL from the stored base/token plus any feed pick."""
+        """Compose the playback URL for this channel.
+
+        Plain channels get the proxied M3U8 URL plus token and feed override.
+        DRM channels get the provider's manifest URL and a licence-proxy URL;
+        the feed switcher does not apply to them.
+        """
+        channel = backend.get_channel(self.route_channel_id)
+        provider = drm_providers.get_provider(channel.provider) if (
+            channel is not None and channel.stream_type == "drm" and channel.provider
+        ) else None
+
+        if provider is not None and provider.get("enabled", True):
+            self.is_drm = True
+            self.drm_error = ""
+            self.url = provider["manifest_url"]
+            self.manifest_type = provider.get("manifest_type", "dash")
+            self.license_url = f"{self._base}/api/drm/license/{provider['name']}"
+            self._cache_buster += 1
+            return
+
+        if channel is not None and channel.stream_type == "drm":
+            # Channel claims DRM but its provider is missing or disabled — say so
+            # rather than silently falling back to a stream URL that will 409.
+            self.is_drm = True
+            self.url = ""
+            self.license_url = ""
+            self.drm_error = (
+                "This channel's DRM provider is not configured or is disabled. "
+                "An administrator can fix this in Settings."
+            )
+            self._cache_buster += 1
+            return
+
+        self.is_drm = False
+        self.license_url = ""
+        self.drm_error = ""
         params = []
         if self._token:
             params.append(f"token={self._token}")
@@ -35,6 +80,11 @@ class WatchState(rx.State):
         query = ("?" + "&".join(params)) if params else ""
         self.url = f"{self._base}/api/stream/{self.route_channel_id}.m3u8{query}"
         self._cache_buster += 1
+
+    @rx.event
+    def handle_drm_error(self, code: str, message: str):
+        """Surface a CDM/licence failure reported by the Shaka component."""
+        self.drm_error = message or f"Protected playback failed ({code})."
 
     @rx.event
     async def on_load(self):
@@ -77,6 +127,16 @@ class WatchState(rx.State):
     @rx.var
     def route_channel_id(self) -> str:
         return self.router.page.params.get("channel_id", "")
+
+    @rx.var
+    def stream_token_for_drm(self) -> str:
+        """The viewer's FreeSky token, for the licence proxy's auth header.
+
+        This is already client-visible — plain channels carry the same token in
+        the M3U8 query string. It authenticates to FreeSky only; the provider's
+        own credentials never leave the server.
+        """
+        return self._token
 
     @rx.var
     def channel(self) -> Channel | None:
@@ -150,6 +210,39 @@ def feed_selector() -> rx.Component:
             spacing="2",
         ),
         margin_top="0.75rem",
+        width="100%",
+    )
+
+
+def drm_playback() -> rx.Component:
+    """Render the Widevine player, or the reason playback can't start.
+
+    Decryption happens entirely inside the browser's licensed CDM; the page only
+    points that CDM at our same-origin licence proxy.
+    """
+    return rx.vstack(
+        rx.cond(
+            WatchState.drm_error != "",
+            rx.callout(
+                WatchState.drm_error,
+                icon="triangle_alert",
+                color_scheme="amber",
+                width="100%",
+            ),
+            rx.fragment(),
+        ),
+        rx.cond(
+            WatchState.url != "",
+            shaka_player(
+                src=WatchState.url,
+                license_url=WatchState.license_url,
+                session_token=WatchState.stream_token_for_drm,
+                manifest_type=WatchState.manifest_type,
+                on_drm_error=WatchState.handle_drm_error,
+            ),
+            rx.fragment(),
+        ),
+        spacing="2",
         width="100%",
     )
 
@@ -327,9 +420,13 @@ def watch() -> rx.Component:
                     rx.box(
                         rx.cond(
                             WatchState.route_channel_id != "",
-                            media_player(
-                                title=WatchState.channel.name,
-                                src=WatchState.url,
+                            rx.cond(
+                                WatchState.is_drm,
+                                drm_playback(),
+                                media_player(
+                                    title=WatchState.channel.name,
+                                    src=WatchState.url,
+                                ),
                             ),
                             rx.center(
                                 rx.spinner(size="3"),
@@ -337,7 +434,9 @@ def watch() -> rx.Component:
                         ),
                         width="100%",
                     ),
-                    feed_selector(),
+                    # The feed switcher re-resolves an upstream M3U8; it has no
+                    # meaning for a DRM channel served from a fixed manifest.
+                    rx.cond(~WatchState.is_drm, feed_selector(), rx.fragment()),
                     padding_bottom="0.3rem",
                     width="100%",
                 ),

@@ -1,5 +1,6 @@
 import os
 import asyncio
+import base64
 import glob
 import httpx
 import logging
@@ -556,6 +557,29 @@ async def stream(channel_id: str, request: Request = None):
     # so each pick re-resolves that specific upstream feed instead of returning
     # whatever feed happens to be cached for this channel.
     prefer = request.query_params.get("player") if request else None
+
+    # A DRM channel has no proxied M3U8 form: the manifest is DASH/CENC and the
+    # media is encrypted to the browser's CDM, so there is nothing this route
+    # could return that a player could decode. Fail loudly instead of handing
+    # back a broken playlist.
+    _drm_channel = get_channel(channel_id)
+    if _drm_channel is not None and getattr(_drm_channel, "stream_type", "hls") == "drm":
+        logger.info(f"Refusing M3U8 for DRM channel {channel_id}; requires in-browser playback")
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "error": "drm_channel",
+                "channel_id": channel_id,
+                "stream_type": "drm",
+                "provider": getattr(_drm_channel, "provider", ""),
+                "message": (
+                    "This channel is DRM-protected and cannot be served as an M3U8 "
+                    "playlist. It requires in-browser playback with EME, so open it "
+                    "in the FreeSky web player instead of an external media player."
+                ),
+            },
+        )
+
     try:
         # Get current time for tracking and caching
         current_time = time.time()
@@ -1608,3 +1632,434 @@ async def get_all_channels():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
+
+
+# ---------------------------------------------------------------------------
+# DRM license proxy
+#
+# Standards-compliant EME relay. The browser's CDM produces an opaque license
+# challenge; we forward it to the provider's license server with the provider's
+# credentials attached server-side (they must never reach the browser) and relay
+# the response back byte-exact.
+#
+# This proxy cannot read the challenge (it is encrypted to Widevine's root of
+# trust) and cannot read keys out of the response (they are encrypted to the
+# requesting CDM). No video data passes through here. There is deliberately no
+# decryption, key extraction or content processing in this module.
+# ---------------------------------------------------------------------------
+
+# A Widevine challenge is a few KB; 64KB is generous headroom and keeps a
+# hostile client from streaming an unbounded body into memory.
+_DRM_MAX_CHALLENGE_BYTES = 64 * 1024
+_DRM_UPSTREAM_TIMEOUT = 15.0
+
+# Never emitted to a log line. Header *names* are logged for debugging; values
+# are credentials and stay out of the log entirely.
+_DRM_LOG_VALUES = False
+
+
+class DrmWrapError(ValueError):
+    """A request_wrap / response_unwrap spec could not be applied."""
+
+
+def _drm_module():
+    """Import the provider registry lazily.
+
+    Imported on use rather than at module import so a missing or broken
+    `drm_providers.py` degrades to a 404 on the DRM routes instead of taking the
+    whole backend down at start-up.
+
+    Returns:
+        The `freesky.drm_providers` module, or None if it cannot be imported.
+    """
+    try:
+        from . import drm_providers
+        return drm_providers
+    except Exception as e:
+        logger.error(f"drm_providers unavailable: {type(e).__name__}")
+        return None
+
+
+def _provider_field(record, field: str, default=""):
+    """Read a field from a provider record, whether it is a dict or an object.
+
+    The registry's record shape is owned by another module; tolerating both
+    mappings and attribute-bearing objects keeps this proxy decoupled from it.
+    """
+    if record is None:
+        return default
+    if isinstance(record, dict):
+        value = record.get(field, default)
+    else:
+        value = getattr(record, field, default)
+    return default if value is None else value
+
+
+def _lookup_provider(name: str):
+    """Resolve a provider by name.
+
+    Returns:
+        (record, error_code) — error_code is None on success, "not_found" for an
+        unknown provider or an unavailable registry, "disabled" when the record
+        exists but is switched off.
+    """
+    module = _drm_module()
+    if module is None:
+        return None, "not_found"
+    try:
+        record = module.get_provider(name)
+    except Exception as e:
+        logger.warning(f"get_provider({name!r}) failed: {type(e).__name__}")
+        return None, "not_found"
+    if record is None:
+        return None, "not_found"
+    if not _provider_field(record, "enabled", True):
+        return record, "disabled"
+    return record, None
+
+
+def _wrap_challenge(challenge: bytes, mode: str) -> Tuple[bytes, str]:
+    """Encode a CDM challenge for the provider's license endpoint.
+
+    Args:
+        challenge: Raw opaque challenge bytes from the CDM.
+        mode: "raw", "base64", or "json:<field>".
+
+    Returns:
+        (body, content_type) ready to POST.
+
+    Raises:
+        DrmWrapError: The mode is not a recognised spec.
+    """
+    mode = (mode or "raw").strip()
+    if mode == "raw":
+        return challenge, "application/octet-stream"
+    if mode == "base64":
+        return base64.b64encode(challenge), "application/octet-stream"
+    if mode.startswith("json:"):
+        field = mode[len("json:"):].strip()
+        if not field:
+            raise DrmWrapError("json request_wrap is missing a field name")
+        # JSON cannot carry raw bytes, so the challenge is base64 inside the
+        # field — the near-universal convention for JSON license endpoints.
+        payload = {field: base64.b64encode(challenge).decode("ascii")}
+        return json.dumps(payload).encode("utf-8"), "application/json"
+    raise DrmWrapError(f"unsupported request_wrap: {mode!r}")
+
+
+def _unwrap_license(body: bytes, mode: str) -> bytes:
+    """Decode a provider's license response into the bytes the CDM expects.
+
+    The result is handed to the browser untouched: `MediaKeySession.update()`
+    rejects anything that is not byte-exact (Chrome surfaces this as error 6008).
+
+    Args:
+        body: The provider's raw response body.
+        mode: "raw", "base64", or "json:<field>".
+
+    Returns:
+        The license bytes for the CDM.
+
+    Raises:
+        DrmWrapError: The mode is unrecognised, or the body does not match it.
+    """
+    mode = (mode or "raw").strip()
+    if mode == "raw":
+        return body
+    if mode == "base64":
+        try:
+            return base64.b64decode(body.strip(), validate=True)
+        except Exception as e:
+            raise DrmWrapError(f"response was not valid base64: {type(e).__name__}")
+    if mode.startswith("json:"):
+        field = mode[len("json:"):].strip()
+        if not field:
+            raise DrmWrapError("json response_unwrap is missing a field name")
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception as e:
+            raise DrmWrapError(f"response was not valid JSON: {type(e).__name__}")
+        if not isinstance(payload, dict) or field not in payload:
+            raise DrmWrapError(f"response JSON has no field {field!r}")
+        value = payload[field]
+        if not isinstance(value, str):
+            raise DrmWrapError(f"response field {field!r} is not a string")
+        try:
+            return base64.b64decode(value, validate=True)
+        except Exception as e:
+            raise DrmWrapError(f"response field {field!r} was not valid base64: {type(e).__name__}")
+    raise DrmWrapError(f"unsupported response_unwrap: {mode!r}")
+
+
+def _request_token(request: Request) -> str:
+    """Pull the per-user stream token off a request.
+
+    The GET streaming routes carry it as a query parameter because players
+    cannot set headers. A POST from our own page can, so accept the header forms
+    too rather than forcing a secret into a URL that ends up in access logs.
+    """
+    token = request.query_params.get("token", "")
+    if token:
+        return token
+    token = request.headers.get("x-stream-token", "")
+    if token:
+        return token
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
+def _authenticate(request: Request) -> Tuple[Optional[dict], bool]:
+    """Resolve the caller for a POST route.
+
+    Mirrors the policy of the `require_stream_token` GET middleware, which this
+    cannot reuse: that middleware only inspects GET requests and reads the token
+    from the query string. Left untouched here on purpose.
+
+    Returns:
+        (user, authorized). `user` is None when the install has no users yet
+        (unconfigured — the same escape hatch the GET middleware uses so a fresh
+        deploy is not locked out), in which case `authorized` is still True.
+    """
+    if not users.list_users():
+        return None, True
+    user = users.user_by_token(_request_token(request))
+    return user, user is not None
+
+
+def _drm_error(status_code: int, code: str, message: str) -> JSONResponse:
+    """Uniform JSON error for the DRM routes."""
+    return JSONResponse(status_code=status_code, content={"error": code, "message": message})
+
+
+@fastapi_app.post("/api/drm/license/{provider}")
+async def drm_license(provider: str, request: Request):
+    """Relay an EME license challenge to a provider's license server.
+
+    The request body is the opaque challenge emitted by the browser's CDM. It is
+    wrapped per the provider's `request_wrap`, POSTed to the provider's
+    `license_url` with its `license_headers` attached server-side, and the
+    response is unwrapped per `response_unwrap` and returned verbatim.
+
+    The returned bytes must reach the CDM unmodified — any re-encoding or
+    transport compression that a client fails to reverse makes
+    `MediaKeySession.update()` throw (Chrome error 6008) — so the response is
+    marked `Content-Encoding: identity` to keep intermediaries from touching it.
+
+    Args:
+        provider: Name of a provider record in the DRM registry.
+        request: The incoming request; the raw body is the CDM challenge.
+
+    Returns:
+        200 with `application/octet-stream` license bytes, or a JSON error:
+        401 unauthenticated, 400 empty/oversized challenge or a bad wrap spec,
+        404 unknown or disabled provider, 403 upstream rejected our credentials,
+        504 upstream timeout, 502 any other upstream or unwrap failure.
+    """
+    _user, authorized = _authenticate(request)
+    if not authorized:
+        return _drm_error(status.HTTP_401_UNAUTHORIZED, "unauthenticated",
+                          "A valid stream token is required.")
+
+    record, err = _lookup_provider(provider)
+    if err == "not_found":
+        return _drm_error(status.HTTP_404_NOT_FOUND, "unknown_provider",
+                          f"No DRM provider named {provider!r}.")
+    if err == "disabled":
+        return _drm_error(status.HTTP_404_NOT_FOUND, "provider_disabled",
+                          f"DRM provider {provider!r} is disabled.")
+
+    challenge = await request.body()
+    if not challenge:
+        return _drm_error(status.HTTP_400_BAD_REQUEST, "empty_challenge",
+                          "The request body must contain the CDM license challenge.")
+    if len(challenge) > _DRM_MAX_CHALLENGE_BYTES:
+        return _drm_error(status.HTTP_400_BAD_REQUEST, "challenge_too_large",
+                          f"Challenge exceeds the {_DRM_MAX_CHALLENGE_BYTES} byte limit.")
+
+    license_url = _provider_field(record, "license_url", "")
+    if not license_url:
+        return _drm_error(status.HTTP_502_BAD_GATEWAY, "provider_misconfigured",
+                          f"DRM provider {provider!r} has no license_url configured.")
+
+    try:
+        body, content_type = _wrap_challenge(challenge, _provider_field(record, "request_wrap", "raw"))
+    except DrmWrapError as e:
+        return _drm_error(status.HTTP_400_BAD_REQUEST, "bad_request_wrap", str(e))
+
+    headers = {"Content-Type": content_type}
+    # Provider headers last so a provider that needs its own Content-Type wins.
+    provider_headers = _provider_field(record, "license_headers", {}) or {}
+    if isinstance(provider_headers, dict):
+        headers.update({str(k): str(v) for k, v in provider_headers.items()})
+    logger.info(
+        f"DRM license relay provider={provider} challenge_bytes={len(challenge)} "
+        f"header_keys={sorted(headers)}"  # names only — values are credentials
+    )
+
+    try:
+        upstream = await client.post(
+            license_url, content=body, headers=headers, timeout=_DRM_UPSTREAM_TIMEOUT
+        )
+    except httpx.TimeoutException:
+        logger.warning(f"DRM license relay provider={provider} timed out")
+        return _drm_error(status.HTTP_504_GATEWAY_TIMEOUT, "upstream_timeout",
+                          "The license server did not respond in time.")
+    except Exception as e:
+        logger.error(f"DRM license relay provider={provider} failed: {type(e).__name__}")
+        return _drm_error(status.HTTP_502_BAD_GATEWAY, "upstream_unreachable",
+                          "Could not reach the license server.")
+
+    if upstream.status_code in (401, 403):
+        logger.warning(f"DRM license relay provider={provider} upstream status={upstream.status_code}")
+        return _drm_error(status.HTTP_403_FORBIDDEN, "upstream_rejected",
+                          "The license server rejected the configured credentials.")
+    if upstream.status_code >= 400:
+        logger.warning(f"DRM license relay provider={provider} upstream status={upstream.status_code}")
+        return _drm_error(status.HTTP_502_BAD_GATEWAY, "upstream_error",
+                          f"The license server returned HTTP {upstream.status_code}.")
+
+    try:
+        license_bytes = _unwrap_license(upstream.content,
+                                        _provider_field(record, "response_unwrap", "raw"))
+    except DrmWrapError as e:
+        logger.error(f"DRM license relay provider={provider} unwrap failed: {e}")
+        return _drm_error(status.HTTP_502_BAD_GATEWAY, "bad_response_unwrap", str(e))
+
+    logger.info(f"DRM license relay provider={provider} ok license_bytes={len(license_bytes)}")
+    return Response(
+        content=license_bytes,
+        media_type="application/octet-stream",
+        headers={
+            # Byte-transparency: identity encoding keeps any compression layer
+            # (Starlette GZipMiddleware skips a response that already declares an
+            # encoding, and Caddy's `encode` does the same) from rewriting the
+            # body the CDM must receive verbatim.
+            "Content-Encoding": "identity",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+def _classify_upstream_error(exc: Exception) -> Tuple[str, str]:
+    """Turn a transport exception into an actionable (code, message) pair."""
+    text = str(exc).lower()
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout", (
+            f"No response within {int(_DRM_UPSTREAM_TIMEOUT)}s. The host may be "
+            "firewalled or the URL may point at a non-responsive port."
+        )
+    if "certificate" in text or "ssl" in text or "tls" in text:
+        return "tls_error", (
+            "TLS handshake failed. Check the hostname matches the certificate "
+            "and that the issuing CA is trusted in this container."
+        )
+    if "name or service not known" in text or "nodename nor servname" in text \
+            or "getaddrinfo" in text or "name resolution" in text:
+        return "dns_error", (
+            "DNS lookup failed for the license host. Check the hostname in "
+            "license_url for typos and the container's DNS settings."
+        )
+    if isinstance(exc, httpx.ConnectError):
+        return "connect_error", (
+            "Connection refused or unreachable. Check the port and any egress "
+            "firewall or proxy rules."
+        )
+    return "transport_error", f"Request failed ({type(exc).__name__})."
+
+
+@fastapi_app.post("/api/drm/test/{provider}")
+async def drm_test(provider: str, request: Request):
+    """Validate a provider's license configuration with one round-trip.
+
+    Admin-only. Sends a small dummy challenge to the configured `license_url` so
+    the settings UI can distinguish a DNS failure, a TLS failure, a credential
+    rejection, a timeout, and a `response_unwrap` that does not match what the
+    server actually returns. No real playback is involved.
+
+    Args:
+        provider: Name of a provider record in the DRM registry.
+        request: The incoming request; carries the admin's stream token.
+
+    Returns:
+        `{"ok": bool, "code": str, "message": str}` — always HTTP 200 for a
+        completed test, so the UI can render the diagnosis; 401/403 if the
+        caller is not an authenticated admin.
+    """
+    user, authorized = _authenticate(request)
+    if not authorized:
+        return _drm_error(status.HTTP_401_UNAUTHORIZED, "unauthenticated",
+                          "A valid stream token is required.")
+    # user is None only on an unconfigured install (no users exist at all).
+    if user is not None and user.get("role") != "admin":
+        return _drm_error(status.HTTP_403_FORBIDDEN, "forbidden",
+                          "Only an admin may test DRM provider configuration.")
+
+    record, err = _lookup_provider(provider)
+    if err == "not_found":
+        return {"ok": False, "code": "unknown_provider",
+                "message": f"No DRM provider named {provider!r} is registered."}
+    if err == "disabled":
+        return {"ok": False, "code": "provider_disabled",
+                "message": f"Provider {provider!r} exists but is disabled. Enable it to test."}
+
+    license_url = _provider_field(record, "license_url", "")
+    if not license_url:
+        return {"ok": False, "code": "misconfigured",
+                "message": "This provider has no license_url configured."}
+
+    try:
+        body, content_type = _wrap_challenge(b"\x00" * 16,
+                                             _provider_field(record, "request_wrap", "raw"))
+    except DrmWrapError as e:
+        return {"ok": False, "code": "bad_request_wrap", "message": str(e)}
+
+    headers = {"Content-Type": content_type}
+    provider_headers = _provider_field(record, "license_headers", {}) or {}
+    if isinstance(provider_headers, dict):
+        headers.update({str(k): str(v) for k, v in provider_headers.items()})
+
+    try:
+        upstream = await client.post(
+            license_url, content=body, headers=headers, timeout=_DRM_UPSTREAM_TIMEOUT
+        )
+    except Exception as e:
+        code, message = _classify_upstream_error(e)
+        logger.warning(f"DRM test provider={provider} {code}")
+        return {"ok": False, "code": code, "message": message}
+
+    if upstream.status_code in (401, 403):
+        return {"ok": False, "code": "unauthorized", "message": (
+            f"The license server returned HTTP {upstream.status_code}. The "
+            "configured license_headers were rejected — the token or key is "
+            "likely wrong or expired."
+        )}
+    if upstream.status_code >= 500:
+        return {"ok": False, "code": "upstream_error", "message": (
+            f"The license server returned HTTP {upstream.status_code}. It is "
+            "reachable but failing on its side; retry later."
+        )}
+    if upstream.status_code >= 400:
+        # Reached the right endpoint and got past auth; the dummy challenge is
+        # not a real one, so a 4xx here is the expected, healthy outcome.
+        return {"ok": True, "code": "reachable", "message": (
+            f"License server reachable and credentials accepted (HTTP "
+            f"{upstream.status_code} on the dummy challenge, which is expected). "
+            "The response_unwrap setting can only be confirmed during real playback."
+        )}
+
+    try:
+        license_bytes = _unwrap_license(upstream.content,
+                                        _provider_field(record, "response_unwrap", "raw"))
+    except DrmWrapError as e:
+        return {"ok": False, "code": "bad_response_unwrap", "message": (
+            f"The server answered HTTP {upstream.status_code} but the response "
+            f"did not match response_unwrap="
+            f"{_provider_field(record, 'response_unwrap', 'raw')!r}: {e}"
+        )}
+
+    return {"ok": True, "code": "ok", "message": (
+        f"License server answered HTTP {upstream.status_code} and the response "
+        f"unwrapped cleanly ({len(license_bytes)} bytes)."
+    )}

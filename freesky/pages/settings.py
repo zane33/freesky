@@ -3,22 +3,55 @@
 Runs in the same process as the FastAPI backend, so it reads and writes
 `channel_prefs` directly instead of going back out over HTTP.
 """
+import httpx
 import reflex as rx
 from urllib.parse import urlparse
 from typing import List
 
-from rxconfig import api_url
+from rxconfig import api_url, backend_port
 
-from freesky import backend, channel_prefs, users, app_settings
+from freesky import backend, channel_prefs, users, app_settings, drm_providers
 from freesky.free_sky import Channel
 from freesky.components import navbar
-from freesky.auth_state import require_admin
+from freesky.auth_state import AuthState, require_admin
 from freesky.free_sky_hybrid import StepDaddyHybrid
+from freesky.drm_providers import DRMProviderError
 
 # "Auto" is a sentinel in the dropdown, stored as "" (no pin) on disk. The real
 # options come from the resolver so the two can't drift apart.
 AUTO_SOURCE = "Auto (failover)"
 SOURCE_OPTIONS = [AUTO_SOURCE] + list(StepDaddyHybrid.PLAYER_PATHS)
+
+# Dropdown options for the DRM form. Taken from drm_providers so the UI can't
+# offer a value the validator will then reject.
+KEY_SYSTEM_OPTIONS = list(drm_providers.KEY_SYSTEMS)
+MANIFEST_TYPE_OPTIONS = list(drm_providers.MANIFEST_TYPES)
+WRAP_OPTIONS = ["raw", "base64", "json:license", "json:payload"]
+
+# The test endpoint lives in the same process, but it is a FastAPI route rather
+# than something importable from here, so the page dials it over loopback. Not
+# api_url: that is the client-facing origin and may not resolve from inside the
+# container.
+BACKEND_ORIGIN = f"http://127.0.0.1:{backend_port}"
+
+
+def _parse_header_lines(text: str) -> dict:
+    """Turn the header textarea into a {name: value} dict.
+
+    One "Name: value" per line; blank lines and lines without a colon are
+    ignored. Deliberately lenient about whitespace — the strict check is
+    drm_providers.validate_provider, which is the single source of truth.
+    """
+    headers = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        name, _, value = line.partition(":")
+        name = name.strip()
+        if name:
+            headers[name] = value.strip()
+    return headers
 
 
 class SettingsState(rx.State):
@@ -48,6 +81,34 @@ class SettingsState(rx.State):
     # every state change, which is what made rows flicker and vanish.
     page: int = 0
     PAGE_SIZE: int = 50
+
+    # --- DRM providers ------------------------------------------------------
+    # Never holds license_headers. Header VALUES are secrets and this state is
+    # serialised to the browser over the Reflex socket; only the header NAMES
+    # travel, so the admin can see that a credential exists without it being
+    # re-transmitted every time the page loads.
+    drm_list: List[dict] = []
+    drm_error: str = ""
+
+    # Form. drm_editing is "" when adding, otherwise the name being edited.
+    drm_editing: str = ""
+    drm_name: str = ""
+    drm_key_system: str = KEY_SYSTEM_OPTIONS[0]
+    drm_license_url: str = ""
+    drm_manifest_url: str = ""
+    drm_manifest_type: str = MANIFEST_TYPE_OPTIONS[0]
+    drm_request_wrap: str = "raw"
+    drm_response_unwrap: str = "raw"
+    drm_enabled: bool = True
+    # Write-only: blank on an edit means "keep the stored headers".
+    drm_headers_input: str = ""
+    drm_clear_headers: bool = False
+
+    drm_confirm_delete: str = ""
+    drm_testing: str = ""
+    drm_test_target: str = ""
+    drm_test_ok: bool = False
+    drm_test_message: str = ""
 
     @rx.var
     def matching(self) -> List[Channel]:
@@ -108,6 +169,7 @@ class SettingsState(rx.State):
         self.users = users.list_users()
         self.trusted_networks = ", ".join(app_settings.trusted_networks())
         self.sources = channel_prefs.sources()
+        self.load_drm()
 
     @rx.event
     async def refresh(self):
@@ -259,6 +321,228 @@ class SettingsState(rx.State):
         return rx.toast(
             f"{'Enabled' if enabled else 'Disabled'} {len(affected)} channel(s)"
         )
+
+    # --- DRM providers ------------------------------------------------------
+
+    def load_drm(self) -> None:
+        """Refresh drm_list from disk, header values stripped.
+
+        Not an @rx.event: called from on_load and from the handlers below, so it
+        stays a plain method rather than something the client can trigger.
+        """
+        rows = []
+        for provider in drm_providers.list_providers():
+            public = drm_providers.public_provider(provider)
+            # license_url is not secret and the admin has to be able to see what
+            # they typed; the headers are, so only their names come through.
+            public["license_url"] = provider["license_url"]
+            public["request_wrap"] = provider["request_wrap"]
+            public["response_unwrap"] = provider["response_unwrap"]
+            public["header_names"] = ", ".join(sorted(provider["license_headers"]))
+            rows.append(public)
+        self.drm_list = rows
+
+    @rx.event
+    def set_drm_name(self, value: str):
+        self.drm_name = value
+
+    @rx.event
+    def set_drm_key_system(self, value: str):
+        self.drm_key_system = value
+
+    @rx.event
+    def set_drm_license_url(self, value: str):
+        self.drm_license_url = value
+
+    @rx.event
+    def set_drm_manifest_url(self, value: str):
+        self.drm_manifest_url = value
+
+    @rx.event
+    def set_drm_manifest_type(self, value: str):
+        self.drm_manifest_type = value
+
+    @rx.event
+    def set_drm_request_wrap(self, value: str):
+        self.drm_request_wrap = value
+
+    @rx.event
+    def set_drm_response_unwrap(self, value: str):
+        self.drm_response_unwrap = value
+
+    @rx.event
+    def set_drm_enabled(self, value: bool):
+        self.drm_enabled = value
+
+    @rx.event
+    def set_drm_headers_input(self, value: str):
+        self.drm_headers_input = value
+        # Typing a replacement and also ticking "clear" is contradictory; the
+        # typed value wins.
+        if value.strip():
+            self.drm_clear_headers = False
+
+    @rx.event
+    def set_drm_clear_headers(self, value: bool):
+        self.drm_clear_headers = value
+        if value:
+            self.drm_headers_input = ""
+
+    @rx.event
+    def reset_drm_form(self):
+        """Back to a blank 'add provider' form."""
+        self.drm_editing = ""
+        self.drm_name = ""
+        self.drm_key_system = KEY_SYSTEM_OPTIONS[0]
+        self.drm_license_url = ""
+        self.drm_manifest_url = ""
+        self.drm_manifest_type = MANIFEST_TYPE_OPTIONS[0]
+        self.drm_request_wrap = "raw"
+        self.drm_response_unwrap = "raw"
+        self.drm_enabled = True
+        self.drm_headers_input = ""
+        self.drm_clear_headers = False
+        self.drm_error = ""
+
+    @rx.event
+    def edit_drm(self, name: str):
+        """Load a provider into the form. Header values are deliberately left
+        blank — they are not sent to the browser, so they cannot be pre-filled."""
+        provider = drm_providers.get_provider(name)
+        if provider is None:
+            self.drm_error = f"Provider '{name}' no longer exists"
+            self.load_drm()
+            return
+        self.drm_editing = provider["name"]
+        self.drm_name = provider["name"]
+        self.drm_key_system = provider["key_system"]
+        self.drm_license_url = provider["license_url"]
+        self.drm_manifest_url = provider["manifest_url"]
+        self.drm_manifest_type = provider["manifest_type"]
+        self.drm_request_wrap = provider["request_wrap"]
+        self.drm_response_unwrap = provider["response_unwrap"]
+        self.drm_enabled = provider["enabled"]
+        self.drm_headers_input = ""
+        self.drm_clear_headers = False
+        self.drm_error = ""
+
+    @rx.event
+    def save_drm(self):
+        """Validate and persist the form.
+
+        Header handling on an edit: a blank textarea keeps whatever is stored,
+        because the form never received the values and submitting {} would
+        silently drop the credential. "Clear stored headers" is the explicit way
+        to remove them.
+        """
+        typed = _parse_header_lines(self.drm_headers_input)
+        if typed:
+            headers = typed
+        elif self.drm_clear_headers or not self.drm_editing:
+            headers = {}
+        else:
+            existing = drm_providers.get_provider(self.drm_editing)
+            headers = existing["license_headers"] if existing else {}
+
+        record = {
+            "name": self.drm_name,
+            "key_system": self.drm_key_system,
+            "license_url": self.drm_license_url,
+            "license_headers": headers,
+            "request_wrap": self.drm_request_wrap,
+            "response_unwrap": self.drm_response_unwrap,
+            "manifest_url": self.drm_manifest_url,
+            "manifest_type": self.drm_manifest_type,
+            "enabled": self.drm_enabled,
+        }
+        try:
+            saved = drm_providers.upsert_provider(record)
+        except DRMProviderError as e:
+            self.drm_error = str(e)
+            return
+        # Renaming means the old record is now orphaned — drop it so an edit
+        # doesn't quietly leave a duplicate behind.
+        if self.drm_editing and self.drm_editing != saved["name"]:
+            drm_providers.delete_provider(self.drm_editing)
+        self.reset_drm_form()
+        self.load_drm()
+        return rx.toast(f"Saved DRM provider '{saved['name']}'")
+
+    @rx.event
+    def toggle_drm_enabled(self, name: str):
+        """Flip one provider on or off without opening the edit form."""
+        provider = drm_providers.get_provider(name)
+        if provider is None:
+            self.load_drm()
+            return
+        provider["enabled"] = not provider["enabled"]
+        try:
+            drm_providers.upsert_provider(provider)
+            self.drm_error = ""
+        except DRMProviderError as e:
+            self.drm_error = str(e)
+        self.load_drm()
+
+    @rx.event
+    def ask_delete_drm(self, name: str):
+        """Arm the confirm buttons for one row. Deleting drops a stored license
+        credential, so it isn't a single click."""
+        self.drm_confirm_delete = name
+
+    @rx.event
+    def cancel_delete_drm(self):
+        self.drm_confirm_delete = ""
+
+    @rx.event
+    def confirm_delete_drm(self, name: str):
+        removed = drm_providers.delete_provider(name)
+        self.drm_confirm_delete = ""
+        if self.drm_editing == name:
+            self.reset_drm_form()
+        self.load_drm()
+        return rx.toast(
+            f"Deleted DRM provider '{name}'" if removed else f"'{name}' was already gone"
+        )
+
+    @rx.event
+    async def test_drm(self, name: str):
+        """Ask the backend to exercise this provider's manifest and license URLs.
+
+        The endpoint answers {ok, code, message}; nothing about the exchange is
+        rendered beyond that, so a license response can't leak into the page.
+        The admin's own session token is forwarded because this call originates
+        server-side and carries none of the browser's cookies.
+        """
+        self.drm_testing = name
+        self.drm_test_target = name
+        self.drm_test_ok = False
+        self.drm_test_message = ""
+        yield
+        try:
+            auth = await self.get_state(AuthState)
+            token = auth.session_token or ""
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+                response = await client.post(
+                    f"{BACKEND_ORIGIN}/api/drm/test/{name}",
+                    params={"token": token} if token else None,
+                    cookies={"fs_session": token} if token else None,
+                )
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            self.drm_test_ok = bool(body.get("ok"))
+            code = body.get("code", response.status_code)
+            message = str(body.get("message") or f"HTTP {response.status_code}")
+            self.drm_test_message = f"{code}: {message}" if code else message
+        except Exception as e:
+            # Includes the case where the endpoint isn't deployed yet.
+            self.drm_test_ok = False
+            self.drm_test_message = f"Test failed: {e}"
+        finally:
+            self.drm_testing = ""
 
 
 def user_row(user: dict) -> rx.Component:
@@ -457,6 +741,305 @@ def channel_row(channel: Channel) -> rx.Component:
     )
 
 
+def drm_provider_row(provider: dict) -> rx.Component:
+    """One stored provider: status, endpoints, and the row's actions."""
+    confirming = SettingsState.drm_confirm_delete == provider["name"]
+    tested = SettingsState.drm_test_target == provider["name"]
+    return rx.vstack(
+        rx.hstack(
+            rx.switch(
+                # Explicit cast: a value indexed out of a dict Var is untyped,
+                # and rx.switch needs a boolean Var.
+                checked=provider["enabled"].to(bool),
+                on_change=lambda _: SettingsState.toggle_drm_enabled(provider["name"]),
+            ),
+            rx.text(provider["name"], size="3", weight="medium"),
+            rx.badge(provider["key_system"], variant="soft"),
+            rx.badge(provider["manifest_type"], variant="soft", color_scheme="gray"),
+            rx.cond(
+                provider["has_license_headers"],
+                rx.badge(
+                    rx.icon("key-round", size=12),
+                    provider["header_names"],
+                    variant="soft",
+                    color_scheme="amber",
+                ),
+                rx.badge("no headers", variant="soft", color_scheme="gray"),
+            ),
+            rx.spacer(),
+            rx.button(
+                rx.icon("flask-conical", size=14),
+                "Test",
+                on_click=lambda: SettingsState.test_drm(provider["name"]),
+                loading=SettingsState.drm_testing == provider["name"],
+                size="1",
+                variant="soft",
+            ),
+            rx.button(
+                rx.icon("pencil", size=14),
+                on_click=lambda: SettingsState.edit_drm(provider["name"]),
+                size="1",
+                variant="soft",
+                title="Edit this provider",
+            ),
+            rx.cond(
+                confirming,
+                rx.hstack(
+                    rx.button(
+                        "Delete",
+                        on_click=lambda: SettingsState.confirm_delete_drm(provider["name"]),
+                        size="1",
+                        color_scheme="red",
+                    ),
+                    rx.button(
+                        "Cancel",
+                        on_click=SettingsState.cancel_delete_drm,
+                        size="1",
+                        variant="soft",
+                    ),
+                    spacing="1",
+                ),
+                rx.button(
+                    rx.icon("trash-2", size=14),
+                    on_click=lambda: SettingsState.ask_delete_drm(provider["name"]),
+                    size="1",
+                    variant="soft",
+                    color_scheme="red",
+                    title="Delete this provider",
+                ),
+            ),
+            align="center",
+            spacing="2",
+            width="100%",
+        ),
+        rx.text(
+            provider["manifest_url"],
+            size="1",
+            color="gray",
+            no_of_lines=1,
+            font_family="mono",
+            width="100%",
+        ),
+        # The test result belongs beside the provider it was run against, not in
+        # a toast that vanishes before it can be read.
+        rx.cond(
+            tested & (SettingsState.drm_test_message != ""),
+            rx.callout(
+                SettingsState.drm_test_message,
+                icon=rx.cond(SettingsState.drm_test_ok, "circle_check", "triangle_alert"),
+                color_scheme=rx.cond(SettingsState.drm_test_ok, "green", "red"),
+                size="1",
+                width="100%",
+            ),
+            rx.fragment(),
+        ),
+        spacing="1",
+        width="100%",
+        padding_y="0.4rem",
+        border_bottom="1px solid var(--gray-4)",
+    )
+
+
+def drm_form() -> rx.Component:
+    """Add/edit form. Header values are write-only — see the note in the state."""
+    editing = SettingsState.drm_editing != ""
+    return rx.vstack(
+        rx.heading(
+            rx.cond(editing, "Edit provider", "Add provider"),
+            size="3",
+        ),
+        rx.hstack(
+            rx.vstack(
+                rx.text("Name", size="1", color="gray"),
+                rx.input(
+                    value=SettingsState.drm_name,
+                    on_change=SettingsState.set_drm_name,
+                    placeholder="sky-uk",
+                    width="100%",
+                ),
+                spacing="1",
+                flex="1",
+            ),
+            rx.vstack(
+                rx.text("Key system", size="1", color="gray"),
+                rx.select(
+                    KEY_SYSTEM_OPTIONS,
+                    value=SettingsState.drm_key_system,
+                    on_change=SettingsState.set_drm_key_system,
+                    width="100%",
+                ),
+                spacing="1",
+                flex="1",
+            ),
+            rx.vstack(
+                rx.text("Manifest type", size="1", color="gray"),
+                rx.select(
+                    MANIFEST_TYPE_OPTIONS,
+                    value=SettingsState.drm_manifest_type,
+                    on_change=SettingsState.set_drm_manifest_type,
+                    width="100%",
+                ),
+                spacing="1",
+                width="120px",
+            ),
+            spacing="2",
+            width="100%",
+            align="end",
+        ),
+        rx.vstack(
+            rx.text("Manifest URL", size="1", color="gray"),
+            rx.input(
+                value=SettingsState.drm_manifest_url,
+                on_change=SettingsState.set_drm_manifest_url,
+                placeholder="https://cdn.example.com/stream.mpd",
+                width="100%",
+            ),
+            spacing="1",
+            width="100%",
+        ),
+        rx.vstack(
+            rx.text("License URL", size="1", color="gray"),
+            rx.input(
+                value=SettingsState.drm_license_url,
+                on_change=SettingsState.set_drm_license_url,
+                placeholder="https://license.example.com/widevine",
+                width="100%",
+            ),
+            spacing="1",
+            width="100%",
+        ),
+        rx.hstack(
+            rx.vstack(
+                rx.text("Request wrap", size="1", color="gray"),
+                rx.select(
+                    WRAP_OPTIONS,
+                    value=SettingsState.drm_request_wrap,
+                    on_change=SettingsState.set_drm_request_wrap,
+                    width="100%",
+                ),
+                spacing="1",
+                flex="1",
+            ),
+            rx.vstack(
+                rx.text("Response unwrap", size="1", color="gray"),
+                rx.select(
+                    WRAP_OPTIONS,
+                    value=SettingsState.drm_response_unwrap,
+                    on_change=SettingsState.set_drm_response_unwrap,
+                    width="100%",
+                ),
+                spacing="1",
+                flex="1",
+            ),
+            spacing="2",
+            width="100%",
+            align="end",
+        ),
+        rx.vstack(
+            rx.text(
+                "License headers — one 'Name: value' per line", size="1", color="gray"
+            ),
+            rx.text_area(
+                value=SettingsState.drm_headers_input,
+                on_change=SettingsState.set_drm_headers_input,
+                placeholder="Authorization: Bearer ...\nX-Api-Key: ...",
+                rows="3",
+                width="100%",
+                font_family="mono",
+                font_size="12px",
+            ),
+            rx.text(
+                rx.cond(
+                    editing,
+                    "Stored values are never sent back to this page. Leave blank "
+                    "to keep them; tick Clear to remove them.",
+                    "Attached server-side when FreeSky relays the license request. "
+                    "Never sent to the browser.",
+                ),
+                size="1",
+                color="gray",
+            ),
+            spacing="1",
+            width="100%",
+        ),
+        rx.hstack(
+            rx.checkbox(
+                "Clear stored headers",
+                checked=SettingsState.drm_clear_headers,
+                on_change=SettingsState.set_drm_clear_headers,
+                disabled=~editing,
+            ),
+            rx.checkbox(
+                "Enabled",
+                checked=SettingsState.drm_enabled,
+                on_change=SettingsState.set_drm_enabled,
+            ),
+            rx.spacer(),
+            rx.cond(
+                editing,
+                rx.button(
+                    "Cancel",
+                    on_click=SettingsState.reset_drm_form,
+                    variant="soft",
+                    type="button",
+                ),
+                rx.fragment(),
+            ),
+            rx.button(
+                rx.cond(editing, "Save changes", "Add provider"),
+                on_click=SettingsState.save_drm,
+            ),
+            align="center",
+            spacing="3",
+            width="100%",
+        ),
+        spacing="3",
+        width="100%",
+    )
+
+
+def drm_section() -> rx.Component:
+    """DRM provider configuration.
+
+    Playback itself happens in the browser's own CDM via EME; this section only
+    tells FreeSky where a provider's manifest and license server live and what
+    credential to attach when relaying a license request.
+    """
+    return rx.card(
+        rx.vstack(
+            rx.heading("DRM Providers", size="5"),
+            rx.text(
+                "Sources whose streams are protected by Widevine or PlayReady. "
+                "The browser's own CDM does the decryption; FreeSky relays the "
+                "license request so the credential below never reaches the "
+                "client. Header values are stored in plain text on the server — "
+                "the file is owner-only, but treat the host as holding them.",
+                color="gray",
+                size="2",
+            ),
+            rx.cond(
+                SettingsState.drm_error != "",
+                rx.callout(SettingsState.drm_error, icon="triangle_alert",
+                           color_scheme="red", size="1", width="100%"),
+            ),
+            rx.cond(
+                SettingsState.drm_list.length() > 0,
+                rx.vstack(
+                    rx.foreach(SettingsState.drm_list, drm_provider_row),
+                    spacing="0",
+                    width="100%",
+                ),
+                rx.text("No DRM providers configured yet.", size="2", color="gray"),
+            ),
+            rx.divider(),
+            drm_form(),
+            spacing="3",
+            width="100%",
+        ),
+        width="100%",
+    )
+
+
 @rx.page("/settings", on_load=SettingsState.on_load)
 def settings() -> rx.Component:
     return rx.box(
@@ -543,6 +1126,7 @@ def settings() -> rx.Component:
                 rx.divider(margin_y="1rem"),
                 access_section(),
                 users_section(),
+                drm_section(),
                 spacing="4",
                 width="100%",
             ),
