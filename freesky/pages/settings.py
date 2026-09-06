@@ -16,6 +16,7 @@ from freesky.components import navbar
 from freesky.auth_state import AuthState, require_admin
 from freesky.free_sky_hybrid import StepDaddyHybrid
 from freesky.drm_providers import DRMProviderError
+from freesky.drm_import import parse_license_key
 
 # "Auto" is a sentinel in the dropdown, stored as "" (no pin) on disk. The real
 # options come from the resolver so the two can't drift apart.
@@ -103,6 +104,29 @@ class SettingsState(rx.State):
     # Write-only: blank on an edit means "keep the stored headers".
     drm_headers_input: str = ""
     drm_clear_headers: bool = False
+
+    # --- license-key import -------------------------------------------------
+    # Parse and save are two steps: parsing must never write. The full parsed
+    # record lives in a backend-only var (leading underscore => Reflex does not
+    # serialise it), because it carries license_headers VALUES. Only the
+    # projection in the drm_preview_* vars below reaches the browser, and that
+    # deliberately carries header NAMES only.
+    _drm_import_record: dict = {}
+
+    drm_import_open: bool = False
+    drm_import_key: str = ""
+    drm_import_name: str = ""
+    drm_import_manifest_url: str = ""
+    drm_import_manifest_type: str = MANIFEST_TYPE_OPTIONS[0]
+    drm_import_key_system: str = KEY_SYSTEM_OPTIONS[0]
+    drm_import_error: str = ""
+
+    drm_import_parsed: bool = False
+    drm_preview_name: str = ""
+    drm_preview_license_url: str = ""
+    drm_preview_request_wrap: str = ""
+    drm_preview_response_unwrap: str = ""
+    drm_preview_header_names: str = ""
 
     drm_confirm_delete: str = ""
     drm_testing: str = ""
@@ -483,6 +507,126 @@ class SettingsState(rx.State):
             self.drm_error = str(e)
         self.load_drm()
 
+    # --- import from a Kodi license key string ------------------------------
+
+    def _clear_drm_preview(self) -> None:
+        """Drop the parsed record and its preview.
+
+        Plain method, not an event: it exists so no code path can leave a stale
+        record (and its header values) sitting in state after an error.
+        """
+        self._drm_import_record = {}
+        self.drm_import_parsed = False
+        self.drm_preview_name = ""
+        self.drm_preview_license_url = ""
+        self.drm_preview_request_wrap = ""
+        self.drm_preview_response_unwrap = ""
+        self.drm_preview_header_names = ""
+
+    def _set_drm_preview(self, record: dict) -> None:
+        """Project a parsed record into the browser-visible preview vars.
+
+        Header NAMES only, for the same reason `load_drm` strips them: this state
+        is serialised over the Reflex socket, and a license header value is a
+        credential.
+        """
+        self._drm_import_record = record
+        self.drm_import_parsed = True
+        self.drm_preview_name = record["name"]
+        self.drm_preview_license_url = record["license_url"]
+        self.drm_preview_request_wrap = record["request_wrap"]
+        self.drm_preview_response_unwrap = record["response_unwrap"]
+        self.drm_preview_header_names = (
+            ", ".join(sorted(record["license_headers"])) or "none"
+        )
+
+    @rx.event
+    def toggle_drm_import(self):
+        """Show or hide the import box, discarding any pending parse on close."""
+        self.drm_import_open = not self.drm_import_open
+        if not self.drm_import_open:
+            self.reset_drm_import()
+
+    @rx.event
+    def reset_drm_import(self):
+        """Empty the import form and forget the parsed record."""
+        self.drm_import_key = ""
+        self.drm_import_name = ""
+        self.drm_import_manifest_url = ""
+        self.drm_import_manifest_type = MANIFEST_TYPE_OPTIONS[0]
+        self.drm_import_key_system = KEY_SYSTEM_OPTIONS[0]
+        self.drm_import_error = ""
+        self._clear_drm_preview()
+
+    @rx.event
+    def set_drm_import_key(self, value: str):
+        self.drm_import_key = value
+        # The preview describes the string that was parsed; editing it makes the
+        # preview a lie, so retract it and make them press Parse again.
+        self._clear_drm_preview()
+
+    @rx.event
+    def set_drm_import_name(self, value: str):
+        self.drm_import_name = value
+        self._clear_drm_preview()
+
+    @rx.event
+    def set_drm_import_manifest_url(self, value: str):
+        self.drm_import_manifest_url = value
+        self._clear_drm_preview()
+
+    @rx.event
+    def set_drm_import_manifest_type(self, value: str):
+        self.drm_import_manifest_type = value
+        self._clear_drm_preview()
+
+    @rx.event
+    def set_drm_import_key_system(self, value: str):
+        self.drm_import_key_system = value
+        self._clear_drm_preview()
+
+    @rx.event
+    def parse_drm_import(self):
+        """Parse the pasted license key into a preview. Writes nothing to disk.
+
+        The parser validates the whole record, so a preview appearing at all
+        means the subsequent save will be accepted.
+        """
+        try:
+            record = parse_license_key(
+                self.drm_import_key,
+                name=self.drm_import_name,
+                manifest_url=self.drm_import_manifest_url,
+                manifest_type=self.drm_import_manifest_type,
+                key_system=self.drm_import_key_system,
+                enabled=True,
+            )
+        except DRMProviderError as e:
+            self.drm_import_error = str(e)
+            self._clear_drm_preview()
+            return
+        self.drm_import_error = ""
+        self._set_drm_preview(record)
+
+    @rx.event
+    def save_drm_import(self):
+        """Persist the previewed record. Only reachable once Parse has succeeded."""
+        record = dict(self._drm_import_record)
+        if not record:
+            self.drm_import_error = "Parse the license key before saving."
+            return
+        try:
+            saved = drm_providers.upsert_provider(record)
+        except DRMProviderError as e:
+            # The parser already validated, so this means the record was edited
+            # underneath us — surface it rather than saving something partial.
+            self.drm_import_error = str(e)
+            return
+        self.reset_drm_import()
+        self.drm_import_open = False
+        self.load_drm()
+        return rx.toast(f"Imported DRM provider '{saved['name']}'")
+
     @rx.event
     def ask_delete_drm(self, name: str):
         """Arm the confirm buttons for one row. Deleting drops a stored license
@@ -840,10 +984,198 @@ def drm_provider_row(provider: dict) -> rx.Component:
     )
 
 
+def drm_import_preview() -> rx.Component:
+    """What the pasted license key resolved to, before anything is saved.
+
+    Header names only — the values stay server-side (see `_set_drm_preview`).
+    """
+    def field(label: str, value) -> rx.Component:
+        return rx.hstack(
+            rx.text(label, size="1", color="gray", width="130px", flex_shrink="0"),
+            rx.text(value, size="1", font_family="mono", no_of_lines=1, flex="1"),
+            align="center",
+            spacing="2",
+            width="100%",
+        )
+
+    return rx.vstack(
+        rx.hstack(
+            rx.icon("circle_check", size=14, color="var(--green-9)"),
+            rx.text("Parsed — nothing saved yet", size="2", weight="medium"),
+            align="center",
+            spacing="2",
+        ),
+        field("Name", SettingsState.drm_preview_name),
+        field("License URL", SettingsState.drm_preview_license_url),
+        field("Request wrap", SettingsState.drm_preview_request_wrap),
+        field("Response unwrap", SettingsState.drm_preview_response_unwrap),
+        field("Header names", SettingsState.drm_preview_header_names),
+        rx.text(
+            "Header values were parsed but are held on the server and never sent "
+            "to this page. Save, then use Test on the new row to confirm the "
+            "license server accepts them.",
+            size="1",
+            color="gray",
+        ),
+        rx.hstack(
+            rx.spacer(),
+            rx.button(
+                "Discard",
+                on_click=SettingsState.reset_drm_import,
+                variant="soft",
+                type="button",
+            ),
+            rx.button(
+                rx.icon("save", size=14),
+                "Save provider",
+                on_click=SettingsState.save_drm_import,
+            ),
+            align="center",
+            spacing="2",
+            width="100%",
+        ),
+        spacing="2",
+        width="100%",
+        padding="0.75rem",
+        border="1px solid var(--gray-5)",
+        border_radius="var(--radius-3)",
+        background="var(--gray-2)",
+    )
+
+
+def drm_import_box() -> rx.Component:
+    """Collapsible "import from license key" area.
+
+    Accepts the `license_key` string from `inputstream.adaptive` — the format
+    Kodi DRM add-ons already use — so a working configuration can be moved over
+    by pasting one string instead of filling six fields by hand.
+    """
+    return rx.vstack(
+        rx.hstack(
+            rx.button(
+                rx.icon(
+                    rx.cond(SettingsState.drm_import_open, "chevron-down", "chevron-right"),
+                    size=14,
+                ),
+                rx.icon("clipboard-paste", size=14),
+                "Import from license key",
+                on_click=SettingsState.toggle_drm_import,
+                variant="soft",
+                size="1",
+                type="button",
+            ),
+            align="center",
+            width="100%",
+        ),
+        rx.cond(
+            SettingsState.drm_import_open,
+            rx.vstack(
+                rx.text(
+                    "Paste the inputstream.adaptive license_key string: "
+                    "license_url|headers|post_data|response. The manifest URL is "
+                    "not part of that string, so give it here.",
+                    size="1",
+                    color="gray",
+                ),
+                rx.cond(
+                    SettingsState.drm_import_error != "",
+                    rx.callout(SettingsState.drm_import_error, icon="triangle_alert",
+                               color_scheme="red", size="1", width="100%"),
+                ),
+                rx.text_area(
+                    value=SettingsState.drm_import_key,
+                    on_change=SettingsState.set_drm_import_key,
+                    placeholder=(
+                        "https://lic.example.com/wv|Authorization=Bearer%20abc"
+                        "&Content-Type=application/octet-stream|R{SSM}|JBlicense"
+                    ),
+                    rows="4",
+                    width="100%",
+                    font_family="mono",
+                    font_size="12px",
+                ),
+                rx.hstack(
+                    rx.vstack(
+                        rx.text("Name", size="1", color="gray"),
+                        rx.input(
+                            value=SettingsState.drm_import_name,
+                            on_change=SettingsState.set_drm_import_name,
+                            placeholder="sky-uk",
+                            width="100%",
+                        ),
+                        spacing="1",
+                        flex="1",
+                    ),
+                    rx.vstack(
+                        rx.text("Key system", size="1", color="gray"),
+                        rx.select(
+                            KEY_SYSTEM_OPTIONS,
+                            value=SettingsState.drm_import_key_system,
+                            on_change=SettingsState.set_drm_import_key_system,
+                            width="100%",
+                        ),
+                        spacing="1",
+                        flex="1",
+                    ),
+                    rx.vstack(
+                        rx.text("Manifest type", size="1", color="gray"),
+                        rx.select(
+                            MANIFEST_TYPE_OPTIONS,
+                            value=SettingsState.drm_import_manifest_type,
+                            on_change=SettingsState.set_drm_import_manifest_type,
+                            width="100%",
+                        ),
+                        spacing="1",
+                        width="120px",
+                    ),
+                    spacing="2",
+                    width="100%",
+                    align="end",
+                ),
+                rx.vstack(
+                    rx.text("Manifest URL", size="1", color="gray"),
+                    rx.input(
+                        value=SettingsState.drm_import_manifest_url,
+                        on_change=SettingsState.set_drm_import_manifest_url,
+                        placeholder="https://cdn.example.com/stream.mpd",
+                        width="100%",
+                    ),
+                    spacing="1",
+                    width="100%",
+                ),
+                rx.hstack(
+                    rx.spacer(),
+                    rx.button(
+                        rx.icon("wand-sparkles", size=14),
+                        "Parse",
+                        on_click=SettingsState.parse_drm_import,
+                        variant="soft",
+                        type="button",
+                    ),
+                    align="center",
+                    width="100%",
+                ),
+                rx.cond(
+                    SettingsState.drm_import_parsed,
+                    drm_import_preview(),
+                    rx.fragment(),
+                ),
+                spacing="3",
+                width="100%",
+            ),
+            rx.fragment(),
+        ),
+        spacing="2",
+        width="100%",
+    )
+
+
 def drm_form() -> rx.Component:
     """Add/edit form. Header values are write-only — see the note in the state."""
     editing = SettingsState.drm_editing != ""
     return rx.vstack(
+        drm_import_box(),
+        rx.divider(),
         rx.heading(
             rx.cond(editing, "Edit provider", "Add provider"),
             size="3",
