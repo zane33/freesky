@@ -193,7 +193,7 @@ class SettingsState(rx.State):
         self.users = users.list_users()
         self.trusted_networks = ", ".join(app_settings.trusted_networks())
         self.sources = channel_prefs.sources()
-        self.load_drm()
+        self._load_drm()
 
     @rx.event
     async def refresh(self):
@@ -348,11 +348,13 @@ class SettingsState(rx.State):
 
     # --- DRM providers ------------------------------------------------------
 
-    def load_drm(self) -> None:
+    def _load_drm(self) -> None:
         """Refresh drm_list from disk, header values stripped.
 
-        Not an @rx.event: called from on_load and from the handlers below, so it
-        stays a plain method rather than something the client can trigger.
+        Underscore-prefixed on purpose. Reflex wraps every PUBLIC state method in
+        an EventHandler, so a public `load_drm` would return an EventSpec when
+        called as `self.load_drm()` from another handler — the body would never
+        run and the list would silently stay empty.
         """
         rows = []
         for provider in drm_providers.list_providers():
@@ -435,7 +437,7 @@ class SettingsState(rx.State):
         provider = drm_providers.get_provider(name)
         if provider is None:
             self.drm_error = f"Provider '{name}' no longer exists"
-            self.load_drm()
+            self._load_drm()
             return
         self.drm_editing = provider["name"]
         self.drm_name = provider["name"]
@@ -489,7 +491,7 @@ class SettingsState(rx.State):
         if self.drm_editing and self.drm_editing != saved["name"]:
             drm_providers.delete_provider(self.drm_editing)
         self.reset_drm_form()
-        self.load_drm()
+        self._load_drm()
         return rx.toast(f"Saved DRM provider '{saved['name']}'")
 
     @rx.event
@@ -497,7 +499,7 @@ class SettingsState(rx.State):
         """Flip one provider on or off without opening the edit form."""
         provider = drm_providers.get_provider(name)
         if provider is None:
-            self.load_drm()
+            self._load_drm()
             return
         provider["enabled"] = not provider["enabled"]
         try:
@@ -505,7 +507,7 @@ class SettingsState(rx.State):
             self.drm_error = ""
         except DRMProviderError as e:
             self.drm_error = str(e)
-        self.load_drm()
+        self._load_drm()
 
     # --- import from a Kodi license key string ------------------------------
 
@@ -526,7 +528,7 @@ class SettingsState(rx.State):
     def _set_drm_preview(self, record: dict) -> None:
         """Project a parsed record into the browser-visible preview vars.
 
-        Header NAMES only, for the same reason `load_drm` strips them: this state
+        Header NAMES only, for the same reason `_load_drm` strips them: this state
         is serialised over the Reflex socket, and a license header value is a
         credential.
         """
@@ -624,7 +626,7 @@ class SettingsState(rx.State):
             return
         self.reset_drm_import()
         self.drm_import_open = False
-        self.load_drm()
+        self._load_drm()
         return rx.toast(f"Imported DRM provider '{saved['name']}'")
 
     @rx.event
@@ -643,7 +645,7 @@ class SettingsState(rx.State):
         self.drm_confirm_delete = ""
         if self.drm_editing == name:
             self.reset_drm_form()
-        self.load_drm()
+        self._load_drm()
         return rx.toast(
             f"Deleted DRM provider '{name}'" if removed else f"'{name}' was already gone"
         )
