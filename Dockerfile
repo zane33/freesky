@@ -50,20 +50,34 @@ ENV PORT=${PORT:-3000} \
 # Initialize Reflex and build frontend
 # ponytail: no `|| minimal frontend` fallback. It swallowed the real rolldown
 # error and shipped a "successful" image serving a 152-byte stub. Fail loudly.
-RUN echo "Building frontend with API_URL=$API_URL" && \
-    echo "Reflex version: $(reflex --version)" && \
-    mkdir -p /srv && \
-    cd /app && \
-    reflex init && \
-    cd .web && \
-    npm config set strict-ssl false && \
-    npm config set registry https://registry.npmjs.org/ && \
-    npm install --legacy-peer-deps && \
-    cd .. && \
-    reflex export --frontend-only --no-zip && \
-    mv .web/build/client/* /srv/ && \
-    rm -rf .web && \
-    echo "Frontend build successful - contents of /srv:" && \
+# Each stage announces itself before it runs, so a failure names the step that
+# broke instead of reporting one exit code for the whole chain. `set -e` keeps
+# the original fail-loudly behaviour -- there is deliberately no fallback that
+# would ship an image serving a stub page.
+RUN set -e; \
+    echo "=== [1/5] environment ==="; \
+    echo "API_URL=$API_URL"; \
+    echo "reflex: $(reflex --version)"; \
+    echo "node:   $(node --version)"; \
+    echo "npm:    $(npm --version)"; \
+    mkdir -p /srv; \
+    cd /app; \
+    echo "=== [2/5] reflex init ==="; \
+    reflex init; \
+    echo "=== [3/5] npm install ==="; \
+    cd .web; \
+    npm config set strict-ssl false; \
+    npm config set registry https://registry.npmjs.org/; \
+    npm install --legacy-peer-deps; \
+    cd ..; \
+    echo "=== [4/5] reflex export (bundling) ==="; \
+    reflex export --frontend-only --no-zip; \
+    echo "=== [5/5] publishing to /srv ==="; \
+    test -d .web/build/client || { echo "ERROR: .web/build/client missing - export produced no output"; ls -la .web || true; exit 1; }; \
+    mv .web/build/client/* /srv/; \
+    rm -rf .web; \
+    test -f /srv/index.html || { echo "ERROR: /srv/index.html missing after export"; exit 1; }; \
+    echo "Frontend build successful - contents of /srv:"; \
     ls -la /srv/
 
 # Final image with only necessary files
