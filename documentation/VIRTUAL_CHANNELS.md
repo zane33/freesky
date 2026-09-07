@@ -286,6 +286,23 @@ What helps, in order:
    on, the startup log in the control panel names the stage; turn it back off.
 4. Otherwise, 1080p30 or 720p50 are the honest options for a CPU-only host.
 
+**Is there a cheaper architecture?** Researched, and no, not for a page whose
+player uses DRM. The only path that skips compositing altogether is
+`video.captureStream()` on the `<video>` element itself (decoded frames at
+their native rate and size, no page composite, no capture copy), and Chromium
+refuses it for Encrypted Media. Proxying the site's own manifest instead of
+rendering is likewise off the table for encrypted streams. The diagnostics
+endpoint now reports `drm` per video element so this can be checked for a
+given page; for an unencrypted page that shortcut would be worth building.
+Every other approach (CDP screencast, headless `beginFrame`, screen grabbing)
+is less efficient than tab capture, not more. What actually moves the needle
+is hardware: VA-API decode takes the 1080p50 H.264 decode off the CPU, EGL
+compositing takes the serial compositor thread off it, and
+`AcceleratedVideoEncoder` lets MediaRecorder encode on the iGPU instead of
+OpenH264 -- Chromium marks H.264 VA-API encode "not power efficient" on Linux
+and may still decline it, in which case decode and compositing alone are the
+gain.
+
 ## One worker, always
 
 The backend must run as a **single** granian worker process. `start.sh` enforces
@@ -375,7 +392,8 @@ All optional. Defaults are in `docker-compose.yml`.
 | `VIRTUAL_CAPTURE_TIMESLICE_MS` | `250` | How often the recorder emits a chunk. |
 | `VIRTUAL_CAPTURE_EXT_DIR` | `freesky/virtual_capture_ext` | The unpacked extension. |
 | `VIRTUAL_DISPLAY_TCP` | unset | Development only: talk to Xvfb over TCP loopback instead of the unix socket, for machines where `/tmp/.X11-unix` is not writable (WSL). Never needed in Docker. |
-| `VIRTUAL_GPU` | unset | `1` switches Chromium to EGL compositing and VA-API decode on `/dev/dri` (must be mapped into the container). Experimental; see [1080p and high frame rates](#1080p-and-high-frame-rates). |
+| `VIRTUAL_GPU` | unset | `1` switches Chromium to EGL compositing, VA-API decode and VA-API encode on `/dev/dri` (must be mapped into the container). Experimental; see [1080p and high frame rates](#1080p-and-high-frame-rates). |
+| `VIRTUAL_GPU_ANGLE` | `gl-egl` | ANGLE backend in GPU mode. Chromium's docs say `gl`; `gl-egl` is what works without GLX under Xvfb. |
 | `CPU_LIMIT` | `4` | Container CPU quota. See `CPUSET`. |
 | `CPUSET` | unset | Pin the container to these cores (e.g. `0-3`) instead of metering it with a quota. Prefer this: a quota pauses the whole container when spent, which stutters the stream. |
 | `VIRTUAL_CONTROL_FPS` | `10` | Preview frame rate. |

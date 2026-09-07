@@ -254,6 +254,10 @@ ENCODER_THREADS = int(os.environ.get("VIRTUAL_ENCODER_THREADS", "2"))
 # line reports whether /dev/dri is visible so it can be tried deliberately.
 GPU = os.environ.get("VIRTUAL_GPU", "").strip() == "1"
 GPU_DEVICE = "/dev/dri/renderD128"
+# ANGLE backend for GPU mode. Chromium's vaapi.md documents "gl"; "gl-egl"
+# (EGL on the render node, no GLX) is what containerised setups under Xvfb
+# generally need, so it is the default. Override if chrome://gpu disagrees.
+GPU_ANGLE = os.environ.get("VIRTUAL_GPU_ANGLE", "").strip() or "gl-egl"
 RASTER_THREADS = int(os.environ.get("VIRTUAL_RASTER_THREADS", "2"))
 
 SEGMENT_SECONDS = int(os.environ.get("VIRTUAL_SEGMENT_SECONDS", "2"))
@@ -898,15 +902,20 @@ class VirtualSession:
         if not GPU:
             return ["--disable-gpu", "--disable-software-rasterizer"]
         return [
-            "--use-gl=angle", "--use-angle=gl-egl",
+            "--use-gl=angle", f"--use-angle={GPU_ANGLE}",
             "--ignore-gpu-blocklist",
             "--enable-gpu-rasterization", "--enable-zero-copy",
-            # A second --enable-features occurrence replaces Playwright's
-            # (CDPScreenshotNewSurface, screenshot-only), which is acceptable
-            # here and only here.
-            "--enable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,"
-            "VaapiIgnoreDriverChecks,AcceleratedVideoDecodeLinuxGL",
-            "--disable-features=UseChromeOSDirectVideoDecoder",
+            # Feature names per Chromium's docs/gpu/vaapi.md (checked against
+            # the M149 build this ships): AcceleratedVideoDecodeLinuxGL is the
+            # VA-API decode path, AcceleratedVideoEncoder the VA-API encode path
+            # that MediaRecorder's H.264 encoder can then use instead of
+            # OpenH264 in software (VaapiVideoEncoder was renamed to it in
+            # M131 and is a no-op now). A second --enable-features occurrence
+            # replaces Playwright's (CDPScreenshotNewSurface, screenshot-only),
+            # which is acceptable here and only here.
+            "--enable-features=AcceleratedVideoDecodeLinuxGL,"
+            "AcceleratedVideoDecodeLinuxZeroCopyGL,AcceleratedVideoEncoder,"
+            "VaapiIgnoreDriverChecks",
         ]
 
     def _capture_args(self) -> list:
@@ -1662,6 +1671,11 @@ class VirtualSession:
             const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
             const info = {
               size: [v.videoWidth, v.videoHeight],
+              // Encrypted Media (Widevine etc.). Decides which shortcuts are
+              // possible: a DRM'd element cannot be captured by
+              // video.captureStream(), and its manifest cannot be proxied.
+              drm: !!v.mediaKeys,
+              src: (v.currentSrc || "").slice(0, 60),
               paused: v.paused, muted: v.muted, readyState: v.readyState,
               currentTime: Math.round(v.currentTime * 10) / 10,
               dropped: q ? q.droppedVideoFrames : null,

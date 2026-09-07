@@ -1477,7 +1477,9 @@ def test_gpu_mode_swaps_software_rendering_flags(monkeypatch):
     gpu = virtual_session.VirtualSession(_tab(), 99)._browser_args()
     assert "--disable-gpu" not in gpu and "--disable-software-rasterizer" not in gpu
     assert "--use-gl=angle" in gpu and "--use-angle=gl-egl" in gpu
-    assert any(a.startswith("--enable-features=") and "VaapiVideoDecoder" in a for a in gpu)
+    feats = next(a for a in gpu if a.startswith("--enable-features="))
+    assert "AcceleratedVideoDecodeLinuxGL" in feats and "AcceleratedVideoEncoder" in feats
+    assert "VaapiVideoEncoder" not in feats, "renamed in M131; the old name is a no-op"
 
 
 def test_host_load_reports_hardware(client):
