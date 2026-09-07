@@ -1253,10 +1253,7 @@ class VirtualSession:
         """
         assert self._context is not None
         try:
-            workers = self._context.service_workers
-            worker = workers[0] if workers else await self._context.wait_for_event(
-                "serviceworker", timeout=15000
-            )
+            worker = await self._extension_worker()
         except Exception as exc:
             raise VirtualSessionError(
                 "Tab capture extension did not start (is freesky/virtual_capture_ext "
@@ -1295,6 +1292,34 @@ class VirtualSession:
                 f"{CAPTURE_WS_BASE} (VIRTUAL_CAPTURE_WS)"
             ) from None
 
+    async def _extension_worker(self, timeout: float = 20.0):
+        """The capture extension's service worker, waiting for it if needed.
+
+        Not `context.service_workers[0]`: a site can register a service worker
+        of its own (Sky Sport does), and it is often first in the list. Picking
+        it produced "ReferenceError: startCapture is not defined" -- the
+        function was being looked for in the wrong worker. Match on the
+        extension's origin instead, and retry briefly in case the worker exists
+        but its script has not finished evaluating its globals.
+        """
+        prefix = f"chrome-extension://{extension_id()}/"
+        deadline = time.monotonic() + timeout
+        while True:
+            for worker in self._context.service_workers:
+                if worker.url.startswith(prefix):
+                    try:
+                        if await worker.evaluate("() => typeof startCapture === 'function'"):
+                            return worker
+                    except Exception:
+                        pass  # still evaluating its script; retry below
+            if time.monotonic() >= deadline:
+                seen = [w.url for w in self._context.service_workers]
+                raise VirtualSessionError(
+                    f"no service worker for extension {extension_id()} "
+                    f"(workers present: {seen or 'none'})"
+                )
+            await asyncio.sleep(0.25)
+
     def accepts_capture(self, key: str) -> bool:
         """True when `key` is this session's live capture secret."""
         return bool(key) and secrets.compare_digest(key, self.capture_secret) \
@@ -1327,10 +1352,10 @@ class VirtualSession:
         out = {"mode": "tab", "connected": self.capture_connected,
                "bytes": self.capture_bytes, "chunks": self.capture_chunks}
         try:
-            workers = self._context.service_workers if self._context else []
-            if workers:
+            if self._context is not None:
+                worker = await self._extension_worker(timeout=2)
                 out["recorder"] = await asyncio.wait_for(
-                    workers[0].evaluate("() => captureStatus()"), timeout=5
+                    worker.evaluate("() => captureStatus()"), timeout=5
                 )
         except Exception as exc:
             out["recorder"] = {"error": f"{type(exc).__name__}: {exc}"}

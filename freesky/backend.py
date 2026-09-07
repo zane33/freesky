@@ -2219,8 +2219,14 @@ async def virtual_control_panel(name: str, request: Request):
         "crop": {"x": record["crop_x"], "y": record["crop_y"],
                  "w": record["crop_w"], "h": record["crop_h"]},
     })
-    return Response(content=_CONTROL_PANEL_HTML.replace("__CONFIG__", cfg),
-                    media_type="text/html")
+    page = (_CONTROL_PANEL_HTML
+            .replace("__CONFIG__", cfg)
+            # The stage reserves the picture's shape before any frame arrives,
+            # so the startup card sits where the live view will be and nothing
+            # jumps when it appears.
+            .replace("__MAXW__", str(width))
+            .replace("__ASPECT__", f"{width} / {height}"))
+    return Response(content=page, media_type="text/html")
 
 
 # Kept at module level rather than in a template file so the backend stays
@@ -2233,31 +2239,50 @@ _CONTROL_PANEL_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FreeSky - virtual channel control</title>
 <style>
-  :root { color-scheme: dark; }
-  body { margin: 0; background: #16161a; color: #e6e6e6;
-         font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-  header { display: flex; gap: .5rem; align-items: center; padding: .6rem .8rem;
-           background: #1f1f24; border-bottom: 1px solid #33333a; flex-wrap: wrap; }
-  h1 { font-size: 15px; margin: 0 .5rem 0 0; font-weight: 600; }
-  button { background: #2c2c33; color: #e6e6e6; border: 1px solid #44444d;
-           border-radius: 6px; padding: .35rem .7rem; cursor: pointer; font-size: 13px; }
-  button:hover { background: #383840; }
+  :root { color-scheme: dark;
+          --bg: #121216; --panel: #1c1c22; --line: #2e2e36; --text: #e8e8ee;
+          --muted: #9a9aa5; --accent: #4f8cff; --ok: #3ddc84; --err: #ff6b62;
+          --warn: #ffb347; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         min-height: 100vh; display: flex; flex-direction: column; }
+  header { display: flex; gap: .5rem; align-items: center; padding: .55rem .8rem;
+           background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  h1 { font-size: 15px; margin: 0 .25rem 0 0; font-weight: 600; white-space: nowrap; }
+  #pill { font-size: 11px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase;
+          padding: .15rem .55rem; border-radius: 999px; border: 1px solid var(--line);
+          color: var(--muted); display: inline-flex; align-items: center; gap: .4rem; margin-right: .5rem; }
+  #pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  #pill[data-state=starting], #pill[data-state=reconnecting] { color: var(--warn); }
+  #pill[data-state=starting]::before, #pill[data-state=reconnecting]::before { animation: blink 1s infinite; }
+  #pill[data-state=live] { color: var(--ok); border-color: rgba(61,220,132,.35); }
+  #pill[data-state=error] { color: var(--err); border-color: rgba(255,107,98,.35); }
+  @keyframes blink { 50% { opacity: .25; } }
+  button { background: #2a2a32; color: var(--text); border: 1px solid #40404a;
+           border-radius: 7px; padding: .38rem .75rem; cursor: pointer; font-size: 13px;
+           transition: background .12s, opacity .12s; }
+  button:hover:not(:disabled) { background: #363640; }
+  button:disabled { opacity: .38; cursor: not-allowed; }
   button.on { background: #d4342c; border-color: #d4342c; }
-  input[type=text] { flex: 1; min-width: 12rem; background: #121215; color: #e6e6e6;
-           border: 1px solid #44444d; border-radius: 6px; padding: .35rem .6rem;
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  input[type=text] { flex: 1; min-width: 12rem; background: #0f0f13; color: var(--text);
+           border: 1px solid #40404a; border-radius: 7px; padding: .38rem .6rem;
            font-family: ui-monospace, monospace; font-size: 12px; }
-  #stage { display: flex; justify-content: center; padding: 1rem; }
-  /* Wraps the image so the crop overlay can be positioned against exactly the
-     rendered picture, not the padded stage around it. */
-  #shell { position: relative; display: inline-block; line-height: 0; }
+  input[type=text]:disabled { opacity: .38; }
+  #stage { flex: 1; display: flex; justify-content: center; align-items: flex-start; padding: 1rem; }
+  /* Wraps the image so the crop overlay and the startup/error cards can be
+     positioned against exactly the rendered picture, not the padded stage. */
+  #shell { position: relative; display: inline-block; line-height: 0; width: 100%;
+           max-width: __MAXW__px; aspect-ratio: __ASPECT__; background: #000;
+           border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
   /* The frame is the coordinate reference for every pointer event, so it must
      never be stretched: any non-uniform scale would misplace clicks. */
-  #frame { max-width: 100%; height: auto; background: #000; display: block;
-           border: 1px solid #33333a; border-radius: 6px; cursor: crosshair; }
+  #frame { width: 100%; height: auto; display: block; cursor: crosshair;
+           opacity: 0; transition: opacity .35s ease; }
+  #frame.ready { opacity: 1; }
   /* Overlay pieces are pointer-events:none so they never swallow a drag or a
      click meant for the page underneath. */
-  #shade { position: absolute; inset: 0; pointer-events: none;
-           background: rgba(0,0,0,.55); display: none; }
   #cropbox { position: absolute; pointer-events: none; display: none;
              border: 1px solid #ffd54f; outline: 1px solid rgba(0,0,0,.6);
              box-shadow: 0 0 0 9999px rgba(0,0,0,.55); }
@@ -2265,29 +2290,88 @@ _CONTROL_PANEL_HTML = r"""<!doctype html>
      the rest -- the admin still needs to see and drive the whole page. */
   #cropbox.saved { border-color: #7ee787; box-shadow: none; }
   #croplabel { position: absolute; top: -1.35rem; left: 0; white-space: nowrap;
-               background: #1f1f24; border: 1px solid #44444d; border-radius: 4px;
-               padding: 0 .3rem; font: 11px/1.5 ui-monospace, monospace;
-               color: #e6e6e6; line-height: 1.5; }
+               background: var(--panel); border: 1px solid #44444d; border-radius: 4px;
+               padding: 0 .3rem; font: 11px/1.5 ui-monospace, monospace; color: var(--text); }
   body.cropping #frame { cursor: crosshair; }
-  #status { padding: 0 .8rem .8rem; color: #9a9aa5; font-size: 12px; }
-  .err { color: #ff8a80; }
+
+  /* Cards shown over the stage while there is no picture. */
+  .card { position: absolute; inset: 0; display: flex; flex-direction: column;
+          align-items: center; justify-content: center; gap: .9rem; padding: 1.5rem;
+          line-height: 1.45; text-align: center;
+          background: radial-gradient(ellipse at center, #1b1b21 0%, #101014 75%); }
+  .card[hidden] { display: none; }
+  .card h2 { margin: 0; font-size: 17px; font-weight: 600; }
+  .card p { margin: 0; color: var(--muted); font-size: 13px; max-width: 34rem; }
+  .spinner { width: 34px; height: 34px; border-radius: 50%; border: 3px solid #2e2e36;
+             border-top-color: var(--accent); animation: spin .9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #steps { list-style: none; margin: .25rem 0 0; padding: 0; text-align: left;
+           display: grid; gap: .35rem; font-size: 13px; min-width: 18rem; }
+  #steps li { display: flex; align-items: center; gap: .6rem; color: var(--muted); }
+  #steps li .dot { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid #4a4a55; flex: none; }
+  #steps li.active { color: var(--text); }
+  #steps li.active .dot { border-color: var(--accent); background: var(--accent);
+                          box-shadow: 0 0 0 4px rgba(79,140,255,.2); animation: pulse 1.2s infinite; }
+  #steps li.done { color: #c9c9d2; }
+  #steps li.done .dot { border-color: var(--ok); background: var(--ok); }
+  #steps li.failed .dot { border-color: var(--err); background: var(--err); }
+  #steps li.skipped { opacity: .45; }
+  #steps li.skipped span:last-child { text-decoration: line-through; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(79,140,255,.08); } }
+  #elapsed { font: 12px ui-monospace, monospace; color: var(--muted); }
+  .icon-err { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center;
+              background: rgba(255,107,98,.15); color: var(--err); font-size: 22px; font-weight: 700; }
+  #errmsg { color: var(--text); font-family: ui-monospace, monospace; font-size: 12.5px;
+            background: #0f0f13; border: 1px solid var(--line); border-radius: 6px;
+            padding: .6rem .8rem; max-width: 40rem; white-space: pre-wrap; text-align: left; }
+  details { color: var(--muted); font-size: 12px; max-width: 40rem; width: 100%; }
+  details pre { text-align: left; font-size: 11px; line-height: 1.4; max-height: 12rem; overflow: auto;
+                background: #0f0f13; border: 1px solid var(--line); border-radius: 6px; padding: .5rem .7rem; }
+  #reconnect { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+               gap: .6rem; background: rgba(0,0,0,.55); color: var(--text); pointer-events: none; }
+  #reconnect[hidden] { display: none; }
+  #status { padding: .2rem .8rem .8rem; color: var(--muted); font-size: 12px; }
+  .err { color: var(--err); }
+  .hint { padding: 0 .8rem .8rem; color: #6f6f7b; font-size: 11.5px; }
+  body[data-state=starting] .hint, body[data-state=error] .hint { display: none; }
 </style>
 </head>
-<body>
+<body data-state="starting">
 <header>
   <h1 id="title">virtual channel</h1>
-  <button id="toggle">Take control</button>
-  <button data-nav="back">&#8592;</button>
-  <button data-nav="forward">&#8594;</button>
-  <button data-nav="reload">&#8635;</button>
-  <input type="text" id="url" spellcheck="false">
-  <button id="go">Go</button>
-  <button id="cropmode" title="Drag a rectangle on the live view to choose the region that gets streamed">Crop</button>
+  <span id="pill" data-state="starting">Starting</span>
+  <button id="toggle" disabled>Take control</button>
+  <button data-nav="back" disabled title="Back">&#8592;</button>
+  <button data-nav="forward" disabled title="Forward">&#8594;</button>
+  <button data-nav="reload" disabled title="Reload the page">&#8635;</button>
+  <input type="text" id="url" spellcheck="false" disabled>
+  <button id="go" disabled>Go</button>
+  <button id="cropmode" disabled title="Drag a rectangle on the live view to choose the region that gets streamed">Crop</button>
   <button id="cropapply" hidden>Apply crop</button>
   <button id="cropclear" hidden>Full screen</button>
 </header>
-<div id="stage"><div id="shell"><img id="frame" alt="live view"><div id="cropbox"><span id="croplabel"></span></div></div></div>
+<div id="stage"><div id="shell">
+  <img id="frame" alt="live view">
+  <div id="cropbox"><span id="croplabel"></span></div>
+  <div id="boot" class="card">
+    <div class="spinner"></div>
+    <h2>Starting the session</h2>
+    <p>Bringing up a private display, a browser and an encoder for this channel. A cold start can take up to a minute on a slow page; a warm one a few seconds.</p>
+    <ul id="steps"></ul>
+    <div id="elapsed">0s</div>
+  </div>
+  <div id="errbox" class="card" hidden>
+    <div class="icon-err">!</div>
+    <h2>The session could not start</h2>
+    <div id="errmsg"></div>
+    <p>Nothing is running for this channel. Fix the cause and try again; the startup log below names the stage that failed.</p>
+    <button id="retry" class="primary">Try again</button>
+    <details><summary>Startup log</summary><pre id="errlog"></pre></details>
+  </div>
+  <div id="reconnect" hidden><div class="spinner"></div><span>Reconnecting live view&hellip;</span></div>
+</div></div>
 <div id="status">Starting session&hellip;</div>
+<div class="hint">Take control to send clicks, scrolling and typing to the remote browser. Crop to choose the region viewers get. What you see here is the X display the encoder captures.</div>
 
 <script>
 const CFG = __CONFIG__;
@@ -2305,6 +2389,20 @@ urlEl.value = CFG.url;
 function say(msg, isErr) {
   statusEl.textContent = msg;
   statusEl.className = isErr ? "err" : "";
+}
+
+// --- page state ------------------------------------------------------------
+// One of: starting | live | error | reconnecting. Everything the toolbar can do
+// needs a running browser, so the buttons follow this rather than each
+// handler checking on its own.
+const pill = document.getElementById("pill");
+const toolbar = document.querySelectorAll("header button, header input");
+function setState(state, label) {
+  document.body.dataset.state = state;
+  pill.dataset.state = state;
+  pill.textContent = label || state;
+  const ready = state === "live" || state === "reconnecting";
+  toolbar.forEach(el => { if (el.id !== "retry") el.disabled = !ready; });
 }
 
 async function post(path, body) {
@@ -2564,21 +2662,179 @@ document.getElementById("go").addEventListener("click", async () => {
   }
 });
 
-// Start the session before wiring the frame up: the browser may not be running
-// yet, and pointing <img> at the stream first would just 409 and show nothing.
-(async () => {
+// --- startup -----------------------------------------------------------------
+// Starting a session spawns an X server, an audio daemon, a browser and an
+// encoder, and can take most of a minute on a slow page. The backend records
+// each stage in a breadcrumb trail as it goes (/api/virtual-sessions/trace),
+// so the panel can show which stage it is actually on instead of a spinner
+// that says nothing for 60 seconds.
+const STEPS = [
+  {key: "lock",     label: "Claiming the channel"},
+  {key: "xvfb",     label: "Starting the virtual display"},
+  {key: "pulse",    label: "Setting up audio", optional: true},
+  {key: "browser",  label: "Launching the browser and loading the page"},
+  {key: "ffmpeg",   label: "Starting the encoder"},
+  {key: "capture",  label: "Connecting the capture feed", optional: true},
+];
+const stepsEl = document.getElementById("steps");
+const elapsedEl = document.getElementById("elapsed");
+const errBox = document.getElementById("errbox");
+const errMsg = document.getElementById("errmsg");
+const errLog = document.getElementById("errlog");
+const bootCard = document.getElementById("boot");
+const liveOverlay = document.getElementById("reconnect");
+let tracePoll = null, tick = null, startedAt = 0;
+
+function renderSteps(lines) {
+  // Stage names in the trail look like "xvfb:begin" / "xvfb:ok"; "sink" and
+  // "pulse" are both audio; "segments" belongs to the player path, not here.
+  const seen = {};
+  for (const ln of lines) {
+    const m = ln.match(/ (lock|xvfb|pulse|sink|browser|ffmpeg|capture|start):([a-z-]+)/);
+    if (!m) continue;
+    const key = m[1] === "sink" ? "pulse" : m[1];
+    seen[key] = (m[2] === "ok" || m[2] === "complete") ? "done"
+              : (m[2] === "failed") ? "failed"
+              : (seen[key] === "done" ? "done" : "active");
+  }
+  const complete = seen.start === "done";
+  stepsEl.innerHTML = "";
+  let activeShown = false;
+  for (const st of STEPS) {
+    let cls = seen[st.key] || "pending";
+    if (complete) cls = (cls === "pending" && st.optional) ? "skipped" : "done";
+    if (cls === "pending" && !activeShown && !complete) {
+      // The first pending step after the last done one is the one in flight
+      // when the trail lags a little behind the process.
+      const prev = STEPS.slice(0, STEPS.indexOf(st)).every(p => (seen[p.key] || (p.optional ? "done" : "")) === "done");
+      if (prev) { cls = "active"; }
+    }
+    if (cls === "active") activeShown = true;
+    const li = document.createElement("li");
+    li.className = cls;
+    li.innerHTML = '<span class="dot"></span><span>' + st.label + "</span>";
+    stepsEl.appendChild(li);
+  }
+}
+
+async function pollTrace() {
   try {
-    say("Starting session (this can take up to a minute on a slow page)...");
+    const res = await fetch("/api/virtual-sessions/trace" + qs, {cache: "no-store"});
+    if (!res.ok) return;
+    const t = await res.json();
+    const lines = (t.lines || []);
+    // The trail is per backend, not per channel: only trust it if the last
+    // attempt it describes is this channel.
+    const attempt = lines.find(l => / attempt /.test(l));
+    if (attempt && attempt.indexOf("channel=" + CFG.name + " ") === -1) return;
+    renderSteps(lines);
+    return lines;
+  } catch (e) { /* the panel keeps its last picture of the stages */ }
+}
+
+function showBoot() {
+  bootCard.hidden = false;
+  errBox.hidden = true;
+  frame.classList.remove("ready");
+  startedAt = performance.now();
+  renderSteps([]);
+  clearInterval(tick);
+  tick = setInterval(() => {
+    const s = Math.round((performance.now() - startedAt) / 1000);
+    elapsedEl.textContent = s + "s" + (s >= 45 ? " - slow page, still working" : "");
+  }, 1000);
+  clearInterval(tracePoll);
+  tracePoll = setInterval(pollTrace, 700);
+}
+
+function stopBootUi() {
+  clearInterval(tick); clearInterval(tracePoll);
+}
+
+function showError(message) {
+  stopBootUi();
+  bootCard.hidden = true;
+  errBox.hidden = false;
+  errMsg.textContent = message;
+  setState("error", "Failed");
+  say("Could not start the session: " + message, true);
+  // The startup log is the thing to read when the message is not enough.
+  pollTrace().then(lines => { errLog.textContent = (lines || []).slice(-25).join("\n") || "(no startup log)"; });
+}
+
+// The <img> is a multipart JPEG stream. Waiting for its first real frame,
+// rather than for the start request to return, is what stops the panel
+// showing a black rectangle labelled "live".
+function waitForFirstFrame(timeoutMs) {
+  return new Promise(resolve => {
+    const t0 = performance.now();
+    const check = () => {
+      if (frame.naturalWidth > 0) return resolve(true);
+      if (performance.now() - t0 > timeoutMs) return resolve(false);
+      setTimeout(check, 200);
+    };
+    check();
+  });
+}
+
+function attachStream() {
+  frame.src = base + "/stream.mjpeg" + qs + "&t=" + Date.now();
+}
+
+async function goLive() {
+  attachStream();
+  const ok = await waitForFirstFrame(20000);
+  stopBootUi();
+  bootCard.hidden = true;
+  frame.classList.add("ready");
+  liveOverlay.hidden = true;
+  setState("live", "Live");
+  redrawCrop();
+  say(ok ? "Viewing only. This is exactly what viewers see. Press “Take control” to drive the browser."
+         : "The session is running but the preview has not produced a frame yet.", !ok);
+}
+
+async function startSession() {
+  setState("starting", "Starting");
+  showBoot();
+  say("Starting the session. A cold start can take up to a minute on a slow page.");
+  try {
     const r = await post("/start", {});
     if (r.url) urlEl.value = r.url;
-    frame.src = base + "/stream.mjpeg" + qs + "&t=" + Date.now();
-    say("Viewing only. Press “Take control” to drive the browser.");
+    // One last read so the stepper shows every stage done before it goes.
+    await pollTrace();
+    await goLive();
   } catch (e) {
-    say("Could not start the session: " + e.message, true);
+    showError(e.message);
   }
-})();
+}
 
-frame.addEventListener("error", () => say("Live view disconnected - reload this page.", true));
+document.getElementById("retry").addEventListener("click", startSession);
+
+// The preview stream drops when the session is rebuilt (a crop change, a
+// stalled-session restart) or when the proxy times it out. Reconnect on its
+// own with a short backoff instead of asking the admin to reload the page.
+let reconnectDelay = 1000;
+frame.addEventListener("error", async () => {
+  if (document.body.dataset.state !== "live" && document.body.dataset.state !== "reconnecting") return;
+  setState("reconnecting", "Reconnecting");
+  liveOverlay.hidden = false;
+  say("Live view dropped - reconnecting…");
+  await new Promise(r => setTimeout(r, reconnectDelay));
+  reconnectDelay = Math.min(reconnectDelay * 2, 8000);
+  attachStream();
+  if (await waitForFirstFrame(10000)) {
+    reconnectDelay = 1000;
+    liveOverlay.hidden = true;
+    setState("live", "Live");
+    say("Live view reconnected.");
+  } else {
+    frame.dispatchEvent(new Event("error"));
+  }
+});
+
+setState("starting", "Starting");
+startSession();
 </script>
 </body>
 </html>

@@ -1438,3 +1438,31 @@ def test_capture_ws_base_ignores_an_empty_environment_value(monkeypatch):
     finally:
         monkeypatch.delenv("VIRTUAL_CAPTURE_WS")
         importlib.reload(virtual_session)
+
+
+def test_capture_uses_the_extension_service_worker_not_the_sites():
+    """A site with its own service worker (Sky Sport) put it first in
+    context.service_workers; evaluating startCapture there raised
+    "ReferenceError: startCapture is not defined". Select by extension origin."""
+    import asyncio
+
+    class _Worker:
+        def __init__(self, url, has_fn):
+            self.url, self.has_fn = url, has_fn
+
+        async def evaluate(self, expr, *a):
+            return self.has_fn
+
+    class _Ctx:
+        def __init__(self, workers):
+            self.service_workers = workers
+
+    session = virtual_session.VirtualSession(_tab(), 99)
+    ext = f"chrome-extension://{virtual_session.extension_id()}/sw.js"
+    site = _Worker("https://www.skysportnow.co.nz/sw.js", False)
+    ours = _Worker(ext, True)
+    session._context = _Ctx([site, ours])
+    assert asyncio.run(session._extension_worker(timeout=1)) is ours
+    session._context = _Ctx([site])
+    with pytest.raises(virtual_session.VirtualSessionError, match="no service worker"):
+        asyncio.run(session._extension_worker(timeout=0.3))
