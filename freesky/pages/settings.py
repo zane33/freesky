@@ -146,6 +146,9 @@ class SettingsState(rx.State):
     # form the whole record can be round-tripped to the browser.
     vc_list: List[dict] = []
     vc_error: str = ""
+    # The admin's own token, kept so a list refresh outside on_load can rebuild
+    # each row's control_url.
+    vc_token: str = ""
     vc_confirm_delete: str = ""
     # Running sessions, refreshed on demand rather than polled: each entry costs
     # a browser and an encoder, so there are never many, and a poll would keep
@@ -244,13 +247,25 @@ class SettingsState(rx.State):
     def set_vc_enabled(self, value: bool):
         self.vc_enabled = value
 
-    def _load_virtual(self):
-        """Re-read the store into the list the page renders."""
+    def _load_virtual(self, token: str = ""):
+        """Re-read the store into the list the page renders.
+
+        `control_url` is baked into each row so the Control button can be a
+        plain link. It used to be a window.open() issued from an event handler,
+        which browsers block as an unrequested popup: the call arrives over the
+        Reflex socket, so it is not in the user-gesture call stack and the
+        browser has no reason to trust it.
+        """
         try:
-            self.vc_list = virtual_channels.list_channels()
+            rows = virtual_channels.list_channels()
         except Exception as exc:  # a corrupt store must not blank the page
             self.vc_list = []
             self.vc_error = f"Could not read virtual channels: {exc}"
+            return
+        suffix = f"?token={token}" if token else ""
+        for row in rows:
+            row["control_url"] = f"/api/virtual-control/{row['name']}/panel{suffix}"
+        self.vc_list = rows
 
     @rx.event
     def reset_vc_form(self):
@@ -335,7 +350,7 @@ class SettingsState(rx.State):
         except virtual_channels.VirtualChannelError as exc:
             self.vc_error = str(exc)
             return
-        self._load_virtual()
+        self._load_virtual(self.vc_token)
         self.reset_vc_form()
         # Edits to geometry or URL only take effect on a fresh session, and an
         # admin who just changed the bitrate expects the next play to use it.
@@ -354,7 +369,7 @@ class SettingsState(rx.State):
         except virtual_channels.VirtualChannelError as exc:
             self.vc_error = str(exc)
             return
-        self._load_virtual()
+        self._load_virtual(self.vc_token)
         if not record["enabled"]:
             yield SettingsState.stop_vc_session(name)
 
@@ -370,25 +385,9 @@ class SettingsState(rx.State):
     def confirm_delete_vc(self, name: str):
         virtual_channels.delete_channel(name)
         self.vc_confirm_delete = ""
-        self._load_virtual()
+        self._load_virtual(self.vc_token)
         yield SettingsState.stop_vc_session(name)
         yield rx.toast(f"Deleted virtual channel '{name}'")
-
-    @rx.event
-    async def open_vc_control(self, name: str):
-        """Open the remote-control panel for this channel in a new tab.
-
-        The panel is a plain HTML page served by the backend, not a Reflex route:
-        faithful remote control needs raw pointer/keyboard events with exact
-        coordinates, which means real DOM listeners. It authenticates with the
-        admin's own token, so the link is only usable by whoever is signed in.
-        """
-        auth = await self.get_state(AuthState)
-        if not auth.is_admin:
-            self.vc_error = "Only an admin can control a browser session."
-            return
-        url = f"/api/virtual-control/{name}/panel?token={auth.stream_token}"
-        yield rx.call_script(f"window.open({url!r}, '_blank', 'noopener')")
 
     @rx.event
     async def refresh_vc_sessions(self):
@@ -402,7 +401,11 @@ class SettingsState(rx.State):
         from freesky import virtual_session
 
         self.vc_missing = virtual_session.preflight()
-        self.vc_sessions = virtual_session.manager.statuses()
+        suffix = f"?token={self.vc_token}" if self.vc_token else ""
+        rows = virtual_session.manager.statuses()
+        for row in rows:
+            row["control_url"] = f"/api/virtual-control/{row['name']}/panel{suffix}"
+        self.vc_sessions = rows
 
     @rx.event
     async def stop_vc_session(self, name: str):
@@ -410,7 +413,7 @@ class SettingsState(rx.State):
         from freesky import virtual_session
 
         await virtual_session.manager.stop(name)
-        self.vc_sessions = virtual_session.manager.statuses()
+        yield SettingsState.refresh_vc_sessions
 
     @rx.var
     def vc_form_title(self) -> str:
@@ -487,7 +490,8 @@ class SettingsState(rx.State):
         self.trusted_networks = ", ".join(app_settings.trusted_networks())
         self.sources = channel_prefs.sources()
         self._load_drm()
-        self._load_virtual()
+        self.vc_token = auth.stream_token
+        self._load_virtual(self.vc_token)
 
     @rx.event
     async def refresh(self):
@@ -1688,13 +1692,16 @@ def virtual_channel_row(record: dict) -> rx.Component:
                 rx.badge(rx.icon("volume-x", size=12), "silent", variant="soft", color_scheme="gray"),
             ),
             rx.spacer(),
-            rx.button(
-                rx.icon("mouse-pointer-click", size=14),
-                "Control",
-                on_click=lambda: SettingsState.open_vc_control(record["name"]),
-                size="1",
-                variant="soft",
-                title="Open the browser session and drive it with mouse and keyboard",
+            rx.link(
+                rx.button(
+                    rx.icon("mouse-pointer-click", size=14),
+                    "Control",
+                    size="1",
+                    variant="soft",
+                    title="Open the browser session and drive it with mouse and keyboard",
+                ),
+                href=record["control_url"],
+                is_external=True,
             ),
             rx.button(
                 rx.icon("pencil", size=14),
@@ -1761,11 +1768,10 @@ def virtual_session_row(session: dict) -> rx.Component:
         rx.text(f"up {session['uptime']}s", size="1", color="gray"),
         rx.text(f"idle {session['idle']}s", size="1", color="gray"),
         rx.spacer(),
-        rx.button(
-            "Control",
-            on_click=lambda: SettingsState.open_vc_control(session["name"]),
-            size="1",
-            variant="soft",
+        rx.link(
+            rx.button("Control", size="1", variant="soft"),
+            href=session["control_url"],
+            is_external=True,
         ),
         rx.button(
             "Stop",

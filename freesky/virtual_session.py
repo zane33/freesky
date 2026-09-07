@@ -231,7 +231,7 @@ class VirtualSession:
         self._ffmpeg: Optional[asyncio.subprocess.Process] = None
         self._sink_module = ""
         self._playwright = None
-        self._browser = None
+        self._context = None
         self._page = None
         self._log_tail: list = []
         # Serialises page operations. Playwright's API is not safe against two
@@ -315,7 +315,11 @@ class VirtualSession:
             # the host default happens to be.
             env["PULSE_SERVER"] = "/nonexistent"
 
+        # Fresh profile per session. Reusing one makes a second Chromium either
+        # attach to the first or refuse to start, and stale profiles grow with
+        # cache until they fill the disk.
         shutil.rmtree(self.profile_dir, ignore_errors=True)
+        os.makedirs(self.profile_dir, exist_ok=True)
 
         args = [
             "--no-sandbox", "--disable-setuid-sandbox",
@@ -333,18 +337,38 @@ class VirtualSession:
             "--no-first-run", "--no-default-browser-check",
             "--disable-features=TranslateUI",
             "--use-gl=swiftshader",
-            f"--user-data-dir={self.profile_dir}",
         ]
 
+        # launch_persistent_context, NOT launch(): Playwright rejects a
+        # --user-data-dir in args outright ("Pass user_data_dir parameter to
+        # browser_type.launch_persistent_context instead"), and that error is
+        # raised before the browser starts. A persistent profile is what we want
+        # anyway — it is how a login an admin performs through the control panel
+        # survives for the life of the session.
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=False, args=args, env=env,
-        )
-        context = await self._browser.new_context(
-            viewport={"width": self.width, "height": self.height},
-            ignore_https_errors=True,
-        )
-        self._page = await context.new_page()
+        try:
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                self.profile_dir,
+                headless=False,
+                args=args,
+                env=env,
+                # no_viewport: let the page fill the real window instead of
+                # applying a device-metrics override on top of it. The window is
+                # already exactly the Xvfb screen size, so the screenshot the
+                # control panel shows is pixel-identical to what x11grab records
+                # — an emulated viewport would be a second, redundant geometry
+                # that can silently disagree with the capture.
+                no_viewport=True,
+                ignore_https_errors=True,
+            )
+        except Exception as exc:
+            # Playwright raises its own error types. Wrap them so callers get a
+            # VirtualSessionError with a readable message instead of a 500.
+            raise VirtualSessionError(f"Could not start Chromium: {exc}") from exc
+
+        # A persistent context opens with one page already present.
+        pages = self._context.pages
+        self._page = pages[0] if pages else await self._context.new_page()
 
         try:
             await self._page.goto(self.record["url"], wait_until="domcontentloaded", timeout=45000)
@@ -530,13 +554,13 @@ class VirtualSession:
         self._ffmpeg = None
 
         for closer in (
-            getattr(self._browser, "close", None),
+            getattr(self._context, "close", None),
             getattr(self._playwright, "stop", None),
         ):
             if closer is not None:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(closer(), timeout=10)
-        self._browser = self._playwright = self._page = None
+        self._context = self._playwright = self._page = None
 
         # Leaked null-sinks accumulate and eventually exhaust module slots.
         if self._sink_module:

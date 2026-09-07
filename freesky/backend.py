@@ -2332,6 +2332,14 @@ async def virtual_control_start(name: str, request: Request):
     except virtual_session.VirtualSessionError as exc:
         return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             content={"error": "start_failed", "message": str(exc)})
+    except Exception as exc:
+        # Never let this escape as a bare 500: the control panel shows the
+        # message to the admin, and "HTTP 500" tells them nothing about what
+        # actually went wrong inside the container.
+        logger.error(f"Virtual control start for {name} failed: {exc}", exc_info=True)
+        return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            content={"error": "start_failed",
+                                     "message": f"{type(exc).__name__}: {exc}"})
     return JSONResponse({"started": True, "name": name, "url": session.page_url})
 
 
@@ -2526,8 +2534,14 @@ async function post(path, body) {
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify(body || {}),
   });
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  return res.json();
+  // Prefer the server's own explanation. "HTTP 500" sent an admin to the
+  // container logs for something the response already knew.
+  let payload = null;
+  try { payload = await res.json(); } catch (e) { /* not JSON */ }
+  if (!res.ok) {
+    throw new Error((payload && payload.message) || ("HTTP " + res.status));
+  }
+  return payload || {};
 }
 
 // The <img> is laid out responsively, so its rendered size rarely equals the
@@ -2536,9 +2550,16 @@ async function post(path, body) {
 // display narrower than the capture width.
 function toPageCoords(ev) {
   const r = frame.getBoundingClientRect();
+  // Scale from the RENDERED size to the frame's real pixel size. naturalWidth
+  // is the authority rather than CFG.width: if the browser ever renders at a
+  // different size than configured, trusting the config would misplace every
+  // click, whereas the decoded frame is by definition what the admin is
+  // looking at.
+  const nw = frame.naturalWidth || CFG.width;
+  const nh = frame.naturalHeight || CFG.height;
   return {
-    x: Math.round((ev.clientX - r.left) * (CFG.width / r.width)),
-    y: Math.round((ev.clientY - r.top) * (CFG.height / r.height)),
+    x: Math.round((ev.clientX - r.left) * (nw / r.width)),
+    y: Math.round((ev.clientY - r.top) * (nh / r.height)),
   };
 }
 
