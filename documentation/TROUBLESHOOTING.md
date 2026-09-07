@@ -207,6 +207,47 @@ a consent dialog, or a login.
 - Audio that worked and then stopped usually means a stalled session — stop it
   in Settings and let the next request rebuild it.
 
+### Virtual channel is choppy, stutters, or looks like a slideshow
+
+**Symptom.** The channel plays, audio is continuous, but the picture updates a
+few times a second or moves in bursts. On the x11grab capture path, ffmpeg's
+`-progress` counters (visible in Settings → Sessions) show `dup` and `drop`
+both climbing into the thousands while `fps` reads a healthy 30 and `speed`
+1.0x. A real case: 5,741 frames out in three minutes, 5,087 of them duplicates
+and 1,990 dropped — about two distinct pictures a second — while the page
+itself was presenting 44fps.
+
+**Cause.** x11grab samples the screen on ffmpeg's wall-clock timer. When the
+container is short of CPU, or is being paused by its CFS quota, the timer slips:
+several grabs then land within milliseconds of each other (dropped, timestamps
+collide) after a long gap (filled with duplicates of the last frame). The
+browser was painting fine; the *sampling* was starved. This cannot be tuned
+away with presets, thread caps or bitrates.
+
+**Fix.**
+
+1. Use **tab capture** (the default for new channels since this was found;
+   existing channels pick it up on their next session, or set **Capture** in
+   the channel form). Frames then come from Chromium's compositor with their
+   own timestamps and Chromium encodes the H.264; ffmpeg only remuxes, and
+   its timestamps are snapped to the channel's frame grid. Measured: 33ms every
+   frame at 30fps, 40ms at 25fps, zero duplicates or drops.
+2. Press **Sessions** and read the **Host CPU** line. `throttled N% of periods`
+   above a few percent means the container's `cpus:` quota is pausing it; set
+   `CPUSET=0-3` (pin cores) in `.env` instead, or raise `CPU_LIMIT`. See
+   [VIRTUAL_CHANNELS.md](VIRTUAL_CHANNELS.md#running-many-channels-at-once).
+3. Read the session's `cpu browser … enc …` figures. A browser at several
+   hundred percent is a page too heavy for the host at that resolution: lower
+   the resolution before the frame rate.
+4. Pick a frame rate that divides 60 (20, 30, 60) for tab capture; the
+   compositor runs at 60Hz and those give even intervals without relying on the
+   snap.
+
+`/api/virtual-control/<name>/diagnostics` (admin token) reports all of the
+above in one JSON document: encoder counters, the capture feed's state and the
+recorder's own error list, per-process CPU, host load and throttling, and what
+the page's `<video>` is presenting.
+
 ### Container is OOM-killed once several virtual channels run
 
 **Cause**: concurrent sessions are uncapped by default and each 720p30 session
@@ -232,6 +273,45 @@ first segments, which can take ~45s.
 **Solutions**: request the channel once in a browser to warm it, lower
 **Warm-up seconds**, or raise the player's own timeout. Caddy's `@api_virtual`
 block already allows 180s.
+
+### Control panel returns 502 about 2.2 seconds after Start
+
+**Symptom**: `POST /api/virtual-control/<name>/start` returns 502 with an empty
+body after a very consistent ~2.2s, while `/health`, the panel HTML and
+`/api/virtual-sessions/status` all answer in milliseconds. The same `/start`
+route answers instantly (503/401) for an unknown channel or a bad token, so
+routing is clearly fine. Hitting the backend port directly, bypassing the
+reverse proxy, fails identically -- so it is not the proxy.
+
+Often paired with: "settings reload the page every time they are saved".
+
+**Cause**: the backend was running in DEVELOPMENT mode, which enables granian's
+file watcher. `reflex run` defaults to `--env dev`
+(`reflex/reflex.py`: `env: constants.Env = constants.Env.DEV`), and neither
+`REFLEX_ENV=prod` nor `env=rx.Env.PROD` in `rxconfig.py` overrides that CLI
+default. Dev mode starts granian with `reload=True`, `reload_tick=100` and
+`reload_paths=[Path.cwd()]` -- and `start.sh` runs from `/app`, so the entire
+app tree is watched, **including the `./data` volume**.
+
+Starting a virtual channel makes Chromium write its profile into
+`/app/data/virtual-profiles`. The watcher fires, granian restarts the worker,
+and `workers_kill_timeout=2` drops the in-flight request about 2.2 seconds in.
+Saving settings does the same, because `users.json`, `app_settings.json` and
+`virtual_channels.json` all live under `/app/data`.
+
+Note `HOTRELOAD_IGNORE_EXTENSIONS` covers `json` and extension-less files, so
+the `.json` stores and files like `Preferences` are ignored -- but a Chromium
+profile also contains `.ldb` files, which are not.
+
+**Fix**: `start.sh` now runs `reflex run --env prod`. Production mode has no
+file watcher at all. As a backstop it also exports
+`REFLEX_HOT_RELOAD_OVERRIDE_PATHS=/app/freesky`, so even in dev the watcher
+points at source rather than the data volume.
+
+**Verified empirically**: writing a single `.ldb` file into
+`data/virtual-profiles/` took a dev-mode backend down for 2.2s
+(`200 -> 000 -> 200`); the identical write under `--env prod` produced no
+interruption at all.
 
 ### Control panel returns 502 and the backend looks like it never starts
 

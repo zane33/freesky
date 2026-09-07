@@ -13,7 +13,7 @@ from typing import Optional, Dict, Set
 from rxconfig import config
 from freesky.free_sky_hybrid import StepDaddyHybrid as StepDaddy
 from freesky.free_sky import Channel
-from fastapi import Response, status, FastAPI, Request
+from fastapi import Response, status, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 # CORSMiddleware removed - CORS handled by Caddy
 from .utils import urlsafe_base64_decode, encrypt, hls_ext, strip_hls_ext
@@ -1829,18 +1829,58 @@ async def close_virtual_sessions():
         raise
 
 
+@fastapi_app.websocket("/api/virtual-capture/{name}")
+async def virtual_capture_feed(websocket: WebSocket, name: str):
+    """The tab-capture extension's recording, straight into ffmpeg's stdin.
+
+    Internal: the browser inside the container connects here over loopback
+    (virtual_session.CAPTURE_WS_BASE), never a client through the proxy. It is
+    admitted by the session's one-time secret, not by a user token, because the
+    feed is not a user -- and a valid user token must NOT be enough to push
+    video into someone's channel. Wrong or stale key: closed before accept, so
+    a probe learns nothing.
+    """
+    from freesky import virtual_session
+
+    session = virtual_session.capture_target(name, websocket.query_params.get("key", ""))
+    if session is None or not session.accepts_capture(websocket.query_params.get("key", "")):
+        await websocket.close(code=4403)
+        return
+    await websocket.accept()
+    session.capture_opened()
+    logger.info(f"virtual[{name}]: capture feed connected")
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            await session.feed_capture(data)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        # ffmpeg going away is the usual reason; the janitor sees the stale
+        # playlist and rebuilds the session, so this only needs logging.
+        logger.warning(f"virtual[{name}]: capture feed ended: {exc}")
+    finally:
+        session.capture_closed()
+        with contextlib.suppress(Exception):
+            await websocket.close()
+
+
 @fastapi_app.get("/api/virtual-sessions/status")
 async def virtual_sessions_status():
     """Running sessions plus a preflight check, for the settings page.
 
     `missing_binaries` is what turns "the stream won't start" into "ffmpeg is
-    not installed" without an admin having to read container logs.
+    not installed" without an admin having to read container logs. `host` is
+    the CPU picture -- load, the container's quota, and how often the quota
+    has been throttling it -- which is what a stuttering stream is nearly
+    always explained by.
     """
     from freesky import virtual_session
 
     return JSONResponse({
         "missing_binaries": virtual_session.preflight(),
         "max_sessions": virtual_session.MAX_SESSIONS,
+        "host": virtual_session.host_load(),
         "sessions": virtual_session.manager.statuses(),
     })
 
@@ -2036,6 +2076,8 @@ async def virtual_control_diagnostics(name: str, request: Request):
     encoder cannot keep up" — from outside the container those look identical,
     and each has a completely different fix.
     """
+    from freesky import virtual_session
+
     session, error = await _control_session(name, request)
     if error is not None:
         return error
@@ -2045,6 +2087,11 @@ async def virtual_control_diagnostics(name: str, request: Request):
         page = {"error": f"{type(exc).__name__}: {exc}"}
     return JSONResponse({
         "encoder": session.metrics,
+        # The capture feed (tab capture): connected or not, bytes received, and
+        # what the recorder inside the browser reports about itself.
+        "feed": await session.capture_status(),
+        "cpu": session.cpu,
+        "host": virtual_session.host_load(),
         "page": page,
         "capture": {"width": session.width, "height": session.height,
                     "framerate": session.record["framerate"],

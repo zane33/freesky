@@ -2,8 +2,8 @@
 
 A **virtual channel** turns any web page into a live TV channel. FreeSky opens
 the page in a real browser on a private virtual display inside the container,
-records the screen *and* the browser's audio, encodes it to H.264/AAC, and
-serves it as a rolling HLS playlist. To a player it is indistinguishable from
+has the browser record its own tab (video *and* audio, H.264-encoded by the
+browser itself), remuxes that to HLS, and serves it as a rolling playlist. To a player it is indistinguishable from
 any other channel: it appears in `/playlist.m3u8`, in the web UI, and works in
 VLC, Jellyfin and Dispatcharr.
 
@@ -35,18 +35,31 @@ plays inside its own player, a dashboard, a webcam page, a scoreboard.
                     │                                                            │
  GET /api/stream/   │   Xvfb :99          Chromium (headful, --kiosk)            │
  virt-<name>.m3u8 ──┼─► 1280x720x24  ◄──── renders the page into the display     │
-                    │        │                      │                            │
-                    │        │ x11grab              │ PulseAudio null-sink       │
-                    │        ▼                      ▼   (fsk_<name>)             │
-                    │      ffmpeg ◄──────── fsk_<name>.monitor                   │
-                    │        │  libx264 zerolatency + AAC                        │
-                    │        ▼                                                   │
+                    │   (control-panel        │                                  │
+                    │    preview only)        │ tab capture extension            │
+                    │                         │ (freesky/virtual_capture_ext):   │
+                    │                         │ compositor frames + tab audio,   │
+                    │                         │ H.264/Opus in WebM, one keyframe │
+                    │                         │ per segment                      │
+                    │                         ▼                                  │
+                    │   ws://127.0.0.1:8005/api/virtual-capture/<name>?key=…     │
+                    │                         │                                  │
+                    │                         ▼                                  │
+                    │      ffmpeg  -c:v copy (timestamps snapped to 1/fps),      │
+                    │              Opus → AAC                                    │
+                    │                         ▼                                  │
                     │   /streams/<name>/index.m3u8 + seg_%06d.ts   (tmpfs)       │
                     └────────────────────────────┬───────────────────────────────┘
                                                  │
  player ◄── rewritten playlist ◄─────────────────┘
         ◄── GET /api/virtual/<name>/seg_000123.ts?token=…
 ```
+
+That is the default, **tab capture**. The older path, **x11grab**, is still
+available per channel: ffmpeg samples the X display on its own timer and
+records a PulseAudio null-sink that Chromium plays into, then encodes with
+libx264. See [Capture paths](#capture-paths-tab-vs-x11grab) for why the
+default changed and when to pick the other one.
 
 **Lifecycle.** A session starts when the first player requests the channel and
 stops after `idle_timeout` seconds with no request. Every segment request is a
@@ -77,10 +90,11 @@ record store) and [`freesky/virtual_session.py`](../freesky/virtual_session.py)
 | **Display name** | What appears in the guide and the M3U. |
 | **Page URL** | The page to restream. `http://` or `https://` only. |
 | **Resolution** | `480p`, `720p` or `1080p`. This is the Xvfb screen size *and* the browser window size — nothing is scaled. |
-| **Frame rate** | 15, 24, 25 or 30. |
-| **Encoder preset** | `ultrafast`, `superfast` or `veryfast`. Slower presets cannot keep up with realtime capture, so they are not offered. |
-| **Video kbps** | Target and max bitrate. 2500 is right for 720p30; 4500–6000 for 1080p30. |
-| **Capture audio** | Off drops the audio input entirely — worth it for a silent dashboard, since a silent sink still costs an encoder and can desync a long session. |
+| **Frame rate** | 15, 20, 24, 25, 30, 50 or 60. Default 30. With tab capture, prefer a rate that divides 60 (20, 30, 60): the browser's compositor runs on a 60Hz timer and those give even frame intervals. 50/60 double the capture and encode cost. |
+| **Capture** | `tab` (default): the browser records its own tab and encodes the H.264; ffmpeg only remuxes. `x11grab`: ffmpeg samples the X display and encodes. See [Capture paths](#capture-paths-tab-vs-x11grab). |
+| **Encoder preset** | `ultrafast`, `superfast` or `veryfast`. Slower presets cannot keep up with realtime capture, so they are not offered. Used by x11grab, and by tab capture only when a crop forces a re-encode. |
+| **Video kbps** | Target bitrate. 2500 is right for 720p30; 4500–6000 for 1080p30. Tab capture hands this to the browser's encoder (Constrained Baseline, which is a little less efficient than x264's Main, so lean higher). |
+| **Capture audio** | Off drops the audio track entirely — worth it for a silent dashboard. |
 | **Audio kbps** | 128 is fine for most things. |
 | **Warm-up seconds** | How long to let the page settle (fonts, player bootstrap, consent dialogs) before the encoder starts, so viewers don't join on a half-painted page. |
 | **Idle timeout (s)** | Seconds with no request before the session is torn down. |
@@ -90,6 +104,53 @@ record store) and [`freesky/virtual_session.py`](../freesky/virtual_session.py)
 
 Changes take effect on the next session — saving a channel stops any running
 session for it so the next tune-in picks up the new settings.
+
+### Capture paths: tab vs x11grab
+
+**Why tab capture is the default.** x11grab records what is on the X display
+by grabbing it on ffmpeg's wall-clock timer. That works when the host is idle
+and fails in a specific, ugly way when it is not: the timer slips, grabs bunch
+up, and ffmpeg both *drops* the bunched frames (their timestamps collide) and
+*duplicates* the last frame to fill the gap before them. Measured on a real
+deployment, a 720p30 channel whose page was presenting 44fps produced about
+**two distinct pictures a second** — 5000 duplicated and 2000 dropped frames in
+three minutes — while ffmpeg reported a healthy 30fps at speed 1.0x. Wall-clock
+sampling cannot be made smooth under load, because the picture's timing is
+decided by scheduler luck, not by the content.
+
+Tab capture takes the frames from Chromium's own compositor, each stamped with
+the time of the frame it *is*, and the tab's audio on the same clock. Under load
+it degrades to fewer frames at the right times instead of bursts of the same
+frame. Chromium also encodes the H.264 itself, so ffmpeg's job shrinks from
+"grab, colour-convert, encode" to "remux": measured, the ffmpeg process went
+from ~25% of a core to ~4%. The browser's own cost goes up by about the same
+amount for the capture copy and the encode, so the total is similar — but none
+of it is timing-sensitive any more.
+
+Two side effects worth knowing:
+
+- **Browser UI is no longer in the stream.** A "Save password?" bubble or an
+  autofill dropdown is drawn by the browser, not the page, so tab capture does
+  not see it. The control panel still does (it previews the X display), so an
+  admin can dismiss it; viewers never saw it. With x11grab such bubbles were
+  visible in the stream.
+- **The stream is Constrained Baseline H.264** (what Chromium's encoder
+  produces) rather than Main. Every player takes it; it needs a slightly higher
+  bitrate for the same quality.
+
+**When to pick x11grab.** A page that blanks protected (DRM) video under
+capture — tab capture then records black — or a host whose Chromium build will
+not load the extension (the session fails to start with "Tab capture extension
+did not start"). It remains fully supported and is exercised by the same tests.
+
+**Timestamps.** Chromium's compositor in a container has no monitor to sync to
+and runs on a fixed 60Hz timer, so captured frames arrive on a 16.7ms grid. A
+30fps capture of a 50fps page comes out as 17/33/50ms intervals and a 25fps
+capture alternates 33/50ms: right on average, wobbling frame to frame. ffmpeg
+snaps each copied frame to the nearest 1/fps slot (never earlier than one past
+the previous frame), which measured as **33ms every frame at 30fps and 40ms
+every frame at 25fps**, with zero duplicated or dropped frames. Each frame is
+snapped on its own, so nothing accumulates over a long session.
 
 ### Getting a page to actually play
 
@@ -177,6 +238,17 @@ Budget, per concurrent session:
 
 720p is the single biggest lever for density and is the default for that reason.
 
+**How the CPU is limited matters as much as how much there is.** The default
+`cpus:` limit in `docker-compose.yml` is a CFS *quota*, enforced by pausing every
+thread in the container once the quota for the current 100ms period is spent.
+Chromium runs dozens of threads and, on a host with more cores than the quota,
+can spend a 4-core allowance in 40ms and then sit frozen for 60ms — ten times a
+second. Average CPU looks fine; the stream stutters. **Settings → Virtual
+Channels → Sessions** shows this as `throttled N% of periods`. If that number
+is above a few percent, set `CPUSET` (e.g. `CPUSET=0-3`) to pin whole cores
+instead, or raise `CPU_LIMIT`. Each running session also shows its own CPU
+split (browser / encoder / display) so a starved browser is visible as such.
+
 The practical ceiling is the container's memory limit, not a code constant — see
 `MEMORY_LIMIT` below. If the container is OOM-killed, **every** channel goes
 down, not just the newest, so size it deliberately.
@@ -245,10 +317,13 @@ Three things worth knowing:
   geometry, so a new encoder is required. Re-applying an identical crop does
   nothing, and so does not interrupt anyone watching.
 
-The crop is applied to the **x11grab input** (`-video_size WxH -i :99.0+X,Y`),
-not with a `-vf crop` filter. x11grab then reads only those pixels off the X
-server each frame; a filter would pull the whole screen across and discard most
-of it.
+With x11grab the crop is applied to the **input** (`-video_size WxH -i
+:99.0+X,Y`), not with a `-vf crop` filter: x11grab then reads only those pixels
+off the X server each frame. With tab capture a crop is the one thing that
+forces ffmpeg to re-encode (`-vf crop` + libx264 with the channel's preset and
+bitrate), because pixels cannot be cut out of an already-compressed stream. A
+cropped tab-capture channel therefore costs about what an x11grab channel does;
+an uncropped one costs ffmpeg almost nothing.
 
 The settings form has no crop fields -- a crop is something you pick by looking
 at the page -- but saving that form preserves whatever the panel set.
@@ -268,7 +343,12 @@ All optional. Defaults are in `docker-compose.yml`.
 | `VIRTUAL_START_TIMEOUT` | `45` | Seconds to wait for the first segments before giving up. |
 | `VIRTUAL_ENCODER_THREADS` | `2` | x264 thread cap. Unpinned, x264 spawns ~1.5x ncpu threads and starves the browser it is capturing. |
 | `VIRTUAL_RASTER_THREADS` | `2` | Chromium raster threads, for the same reason. |
-| `CPU_LIMIT` | `4` | Container CPU limit. This is what actually decides whether a channel is smooth. |
+| `VIRTUAL_CAPTURE_WS` | `ws://127.0.0.1:$BACKEND_PORT` | Where the tab-capture extension delivers its recording. Loopback to the backend, bypassing the proxy. |
+| `VIRTUAL_CAPTURE_TIMESLICE_MS` | `250` | How often the recorder emits a chunk. |
+| `VIRTUAL_CAPTURE_EXT_DIR` | `freesky/virtual_capture_ext` | The unpacked extension. |
+| `VIRTUAL_DISPLAY_TCP` | unset | Development only: talk to Xvfb over TCP loopback instead of the unix socket, for machines where `/tmp/.X11-unix` is not writable (WSL). Never needed in Docker. |
+| `CPU_LIMIT` | `4` | Container CPU quota. See `CPUSET`. |
+| `CPUSET` | unset | Pin the container to these cores (e.g. `0-3`) instead of metering it with a quota. Prefer this: a quota pauses the whole container when spent, which stutters the stream. |
 | `VIRTUAL_CONTROL_FPS` | `10` | Preview frame rate. |
 | `VIRTUAL_CONTROL_MAX_WIDTH` | `960` | Preview is downscaled to this width. Lower it first if the panel feels slow. |
 | `VIRTUAL_CONTROL_QUALITY` | `7` | Preview JPEG quality on ffmpeg's mjpeg scale — 2 is best, 31 is worst. |
@@ -314,8 +394,14 @@ is what prevents path traversal out of the output directory.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/virtual-sessions/status` | Running sessions plus a preflight check for missing binaries. |
+| `GET` | `/api/virtual-sessions/status` | Running sessions plus a preflight check for missing binaries, and `host`: `{cpus, quota, load, throttled_pct}`. Each session carries `capture`, `capture_connected` and `cpu_browser` / `cpu_encoder` / `cpu_display` (percent of one core over the last sample). |
 | `POST` | `/api/virtual-sessions/<name>/stop` | Stop one session. |
+
+### Internal
+
+| Method | Path | Purpose |
+|---|---|---|
+| `WS` | `/api/virtual-capture/<name>?key=…` | The tab-capture extension's recording, written straight into ffmpeg's stdin. Admitted only by the session's one-time secret, minted per session and never sent to a client — a valid user token is deliberately *not* enough to push video into a channel. Wrong key: closed before accept. |
 
 ### Remote control (**admin token required**)
 
@@ -351,21 +437,45 @@ reliable audio output path in a container — a long-standing, still-open proble
 ([Mux](https://www.mux.com/blog/lessons-learned-building-headless-chrome-as-a-service))
 all run a real browser against a virtual display.
 
-**`x11grab`, not CDP `Page.startScreencast`.** The screencast API delivers
-base64 JPEG frames at a variable rate and carries no audio at all, so frames
-would have to be re-timed by hand. It also couples stream liveness to Chromium:
-with `x11grab`, Chromium can crash and be relaunched into the same display while
-ffmpeg keeps running and viewers see only a few black frames.
+**Tab capture (`chrome.tabCapture` + `MediaRecorder`), not `x11grab` and not
+CDP `Page.startScreencast`.** The screencast API delivers base64 JPEG frames at
+a variable rate and carries no audio, so it was never a candidate. `x11grab` was
+the original design and is kept as an option; it lost the default because it
+samples on a wall-clock timer and turns into bursts of duplicate frames the
+moment the host is busy (numbers in [Capture paths](#capture-paths-tab-vs-x11grab)).
+Tab capture is what the browser-to-video tools that work well in practice
+(puppeteer-stream and its descendants) use: frames come from the compositor
+with their own timestamps, audio from the same tab on the same clock, and
+Chromium's MediaRecorder can emit H.264 directly — `MediaRecorder.isTypeSupported
+('video/webm;codecs=h264,opus')` is true in Playwright's Chromium — so ffmpeg
+remuxes with `-c:v copy` instead of encoding a second time. The extension is
+MV3 (MV2 no longer loads in current Chromium): a service worker that the
+backend drives through Playwright's `context.service_workers[0].evaluate()`, and
+an offscreen document that holds the `MediaStream` and the recorder, because a
+service worker has no DOM. `--allowlisted-extension-id=<id>` lifts tabCapture's
+"the user must have invoked the extension" rule; the id is derived at runtime
+from the SHA-256 of the manifest's `key`, so the flag cannot drift from the
+extension it names. `videoKeyFrameIntervalDuration` asks the recorder for one
+keyframe per segment, which is what keeps `EXT-X-INDEPENDENT-SEGMENTS` true
+without a re-encode.
+
+Rejected along the way: VP8/VP9 from MediaRecorder (Chromium's VP8 encode cost
+~2 cores at 720p30 in measurement, versus ~0.3 for its H.264) and re-timing
+frames to CFR in ffmpeg (needs a decode; the `setts` bitstream filter does the
+snap on the copied packets instead).
 
 **Playwright, not raw Chromium.** The browser and a matching Chromium build were
 already a dependency of this repo, and real page control is needed anyway for
 consent dialogs, play buttons and the remote-control panel.
 
 **PulseAudio null-sink per session.** A null-sink automatically exposes a
-`.monitor` source, which is what ffmpeg records. One per session, with Chromium
-pointed at it via `PULSE_SINK`, is what keeps two concurrent channels from
-recording each other's audio. Sinks are unloaded on teardown — leaked null-sinks
-accumulate and eventually exhaust module slots.
+`.monitor` source, which is what ffmpeg records on the x11grab path. One per
+session, with Chromium pointed at it via `PULSE_SINK`, is what keeps two
+concurrent channels from recording each other's audio. Tab capture takes the
+audio from the tab itself and no longer records the sink, but the sink is still
+created: Chromium needs an audio output to run a `<video>`'s clock against, and
+a missing device is a stalled player. Sinks are unloaded on teardown — leaked
+null-sinks accumulate and eventually exhaust module slots.
 
 **Plain HLS, not LL-HLS.** ffmpeg's `hls` muxer **does not implement Apple
 LL-HLS**: there is no `EXT-X-PART`, no partial segments, and no `hls_part_size`
@@ -395,11 +505,15 @@ under load and libx264 with a fixed GOP is much happier with a constant rate.
 
 ## Performance and latency
 
-**The encoder is not the bottleneck.** Measured, a 720p30 `libx264 -preset
-veryfast -tune zerolatency` encode costs roughly a fifth to a third of one core,
-and the BGRA→YUV conversion about 0.05 of a core. If a channel stutters, the
-cause is upstream: Chromium not painting fast enough under software rendering.
-Tune the browser and the CPU budget, not the codec.
+**Where the CPU goes (tab capture, 720p30, measured on a desktop core with the
+container's flags).** Chromium ~1.1 cores in total: about half in the renderer
+(decode, raster, and the H.264 encode in the offscreen document) and half in
+the GPU process (software compositing plus the capture copy). ffmpeg ~0.04 of
+a core (remux + AAC). Xvfb ~0.04. On x11grab the split was Chromium ~0.4,
+ffmpeg ~0.25 (libx264 + colour conversion), Xvfb ~0.05 — cheaper in total, but
+every one of those parts sat on the timing-critical path. If a tab-capture
+channel stutters, the cause is CPU starvation or quota throttling of the
+browser (see the Host CPU line in Settings), not the codec.
 
 Notable choices, all of which were measured or checked against source rather
 than taken from guides:
@@ -517,13 +631,36 @@ not just page content. To stop it recurring, the container launches Chromium
 with the password manager and other prompt-generating features disabled; if a
 new dialog type appears, add its suppression flag in `_start_browser`.
 
-**ffmpeg logs "More than 1000 frames duplicated".**
+**The stream is choppy / a slideshow.**
+Open **Settings → Virtual Channels** and press **Sessions**. Three things to
+read there, in order:
+
+1. The **Host CPU** line. `throttled N% of periods` above a few percent means
+   the container's CPU quota is pausing it (see
+   [Running many channels at once](#running-many-channels-at-once)); set
+   `CPUSET` or raise `CPU_LIMIT`. A load well above the quota means the host is
+   simply full.
+2. The session's **cpu browser / enc** split. A browser at several hundred
+   percent with a low frame rate is a page that is too expensive to render at
+   that resolution: drop to 480p/720p or lower the frame rate.
+3. The session's capture badge. `tab capture: no feed` means the extension is
+   not delivering; the session will be rebuilt by the janitor, and
+   `/api/virtual-control/<name>/diagnostics` shows the recorder's own error
+   list under `feed`.
+
+If the channel is on **x11grab**, switch it to **tab** capture: x11grab cannot
+be made smooth on a busy host, for the reason in
+[Capture paths](#capture-paths-tab-vs-x11grab).
+
+**ffmpeg logs "More than 1000 frames duplicated".** (x11grab only)
 This is a *timestamp* message, not a picture-quality one: ffmpeg received frames
 whose wall-clock times were further apart than 1/framerate, and padded the
 constant-rate grid by repeating the last one. x11grab grabs unconditionally on a
 timer, so this does **not** mean "the page didn't change" — it means the grab
 loop was late, which on this container almost always means **Chromium was
-starved of CPU and stopped painting**.
+starved of CPU and stopped painting**, or the container was being throttled by
+its CPU quota. The fix is tab capture; the rest of this entry is for the case
+where x11grab has to stay.
 
 Things that do *not* fix it: a faster x264 preset, or a different muxer. The
 encode costs only a fraction of a core at 720p30 — it is not the bottleneck.

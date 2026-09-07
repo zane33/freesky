@@ -23,6 +23,7 @@ SOURCE_OPTIONS = [AUTO_SOURCE] + list(StepDaddyHybrid.PLAYER_PATHS)
 RESOLUTION_OPTIONS = list(virtual_channels.RESOLUTIONS)
 FRAMERATE_OPTIONS = [str(f) for f in virtual_channels.FRAMERATES]
 PRESET_OPTIONS = list(virtual_channels.PRESETS)
+CAPTURE_OPTIONS = list(virtual_channels.CAPTURE_MODES)
 
 class SettingsState(rx.State):
     """Channel visibility settings, persisted server-side for every client."""
@@ -69,6 +70,9 @@ class SettingsState(rx.State):
     # Missing binaries from the capture preflight. Turns "the stream won't
     # start" into "ffmpeg is not installed" without an admin reading logs.
     vc_missing: List[str] = []
+    # One line on the host's CPU: load, quota, and how often the quota has been
+    # pausing the container. A stuttering channel is nearly always this.
+    vc_host: str = ""
 
     # Form. vc_editing is "" when adding, otherwise the name being edited.
     # Numeric fields are strings because rx.input hands back strings; they are
@@ -80,6 +84,7 @@ class SettingsState(rx.State):
     vc_resolution: str = virtual_channels.DEFAULT_RESOLUTION
     vc_framerate: str = str(virtual_channels.DEFAULT_FRAMERATE)
     vc_preset: str = virtual_channels.DEFAULT_PRESET
+    vc_capture: str = virtual_channels.DEFAULT_CAPTURE
     vc_video_bitrate: str = "2500"
     vc_audio: bool = True
     vc_audio_bitrate: str = "128"
@@ -119,6 +124,10 @@ class SettingsState(rx.State):
     @rx.event
     def set_vc_preset(self, value: str):
         self.vc_preset = value
+
+    @rx.event
+    def set_vc_capture(self, value: str):
+        self.vc_capture = value
 
     @rx.event
     def set_vc_video_bitrate(self, value: str):
@@ -194,6 +203,7 @@ class SettingsState(rx.State):
         self.vc_resolution = virtual_channels.DEFAULT_RESOLUTION
         self.vc_framerate = str(virtual_channels.DEFAULT_FRAMERATE)
         self.vc_preset = virtual_channels.DEFAULT_PRESET
+        self.vc_capture = virtual_channels.DEFAULT_CAPTURE
         self.vc_video_bitrate = "2500"
         self.vc_audio = True
         self.vc_audio_bitrate = "128"
@@ -221,6 +231,7 @@ class SettingsState(rx.State):
         self.vc_resolution = record["resolution"]
         self.vc_framerate = str(record["framerate"])
         self.vc_preset = record["preset"]
+        self.vc_capture = record.get("capture", virtual_channels.DEFAULT_CAPTURE)
         self.vc_video_bitrate = str(record["video_bitrate"])
         self.vc_audio = record["audio"]
         self.vc_audio_bitrate = str(record["audio_bitrate"])
@@ -255,6 +266,7 @@ class SettingsState(rx.State):
             "resolution": self.vc_resolution,
             "framerate": self.vc_framerate,
             "preset": self.vc_preset,
+            "capture": self.vc_capture,
             "video_bitrate": self.vc_video_bitrate,
             "audio": self.vc_audio,
             "audio_bitrate": self.vc_audio_bitrate,
@@ -390,6 +402,7 @@ class SettingsState(rx.State):
         from freesky import virtual_session
 
         self.vc_missing = virtual_session.preflight()
+        self.vc_host = _describe_host(virtual_session.host_load())
         suffix = f"?token={self.vc_token}" if self.vc_token else ""
         rows = virtual_session.manager.statuses()
         for row in rows:
@@ -832,6 +845,22 @@ def channel_row(channel: Channel) -> rx.Component:
     )
 
 
+def _describe_host(host: dict) -> str:
+    """One readable line from virtual_session.host_load()."""
+    parts = []
+    load = host.get("load")
+    if load:
+        parts.append(f"load {load[0]} on {host.get('cpus', '?')} CPUs")
+    quota = host.get("quota") or 0
+    parts.append(f"container quota {quota:g} cores" if quota else "no CPU quota")
+    throttled = host.get("throttled_pct")
+    if throttled is not None:
+        note = " - the quota is pausing the container; use cpuset or raise CPU_LIMIT" \
+            if throttled >= 5 else ""
+        parts.append(f"throttled {throttled}% of periods{note}")
+    return "Host CPU: " + ", ".join(parts)
+
+
 def virtual_channel_row(record: dict) -> rx.Component:
     """One stored virtual channel: status, its page URL, and the row's actions."""
     confirming = SettingsState.vc_confirm_delete == record["name"]
@@ -939,6 +968,23 @@ def virtual_session_row(session: dict) -> rx.Component:
         rx.text(f"speed {session['speed']}", size="1", color="gray"),
         rx.text(f"dup {session['dup']}", size="1", color="gray"),
         rx.text(f"drop {session['drop']}", size="1", color="gray"),
+        # Which capture path, and whether the tab-capture feed is actually
+        # connected: a tab session with no feed is a black stream in waiting.
+        rx.cond(
+            session["capture"] == "tab",
+            rx.cond(
+                session["capture_connected"].to(bool),
+                rx.badge("tab capture", color_scheme="blue", variant="soft"),
+                rx.badge("tab capture: no feed", color_scheme="red", variant="soft"),
+            ),
+            rx.badge("x11grab", color_scheme="gray", variant="soft"),
+        ),
+        # Percent of one core, per process group, over the last sample. This
+        # is where "why is it choppy" gets answered.
+        rx.text(
+            f"cpu browser {session['cpu_browser']}% enc {session['cpu_encoder']}%",
+            size="1", color="gray",
+        ),
         rx.spacer(),
         rx.link(
             rx.button("Control", size="1", variant="soft"),
@@ -1018,6 +1064,21 @@ def virtual_form() -> rx.Component:
                     FRAMERATE_OPTIONS,
                     value=SettingsState.vc_framerate,
                     on_change=SettingsState.set_vc_framerate,
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text("Capture", size="1", color="gray"),
+                # "tab": Chromium's own tab capture, frames with compositor
+                # timestamps, H.264 encoded in the browser, ffmpeg remuxes.
+                # "x11grab": ffmpeg samples the X display on a timer. Only for
+                # pages tab capture cannot see.
+                rx.select(
+                    CAPTURE_OPTIONS,
+                    value=SettingsState.vc_capture,
+                    on_change=SettingsState.set_vc_capture,
                     width="100%",
                 ),
                 spacing="1",
@@ -1222,6 +1283,10 @@ def virtual_section() -> rx.Component:
                 "once; each costs roughly 1.5-2 CPU cores and ~900MB at 720p.",
                 color="gray",
                 size="2",
+            ),
+            rx.cond(
+                SettingsState.vc_host != "",
+                rx.text(SettingsState.vc_host, size="1", color="gray"),
             ),
             rx.cond(
                 SettingsState.vc_preflight_message != "",

@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "FreeSky Tab Capture",
+  "version": "1.0",
+  "description": "Streams the captured tab's compositor output (H.264 + Opus) to the FreeSky backend for restreaming as HLS.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2eV1NZ+19G7oHdtkZdviGdTsoY8nW5+QpQtLI6ZIEPDCD9FPZGsYzgLaSOH71zWgPp2G9CCsypP+P7v+yHg/feHVlACfy5Km1TghSiNm0bFmOHwnr111b2KsdmmTamKqKlwpg8tZwA07Zz8dUAFKXxgtA8g+uRgMinFu7nV94zVFzo6Vw5l/1eDCLkKY6PIu3sHCZsiZxcbDiLoeK3EI8qionJH8p/kw2AEcVnS3gTuaXaDwU1zwQ77fqa0FY4YxxMvoWftY1ym+pschVkbIPgHxP/vs2H3SgGIseQX0n0X69+Y7dNRQo6qvSP4DC8A9q+kY4IxN5jwH/yYnJpdzMQIDAQAB",
+  "permissions": [
+    "tabCapture",
+    "offscreen",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "sw.js"
+  }
+}

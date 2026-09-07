@@ -63,6 +63,11 @@ services:
       # more CPUs.
       - VIRTUAL_ENCODER_THREADS=${VIRTUAL_ENCODER_THREADS:-2}
       - VIRTUAL_RASTER_THREADS=${VIRTUAL_RASTER_THREADS:-2}
+      # Tab capture (the default capture path, see VIRTUAL_CHANNELS.md): the
+      # browser records its own tab as H.264 and delivers it to the backend
+      # over loopback. This is where it delivers to; only change it if the
+      # backend listens somewhere other than 127.0.0.1:BACKEND_PORT.
+      - VIRTUAL_CAPTURE_WS=${VIRTUAL_CAPTURE_WS:-}
       - VIRTUAL_CONTROL_FPS=${VIRTUAL_CONTROL_FPS:-10}
       - VIRTUAL_CONTROL_MAX_WIDTH=${VIRTUAL_CONTROL_MAX_WIDTH:-960}
       # ffmpeg mjpeg quality: 2 best, 31 worst.
@@ -139,6 +144,23 @@ services:
     # but that only makes it fall back to /tmp - raising this is the real fix.
     shm_size: "1gb"
 
+    # CPU: pin cores rather than metering them.
+    #
+    # `cpus:` (below, CPU_LIMIT) is a CFS *quota*: the container may use N
+    # core-seconds per second, enforced by pausing EVERY thread in it once the
+    # quota for the current 100ms period is spent. Chromium runs dozens of
+    # threads, so on a host with more cores than the quota it can burn a
+    # 4-core allowance in 40ms and then sit frozen for the remaining 60ms --
+    # ten times a second. That is invisible in average CPU and shows up as a
+    # stuttering virtual channel. Settings -> Virtual Channels -> Sessions
+    # reports it as "throttled N% of periods".
+    #
+    # A cpuset gives the container N whole cores and never pauses it. Set
+    # CPUSET to a core list (e.g. "0-3") to use that instead; an empty value
+    # leaves it unset. When CPUSET is set, raise CPU_LIMIT to at least the
+    # number of pinned cores (or the quota still applies on top).
+    cpuset: "${CPUSET:-}"
+
     # Resource Limits
     #
     # The CPU limit lives under deploy.resources.limits, NOT as a top-level
@@ -151,8 +173,9 @@ services:
         limits:
           # Virtual channels are CPU-bound on software rendering, and the
           # failure mode is the browser being starved until it stops painting.
-          # Budget at least 2 CPUs per concurrent 720p channel; the encoder
-          # itself needs only a fraction of one.
+          # Budget at least 2 CPUs per concurrent 720p channel with tab
+          # capture (the browser also encodes); the ffmpeg remux is free.
+          # Prefer CPUSET above for the reason given there.
           cpus: "${CPU_LIMIT:-4}"
           # 512M was right when this was a pure HTTP proxy. A virtual channel
           # adds a headful Chromium (~500-700M) plus an ffmpeg x264 encoder

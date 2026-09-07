@@ -71,13 +71,18 @@ DEFAULT_RESOLUTION = "720p"
 # Every value here divides evenly into a 2-second GOP, so the encoder's
 # keyframe interval stays exactly one segment long whichever is chosen.
 #
-# The default is 25 rather than 30 deliberately. Under software rendering a
-# browser often cannot paint 30fps, and asking for more than it can produce does
-# not make the stream smoother — ffmpeg just duplicates frames to hold the rate,
-# burning CPU that the browser needed. Matching the achievable rate is what
-# actually looks better.
-FRAMERATES = (15, 20, 24, 25, 30)
-DEFAULT_FRAMERATE = 25
+# The default is 30, and the reason is the browser's own clock. Headless-in-a-
+# container Chromium has no real monitor to sync to, so its compositor runs on a
+# fixed 60Hz timer. Tab capture takes every Nth compositor frame, so a rate that
+# divides 60 (30, 20, 60) yields perfectly even frame intervals, while 25 lands
+# between grid ticks and alternates 33/50ms -- a visible cadence wobble on pans
+# even when nothing is dropped. 25 stays available for the x11grab path, which
+# samples the screen on its own timer and does not care about the grid.
+#
+# 50 and 60 are for hosts with CPU to spare and a 50/60fps source. Capture and
+# encode cost scale with the rate; see VIRTUAL_CHANNELS.md before picking them.
+FRAMERATES = (15, 20, 24, 25, 30, 50, 60)
+DEFAULT_FRAMERATE = 30
 
 # x264 presets worth offering. Anything slower than "veryfast" cannot keep up
 # with 1080p30 realtime capture on the CPUs this app typically runs on, so the
@@ -85,6 +90,19 @@ DEFAULT_FRAMERATE = 25
 # dropped-frame stream.
 PRESETS = ("ultrafast", "superfast", "veryfast")
 DEFAULT_PRESET = "veryfast"
+
+# How the picture gets from the browser to the encoder.
+#
+#   tab      Chromium's own tab capture: frames are taken from the compositor
+#            with the timestamp of the frame they are, audio from the same tab
+#            on the same clock, and Chromium encodes the H.264 itself so ffmpeg
+#            only remuxes. This is the smooth path and the default.
+#   x11grab  ffmpeg samples the X display on a wall-clock timer and records the
+#            PulseAudio sink. Kept for pages that tab capture cannot see (a site
+#            that blanks protected video under capture) and as a fallback when
+#            the extension will not load.
+CAPTURE_MODES = ("tab", "x11grab")
+DEFAULT_CAPTURE = "tab"
 
 
 # Fields whose value is baked into a running session: the browser was launched
@@ -96,7 +114,7 @@ DEFAULT_PRESET = "veryfast"
 # fixed a typo in a channel's name tore down a browser they had just signed in
 # to.
 CAPTURE_FIELDS = (
-    "url", "resolution", "framerate", "preset", "video_bitrate",
+    "url", "resolution", "framerate", "preset", "video_bitrate", "capture",
     "audio", "audio_bitrate", "warmup", "click_selectors", "hide_selectors",
     # The crop is baked into ffmpeg's x11grab input geometry, so changing it
     # means a new encoder -- and therefore a session restart.
@@ -236,6 +254,10 @@ def validate_channel(record: dict) -> dict:
     if preset not in PRESETS:
         raise VirtualChannelError(f"Encoder preset must be one of: {', '.join(PRESETS)}.")
 
+    capture = str(record.get("capture", DEFAULT_CAPTURE)).strip().lower() or DEFAULT_CAPTURE
+    if capture not in CAPTURE_MODES:
+        raise VirtualChannelError(f"Capture must be one of: {', '.join(CAPTURE_MODES)}.")
+
     tags = record.get("tags") or ["Virtual"]
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(",")]
@@ -254,6 +276,7 @@ def validate_channel(record: dict) -> dict:
         "resolution": resolution,
         "framerate": framerate,
         "preset": preset,
+        "capture": capture,
         # 0 disables the audio input entirely. Some pages have no sound and
         # capturing a silent PulseAudio monitor still costs an encoder and can
         # desync a long-running stream, so it is worth being able to turn off.
@@ -556,7 +579,16 @@ if __name__ == "__main__":
         assert needs_restart(base, {**base, "url": "https://other.com"})
         assert needs_restart(base, {**base, "resolution": "1080p"})
         assert needs_restart(base, {**base, "audio": False})
+        assert needs_restart(base, {**base, "capture": "x11grab"}), "capture path is baked in"
         assert not needs_restart({}, base), "a new channel has nothing to restart"
+
+        assert base["capture"] == DEFAULT_CAPTURE == "tab", "tab capture is the smooth default"
+        assert validate_channel({**base, "capture": "X11GRAB"})["capture"] == "x11grab"
+        try:
+            validate_channel({**base, "capture": "cdp"})
+            raise AssertionError("unknown capture mode must be rejected")
+        except VirtualChannelError:
+            pass
 
         assert base["autostart"] is False, "opt-in, since it runs around the clock"
         assert validate_channel({**base, "autostart": True})["autostart"] is True

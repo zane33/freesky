@@ -22,6 +22,16 @@ Why this shape rather than the obvious alternatives
 * **Playwright rather than raw Chromium.** The browser and its matching Chromium
   build are already a dependency of this repo, and we need real page control
   anyway to dismiss consent dialogs and click a play button.
+* **Tab capture by default, x11grab as the fallback.** x11grab samples the X
+  display on ffmpeg's wall-clock timer. When the host is busy the timer slips,
+  grabs bunch up, and ffmpeg both drops the bunched frames and duplicates the
+  last one to fill the gap: the stream turns into a slideshow with bursts even
+  though the browser is painting fine. Tab capture (freesky/virtual_capture_ext)
+  takes frames from Chromium's own compositor with the timestamp of the frame
+  they are, muxes the tab's audio on the same clock, and has Chromium encode
+  the H.264 itself, so ffmpeg only remuxes. Frame timing is then a property of
+  the browser, not of scheduler luck. x11grab remains per channel for pages tab
+  capture cannot see.
 * **Plain HLS, not LL-HLS.** ffmpeg's `hls` muxer does not implement Apple
   LL-HLS — there is no `EXT-X-PART`, no partial segments, and no `hls_part_size`
   option, despite what several guides claim (`-lhls` is a *dash* muxer option
@@ -33,12 +43,15 @@ Nothing here runs until a virtual channel is actually requested, so the cost on
 an install that never uses the feature is one import.
 """
 import asyncio
+import base64
 import contextlib
 import fcntl
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -192,6 +205,17 @@ def reset_trace(name: str) -> None:
 # clear of anything a desktop session would claim.
 _DISPLAY_BASE = int(os.environ.get("VIRTUAL_DISPLAY_BASE", "99"))
 
+# Development knob: talk to Xvfb over TCP loopback instead of the unix socket.
+# In the container the socket is the right thing. On a dev machine where
+# /tmp/.X11-unix is not writable (WSLg mounts it read-only for the user), it is
+# the only way to run the pipeline at all. Never needed in Docker.
+_DISPLAY_TCP = os.environ.get("VIRTUAL_DISPLAY_TCP", "") == "1"
+
+
+def display_name(display: int) -> str:
+    """The DISPLAY string for a session's X server."""
+    return f"127.0.0.1:{display}" if _DISPLAY_TCP else f":{display}"
+
 # Runtime dir for the container-local PulseAudio daemon. Deliberately not the
 # host's socket: we want our own daemon at the same UID as Chromium and ffmpeg.
 # Browser profiles. These live on the DATA VOLUME, not in /tmp, because they
@@ -252,6 +276,63 @@ CONTROL_MAX_WIDTH = int(os.environ.get("VIRTUAL_CONTROL_MAX_WIDTH", "960"))
 CONTROL_QUALITY = int(os.environ.get("VIRTUAL_CONTROL_QUALITY", "7"))
 CONTROL_FPS = float(os.environ.get("VIRTUAL_CONTROL_FPS", "10"))
 
+# --- tab capture --------------------------------------------------------------
+# The unpacked extension that does the capturing. It ships with the app; its id
+# is pinned by the `key` in its manifest so Chromium can be told to trust it.
+EXT_DIR = os.environ.get(
+    "VIRTUAL_CAPTURE_EXT_DIR",
+    os.path.join(os.path.dirname(__file__), "virtual_capture_ext"),
+)
+# Where the extension delivers the recording. Loopback straight to the backend,
+# bypassing the reverse proxy: this is an internal pipe, not a client request.
+CAPTURE_WS_BASE = os.environ.get(
+    "VIRTUAL_CAPTURE_WS",
+    f"ws://127.0.0.1:{os.environ.get('BACKEND_PORT', '8005')}",
+)
+# MediaRecorder emits a chunk this often. Smaller means less latency between
+# the compositor and ffmpeg; 250ms is well under one segment and keeps the
+# message rate trivial.
+CAPTURE_TIMESLICE_MS = int(os.environ.get("VIRTUAL_CAPTURE_TIMESLICE_MS", "250"))
+# H.264 in WebM is what Playwright's Chromium can record, and what lets ffmpeg
+# remux with -c:v copy instead of encoding a second time.
+CAPTURE_MIME_AV = "video/webm;codecs=h264,opus"
+CAPTURE_MIME_V = "video/webm;codecs=h264"
+
+
+def extension_id() -> str:
+    """The extension id Chromium derives from the manifest's `key`.
+
+    Chromium ids an unpacked extension by the SHA-256 of its public key when a
+    key is present (else by its path). Computing it here from the same manifest
+    keeps the --allowlisted-extension-id flag from silently drifting away from
+    the extension it names, which would surface only as "Extension has not been
+    invoked for the current page" at capture time.
+    """
+    cached = getattr(extension_id, "_cached", None)
+    if cached:
+        return cached
+    with open(os.path.join(EXT_DIR, "manifest.json")) as f:
+        key = json.load(f)["key"]
+    digest = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
+    ext_id = "".join(chr(ord("a") + int(c, 16)) for c in digest)
+    extension_id._cached = ext_id
+    return ext_id
+
+
+# Sessions currently accepting a capture feed, keyed by their one-time secret.
+# Registered before the extension is told to connect and removed on stop, so
+# the WebSocket route can admit a feed for a session that is still starting
+# (it is not in manager._sessions until start() returns).
+_capture_targets: Dict[str, "VirtualSession"] = {}
+
+
+def capture_target(name: str, key: str) -> Optional["VirtualSession"]:
+    """The session a capture feed belongs to, or None if the key is wrong."""
+    session = _capture_targets.get(key or "")
+    if session is None or session.name != name:
+        return None
+    return session
+
 # A stream is considered dead when its playlist has not been rewritten in this
 # many segment durations. Process liveness is NOT a sufficient check: ffmpeg can
 # sit there holding a dead X connection, and Chromium can die while ffmpeg
@@ -310,6 +391,30 @@ def _ffmpeg_supports_fps_mode() -> bool:
     except (OSError, subprocess.SubprocessError, ValueError):
         result = False
     _ffmpeg_supports_fps_mode._cached = result
+    return result
+
+
+def _ffmpeg_has_bsf(name: str) -> bool:
+    """True when the installed ffmpeg lists `name` in `ffmpeg -bsfs`.
+
+    Cached per name; shells out once. Used to skip the timestamp snap on an
+    ffmpeg too old to have `setts` (added in 5.0) instead of failing to start.
+    """
+    cache = getattr(_ffmpeg_has_bsf, "_cache", None)
+    if cache is None:
+        cache = _ffmpeg_has_bsf._cache = {}
+    if name in cache:
+        return cache[name]
+    result = False
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-bsfs"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        result = any(line.strip() == name for line in out.splitlines())
+    except (OSError, subprocess.SubprocessError):
+        result = False
+    cache[name] = result
     return result
 
 
@@ -439,6 +544,21 @@ class VirtualSession:
         # Serialises page operations. Playwright's API is not safe against two
         # coroutines driving the same page at once.
         self._page_lock = asyncio.Lock()
+        # Tab capture. The secret is what admits the extension's WebSocket feed
+        # and nothing else: it is minted per session and never leaves the
+        # container, so a client that can reach the backend port still cannot
+        # inject video into a channel.
+        self.capture = record.get("capture", virtual_channels.DEFAULT_CAPTURE)
+        self.capture_secret = secrets.token_urlsafe(24)
+        self.capture_connected = False
+        self.capture_bytes = 0
+        self.capture_chunks = 0
+        self._capture_ready = asyncio.Event()
+        self._capture_started = False
+        # CPU accounting, filled in by the manager's sampler. Percent of one
+        # core over the last sample interval, per process group.
+        self.cpu: dict = {}
+        self._cpu_sample: Optional[tuple] = None
         # Cross-PROCESS guard; see _acquire_channel_lock().
         self._lock_fd: Optional[int] = None
 
@@ -558,8 +678,8 @@ class VirtualSession:
         argv = [
             "Xvfb", f":{self.display}",
             "-screen", "0", f"{self.width}x{self.height}x24",
-            "-ac", "-nolisten", "tcp", "-dpi", "96", "+extension", "RANDR",
-        ]
+            "-ac", "-dpi", "96", "+extension", "RANDR",
+        ] + (["-listen", "tcp", "-nolisten", "unix"] if _DISPLAY_TCP else ["-nolisten", "tcp"])
         trace("xvfb:spawn", " ".join(argv))
         self._xvfb = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         trace("xvfb:spawned", f"pid={self._xvfb.pid}")
@@ -571,7 +691,7 @@ class VirtualSession:
             if self._xvfb.poll() is not None:
                 raise VirtualSessionError(f"Xvfb exited immediately on display :{self.display}")
             try:
-                await _run(["xdpyinfo", "-display", f":{self.display}"], timeout=5)
+                await _run(["xdpyinfo", "-display", display_name(self.display)], timeout=5)
                 return
             except VirtualSessionError:
                 await asyncio.sleep(0.3)
@@ -749,6 +869,28 @@ class VirtualSession:
             # --disable-renderer-backgrounding, which matter here (a kiosk
             # window under Xvfb can look "occluded", and a throttled renderer
             # stops presenting frames), so they are not repeated.
+        ] + self._capture_args()
+
+    def _capture_args(self) -> list:
+        """Switches that load and trust the tab-capture extension.
+
+        Only for tab capture: an x11grab session has no use for the extension
+        and should not carry a capture-capable extension it never drives.
+
+        --allowlisted-extension-id is what lets the extension call
+        chrome.tabCapture.getMediaStreamId without the user having "invoked" it
+        on the tab; without it capture fails at start. The id is derived from
+        the manifest at runtime so the flag and the extension cannot disagree.
+        """
+        if self.capture != "tab":
+            return []
+        ext_id = extension_id()
+        return [
+            f"--load-extension={EXT_DIR}",
+            f"--disable-extensions-except={EXT_DIR}",
+            f"--allowlisted-extension-id={ext_id}",
+            # The pre-M110 spelling, harmless on builds that ignore it.
+            f"--whitelisted-extension-id={ext_id}",
         ]
 
     async def _start_browser(self) -> None:
@@ -756,7 +898,7 @@ class VirtualSession:
         from playwright.async_api import async_playwright
 
         env = dict(os.environ)
-        env["DISPLAY"] = f":{self.display}"
+        env["DISPLAY"] = display_name(self.display)
         if self.record["audio"]:
             env.update(_pulse_env())
             env["PULSE_SINK"] = self.sink
@@ -800,6 +942,11 @@ class VirtualSession:
                 # that can silently disagree with the capture.
                 no_viewport=True,
                 ignore_https_errors=True,
+                # Playwright disables extensions by default. Tab capture IS an
+                # extension, so that one default has to go for the tab path.
+                ignore_default_args=(
+                    ["--disable-extensions"] if self.capture == "tab" else []
+                ),
             )
         except Exception as exc:
             # Playwright raises its own error types. Wrap them so callers get a
@@ -850,6 +997,126 @@ class VirtualSession:
             await self._page.mouse.click(self.width // 2, self.height // 2)
 
     def _ffmpeg_argv(self) -> list:
+        """The encoder command for this session's capture path."""
+        if self.capture == "tab":
+            return self._ffmpeg_argv_tab()
+        return self._ffmpeg_argv_x11grab()
+
+    def _hls_output_argv(self) -> list:
+        """The HLS muxer half of the command, shared by both capture paths."""
+        return [
+            # Drops the MPEG-TS muxer's default 0.7s PCR preload, a fixed offset
+            # between the container timeline and real time.
+            "-muxdelay", "0", "-muxpreload", "0",
+            "-f", "hls",
+            "-hls_time", str(SEGMENT_SECONDS),
+            "-hls_list_size", str(PLAYLIST_SIZE),
+            # Keep a few segments past the window so a client holding a slightly
+            # stale playlist does not 404.
+            "-hls_delete_threshold", "3",
+            "-hls_segment_type", "mpegts",
+            # temp_file writes .tmp then renames, so we never serve a
+            # half-written segment. NOTE: no hls_playlist_type — "event" forbids
+            # removing segments and would silently defeat delete_segments,
+            # growing the disk without bound.
+            "-hls_flags",
+            "delete_segments+append_list+independent_segments+program_date_time+temp_file",
+            "-hls_segment_filename", os.path.join(self.out_dir, "seg_%06d.ts"),
+            self.playlist_path,
+        ]
+
+    def _ffmpeg_argv_tab(self) -> list:
+        """Remux the extension's WebM feed (H.264 + Opus) into HLS.
+
+        The video is normally passed through untouched: Chromium already encoded
+        it, with a keyframe every SEGMENT_SECONDS (offscreen.js asks for one via
+        videoKeyFrameIntervalDuration), so every segment still starts on an IDR
+        and the encode costs ffmpeg nothing. Only audio is transcoded, Opus to
+        AAC, because MPEG-TS players do not take Opus.
+
+        A crop is the one thing that forces a re-encode: cutting pixels out of a
+        compressed stream needs decoding it first. That path uses the same
+        libx264 settings as x11grab does.
+        """
+        record = self.record
+        fps = record["framerate"]
+        gop = fps * SEGMENT_SECONDS
+        vb = record["video_bitrate"]
+
+        argv = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-nostats", "-progress", "pipe:1",
+            # The feed arrives on stdin as it is recorded; do not wait to probe
+            # more of it than the first cluster before starting.
+            "-fflags", "nobuffer", "-flags", "low_delay",
+            "-i", "pipe:0",
+            "-map", "0:v",
+        ]
+        if record["audio"]:
+            argv += ["-map", "0:a?"]
+        box = virtual_channels.crop_box(record)
+        if box:
+            crop_x, crop_y, crop_w, crop_h = box
+            argv += [
+                "-vf", f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}",
+                "-c:v", "libx264",
+                "-preset", record["preset"],
+                "-threads", str(ENCODER_THREADS),
+                "-tune", "zerolatency",
+                "-profile:v", "main", "-pix_fmt", "yuv420p",
+                "-b:v", f"{vb}k", "-maxrate", f"{vb}k", "-bufsize", f"{vb * 2}k",
+                "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0",
+                "-x264-params", "repeat-headers=1",
+            ]
+            argv += ["-fps_mode", "cfr"] if _ffmpeg_supports_fps_mode() else ["-vsync", "cfr"]
+        else:
+            argv += ["-c:v", "copy"] + self._snap_bsf(fps)
+        if record["audio"]:
+            argv += [
+                # The recorder's audio and video share a clock, so there is no
+                # capture-clock drift to correct; a gentle async only absorbs
+                # the odd gap Opus leaves when the tab briefly produces nothing.
+                "-af", "aresample=async=1000:first_pts=0",
+                "-c:a", "aac", "-b:a", f"{record['audio_bitrate']}k",
+                "-ar", "48000", "-ac", "2",
+            ]
+        else:
+            argv += ["-an"]
+        return argv + self._hls_output_argv()
+
+    @staticmethod
+    def _snap_bsf(fps: int) -> list:
+        """Snap copied video timestamps onto the channel's frame grid.
+
+        Chromium's compositor in a container runs on a fixed 60Hz timer, so
+        the frames the capturer hands over carry timestamps on a 16.7ms grid.
+        Captured at 30fps a 50fps page comes out as 17/33/50ms intervals, and a
+        25fps page captured at 25 alternates 33/50ms: the average rate is right
+        but every third frame is early or late, which reads as a wobble on
+        slow pans. Each timestamp is rounded to the nearest 1/fps slot, but
+        never to a slot earlier than one past the previous frame's: two grid
+        frames 17ms apart at 30fps would otherwise round into the same slot,
+        and the second is pushed to the next one instead. Because the capturer
+        is rate-limited to fps on average, a pushed frame is followed by a gap
+        that rounding pulls back onto the true grid, so the shift stays within
+        a frame and cannot accumulate over a long session. Measured: a 50fps
+        page captured at 30 goes from 17/33/50ms intervals to 33ms every frame,
+        and at 25 from 33/50 to 40ms every frame.
+
+        Only meaningful with -c:v copy; the re-encode path already runs CFR.
+        """
+        if not _ffmpeg_has_bsf("setts"):
+            # ffmpeg < 5.0 has no setts filter. The stream is still correct,
+            # just on the compositor's grid rather than the channel's.
+            return []
+        # The comma inside the expression must be escaped, or ffmpeg reads it
+        # as the separator between bsf options. argv goes straight to exec, so
+        # exactly one backslash reaches ffmpeg. TB is the input timebase, so
+        # 1/(TB*fps) is one frame slot in timestamp units.
+        expr = f"max(PREV_OUTPTS+1/(TB*{fps})\\,round(TS*TB*{fps})/(TB*{fps}))"
+        return ["-bsf:v", f"setts=ts={expr}"]
+
+    def _ffmpeg_argv_x11grab(self) -> list:
         record = self.record
         fps = record["framerate"]
         gop = fps * SEGMENT_SECONDS
@@ -880,12 +1147,12 @@ class VirtualSession:
             crop_x, crop_y, crop_w, crop_h = box
             argv += [
                 "-video_size", f"{crop_w}x{crop_h}",
-                "-i", f":{self.display}.0+{crop_x},{crop_y}",
+                "-i", f"{display_name(self.display)}.0+{crop_x},{crop_y}",
             ]
         else:
             argv += [
                 "-video_size", f"{self.width}x{self.height}",
-                "-i", f":{self.display}.0",
+                "-i", f"{display_name(self.display)}.0",
             ]
         if record["audio"]:
             argv += [
@@ -932,28 +1199,7 @@ class VirtualSession:
         # x11grab drops frames under load; libx264 with a fixed GOP is much
         # happier with a constant frame rate.
         argv += ["-fps_mode", "cfr"] if _ffmpeg_supports_fps_mode() else ["-vsync", "cfr"]
-
-        argv += [
-            # Drops the MPEG-TS muxer's default 0.7s PCR preload, a fixed offset
-            # between the container timeline and real time.
-            "-muxdelay", "0", "-muxpreload", "0",
-            "-f", "hls",
-            "-hls_time", str(SEGMENT_SECONDS),
-            "-hls_list_size", str(PLAYLIST_SIZE),
-            # Keep a few segments past the window so a client holding a slightly
-            # stale playlist does not 404.
-            "-hls_delete_threshold", "3",
-            "-hls_segment_type", "mpegts",
-            # temp_file writes .tmp then renames, so we never serve a
-            # half-written segment. NOTE: no hls_playlist_type — "event" forbids
-            # removing segments and would silently defeat delete_segments,
-            # growing the disk without bound.
-            "-hls_flags",
-            "delete_segments+append_list+independent_segments+program_date_time+temp_file",
-            "-hls_segment_filename", os.path.join(self.out_dir, "seg_%06d.ts"),
-            self.playlist_path,
-        ]
-        return argv
+        return argv + self._hls_output_argv()
 
     async def _start_ffmpeg(self) -> None:
         # Warm the ffmpeg version probe OFF the event loop. It shells out with a
@@ -962,6 +1208,7 @@ class VirtualSession:
         # every other request, /health included, just hangs. It caches on the
         # function, so this costs nothing on later starts.
         await asyncio.to_thread(_ffmpeg_supports_fps_mode)
+        await asyncio.to_thread(_ffmpeg_has_bsf, "setts")
 
         # Wipe first, not just on teardown: append_list will happily resume onto
         # a playlist left behind by a crashed run and reference segments that no
@@ -970,18 +1217,121 @@ class VirtualSession:
         os.makedirs(self.out_dir, exist_ok=True)
 
         env = dict(os.environ)
-        env["DISPLAY"] = f":{self.display}"
+        env["DISPLAY"] = display_name(self.display)
         if self.record["audio"]:
             env.update(_pulse_env())
 
         self._ffmpeg = await asyncio.create_subprocess_exec(
             *self._ffmpeg_argv(),
+            # Tab capture feeds the recording in on stdin; x11grab reads the
+            # display itself and gets no stdin at all (-nostdin).
+            stdin=asyncio.subprocess.PIPE if self.capture == "tab" else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
         asyncio.create_task(self._drain_ffmpeg_log())
         asyncio.create_task(self._drain_ffmpeg_progress())
+
+        if self.capture == "tab":
+            trace("capture:begin")
+            await self._start_tab_capture()
+            trace("capture:ok")
+
+    # -- tab capture -----------------------------------------------------------
+
+    async def _start_tab_capture(self) -> None:
+        """Tell the extension to record the page tab and stream it to us.
+
+        The extension's service worker is driven directly through Playwright,
+        which is what makes the whole thing need no user gesture and no UI. The
+        feed lands on /api/virtual-capture/<name> (backend.py) and is written
+        into ffmpeg's stdin by feed_capture().
+        """
+        assert self._context is not None
+        try:
+            workers = self._context.service_workers
+            worker = workers[0] if workers else await self._context.wait_for_event(
+                "serviceworker", timeout=15000
+            )
+        except Exception as exc:
+            raise VirtualSessionError(
+                "Tab capture extension did not start (is freesky/virtual_capture_ext "
+                f"present in the image?): {exc}"
+            ) from exc
+
+        _capture_targets[self.capture_secret] = self
+        opts = {
+            "ws": f"{CAPTURE_WS_BASE}/api/virtual-capture/{self.name}?key={self.capture_secret}",
+            "fps": self.record["framerate"],
+            "width": self.width, "height": self.height,
+            "audio": bool(self.record["audio"]),
+            "mime": CAPTURE_MIME_AV if self.record["audio"] else CAPTURE_MIME_V,
+            "vbps": self.record["video_bitrate"] * 1000,
+            "abps": self.record["audio_bitrate"] * 1000,
+            "keyMs": SEGMENT_SECONDS * 1000,
+            "timeslice": CAPTURE_TIMESLICE_MS,
+        }
+        try:
+            result = await asyncio.wait_for(
+                worker.evaluate("opts => startCapture(opts)", opts), timeout=30
+            )
+        except Exception as exc:
+            raise VirtualSessionError(f"Tab capture failed to start: {exc}") from exc
+        self._capture_started = True
+        trace("capture:started", json.dumps(result)[:200])
+
+        # The feed connecting is the proof that the whole path works end to end;
+        # a start that returned but never connects is a dead session, and it is
+        # cheaper to say so now than to time out waiting for segments.
+        try:
+            await asyncio.wait_for(self._capture_ready.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            raise VirtualSessionError(
+                "Tab capture started but its feed never reached the backend at "
+                f"{CAPTURE_WS_BASE} (VIRTUAL_CAPTURE_WS)"
+            ) from None
+
+    def accepts_capture(self, key: str) -> bool:
+        """True when `key` is this session's live capture secret."""
+        return bool(key) and secrets.compare_digest(key, self.capture_secret) \
+            and self._ffmpeg is not None
+
+    def capture_opened(self) -> None:
+        self.capture_connected = True
+        self._capture_ready.set()
+
+    def capture_closed(self) -> None:
+        self.capture_connected = False
+
+    async def feed_capture(self, data: bytes) -> None:
+        """Write one recorder chunk into ffmpeg. Raises when ffmpeg is gone."""
+        proc = self._ffmpeg
+        if proc is None or proc.stdin is None or proc.returncode is not None:
+            raise VirtualSessionError("encoder is not running")
+        proc.stdin.write(data)
+        # Back-pressure: if ffmpeg falls behind, this waits, the WebSocket read
+        # loop waits, and the extension's bufferedAmount grows where the
+        # diagnostics endpoint can see it, rather than memory growing here.
+        await proc.stdin.drain()
+        self.capture_bytes += len(data)
+        self.capture_chunks += 1
+
+    async def capture_status(self) -> dict:
+        """What the extension reports about its recording, for diagnostics."""
+        if self.capture != "tab":
+            return {"mode": self.capture}
+        out = {"mode": "tab", "connected": self.capture_connected,
+               "bytes": self.capture_bytes, "chunks": self.capture_chunks}
+        try:
+            workers = self._context.service_workers if self._context else []
+            if workers:
+                out["recorder"] = await asyncio.wait_for(
+                    workers[0].evaluate("() => captureStatus()"), timeout=5
+                )
+        except Exception as exc:
+            out["recorder"] = {"error": f"{type(exc).__name__}: {exc}"}
+        return out
 
     async def _drain_ffmpeg_log(self) -> None:
         """Keep the last few stderr lines so a failure has a diagnosis.
@@ -994,6 +1344,11 @@ class VirtualSession:
             async for raw in self._ffmpeg.stderr:
                 line = raw.decode(errors="replace").strip()
                 if not line:
+                    continue
+                # WebM packets carry no duration, and the hls muxer says so on
+                # every one when copying. It is harmless (EXTINF comes out
+                # right) but would push every real warning out of the tail.
+                if "pkt->duration = 0" in line or line.startswith("Last message repeated"):
                     continue
                 self._log_tail.append(line)
                 del self._log_tail[:-40]
@@ -1060,9 +1415,14 @@ class VirtualSession:
 
     async def stop(self) -> None:
         """Tear everything down. Safe to call twice, and on a half-built session."""
+        _capture_targets.pop(self.capture_secret, None)
         # ffmpeg first, and gracefully: SIGKILL leaves a playlist with no
         # ENDLIST, which players poll forever.
         if self._ffmpeg is not None and self._ffmpeg.returncode is None:
+            # EOF on stdin is the clean end for the remux path.
+            if self._ffmpeg.stdin is not None:
+                with contextlib.suppress(Exception):
+                    self._ffmpeg.stdin.close()
             with contextlib.suppress(ProcessLookupError):
                 self._ffmpeg.terminate()
             with contextlib.suppress(asyncio.TimeoutError):
@@ -1132,13 +1492,13 @@ class VirtualSession:
             "-draw_mouse", "1",
             "-framerate", str(int(max(CONTROL_FPS, 1))),
             "-video_size", f"{self.width}x{self.height}",
-            "-i", f":{self.display}.0",
+            "-i", f"{display_name(self.display)}.0",
             # -2 keeps the height even, which the encoder requires.
             "-vf", f"scale={width}:-2",
             "-q:v", str(CONTROL_QUALITY), "-f", "mjpeg", "pipe:1",
         ]
         env = dict(os.environ)
-        env["DISPLAY"] = f":{self.display}"
+        env["DISPLAY"] = display_name(self.display)
         proc = await asyncio.create_subprocess_exec(
             *argv, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL, env=env,
@@ -1179,7 +1539,7 @@ class VirtualSession:
             return
 
         kind = str(event.get("type", ""))
-        display = f":{self.display}"
+        display = display_name(self.display)
         x, y = int(event.get("x", 0) or 0), int(event.get("y", 0) or 0)
         button = {"left": "1", "middle": "2", "right": "3"}.get(
             str(event.get("button", "left")), "1"
@@ -1327,13 +1687,62 @@ class VirtualSession:
             "url": self.page_url,
             # Flat, not nested: Reflex cannot index a nested dict inside an
             # rx.foreach over List[dict], so the row would fail to render.
-            "fps": self.metrics.get("fps", "-"),
+            # Stream copy reports no encoder fps; the recorder's rate is the
+            # channel's, so fall back to the configured value there.
+            "fps": self.metrics.get("fps") or (str(self.record["framerate"]) if self.capture == "tab" else "-"),
             "speed": self.metrics.get("speed", "-"),
             "dup": self.metrics.get("dup", "-"),
             "drop": self.metrics.get("drop", "-"),
+            "capture": self.capture,
+            "capture_connected": self.capture_connected,
+            # Percent of one core over the last sample (see SessionManager.
+            # _sample_cpu). "-" until the first two samples exist.
+            "cpu_browser": self.cpu.get("browser", "-"),
+            "cpu_encoder": self.cpu.get("encoder", "-"),
+            "cpu_display": self.cpu.get("display", "-"),
             "error": self.error,
             "log": self._log_tail[-5:],
         }
+
+    def _pids(self) -> dict:
+        """Process ids per group: the browser tree, the encoder, the display.
+
+        Chromium's helper processes do not repeat --user-data-dir, so the tree
+        is found by parent links from the one process that does.
+        """
+        out = {"browser": [], "encoder": [], "display": []}
+        if self._ffmpeg is not None and self._ffmpeg.returncode is None:
+            out["encoder"].append(self._ffmpeg.pid)
+        if self._xvfb is not None and self._xvfb.poll() is None:
+            out["display"].append(self._xvfb.pid)
+        marker = f"--user-data-dir={self.profile_dir}"
+        parents: Dict[int, int] = {}
+        root = None
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                pid = int(entry)
+                try:
+                    with open(f"/proc/{pid}/stat") as f:
+                        parents[pid] = int(f.read().rsplit(")", 1)[1].split()[1])
+                    if root is None:
+                        with open(f"/proc/{pid}/cmdline", "rb") as f:
+                            cmd = f.read()
+                        if marker.encode() in cmd and b"--type=" not in cmd:
+                            root = pid
+                except OSError:
+                    continue
+        except OSError:
+            return out
+        if root is None:
+            return out
+        tree = {root}
+        # A few passes are enough: Chromium's tree is at most a few levels deep.
+        for _ in range(4):
+            tree |= {pid for pid, ppid in parents.items() if ppid in tree}
+        out["browser"] = sorted(tree)
+        return out
 
 
 # --- manager ----------------------------------------------------------------
@@ -1497,6 +1906,39 @@ class SessionManager:
         session.record = record
         return True
 
+    def _sample_cpu(self) -> None:
+        """Refresh every session's per-group CPU percentages.
+
+        Reads /proc directly rather than shelling out to ps, and keeps one prior
+        sample per session so the number is a rate over the last interval rather
+        than a lifetime average that hides a stall.
+        """
+        clk = os.sysconf("SC_CLK_TCK")
+        now = time.monotonic()
+        for session in list(self._sessions.values()):
+            ticks = {}
+            for group, pids in session._pids().items():
+                total = 0
+                for pid in pids:
+                    try:
+                        with open(f"/proc/{pid}/stat") as f:
+                            parts = f.read().rsplit(")", 1)[1].split()
+                        total += int(parts[11]) + int(parts[12])
+                    except (OSError, IndexError, ValueError):
+                        continue
+                ticks[group] = total
+            prev = session._cpu_sample
+            session._cpu_sample = (now, ticks)
+            if prev is None:
+                continue
+            elapsed = now - prev[0]
+            if elapsed <= 0:
+                continue
+            session.cpu = {
+                group: round((ticks.get(group, 0) - prev[1].get(group, 0)) / clk / elapsed * 100)
+                for group in ticks
+            }
+
     async def _reap_loop(self) -> None:
         """Tear down idle and dead sessions.
 
@@ -1506,6 +1948,8 @@ class SessionManager:
         try:
             while self._sessions:
                 await asyncio.sleep(5)
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(self._sample_cpu)
                 now = time.monotonic()
                 for name, session in list(self._sessions.items()):
                     idle = now - session.last_access
@@ -1531,6 +1975,67 @@ class SessionManager:
 
 
 manager = SessionManager()
+
+
+def _read(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+_throttle_sample: Optional[tuple] = None
+
+
+def host_load() -> dict:
+    """The CPU picture a stuttering stream is usually explained by.
+
+    `quota` is the container's CPU limit in cores (0 = none). `throttled_pct`
+    is the share of CFS periods in which the container was stopped for having
+    used its quota, over the interval since this was last called. That number
+    is the one to look at first: a `cpus:` limit is enforced by pausing every
+    thread once the quota for the current 100ms period is spent, and Chromium,
+    with dozens of threads, can spend a 4-core quota in 40ms on an 8-core host
+    and then sit frozen for the remaining 60ms. That shows up as a stream that
+    stutters at ~10Hz while average CPU looks fine. Pinning cores (cpuset)
+    instead of a quota has no such pause; see docker-compose.yml.
+    """
+    global _throttle_sample
+    out: dict = {"cpus": os.cpu_count() or 0, "quota": 0.0, "load": None,
+                 "throttled_pct": None, "cgroup": ""}
+    try:
+        out["load"] = [round(x, 2) for x in os.getloadavg()]
+    except OSError:
+        pass
+    # cgroup v2, then v1.
+    periods = throttled = None
+    cpu_max = _read("/sys/fs/cgroup/cpu.max")
+    if cpu_max:
+        out["cgroup"] = "v2"
+        quota, _, period = cpu_max.partition(" ")
+        if quota != "max" and period.isdigit() and int(period):
+            out["quota"] = round(int(quota) / int(period), 2)
+        stat = dict(line.split(" ", 1) for line in _read("/sys/fs/cgroup/cpu.stat").splitlines() if " " in line)
+        periods, throttled = stat.get("nr_periods"), stat.get("nr_throttled")
+    else:
+        quota = _read("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+        period = _read("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+        if quota:
+            out["cgroup"] = "v1"
+            if quota.lstrip("-").isdigit() and int(quota) > 0 and period.isdigit() and int(period):
+                out["quota"] = round(int(quota) / int(period), 2)
+            stat = dict(line.split(" ", 1) for line in _read("/sys/fs/cgroup/cpu/cpu.stat").splitlines() if " " in line)
+            periods, throttled = stat.get("nr_periods"), stat.get("nr_throttled")
+    if periods is not None and throttled is not None and periods.isdigit() and throttled.isdigit():
+        sample = (int(periods), int(throttled))
+        prev = _throttle_sample
+        _throttle_sample = sample
+        if prev is not None and sample[0] > prev[0]:
+            out["throttled_pct"] = round((sample[1] - prev[1]) / (sample[0] - prev[0]) * 100)
+        elif prev is None and sample[0]:
+            out["throttled_pct"] = round(sample[1] / sample[0] * 100)
+    return out
 
 
 def progress_metrics(block: dict) -> dict:
@@ -1586,7 +2091,8 @@ if __name__ == "__main__":
     # long, order-sensitive, and a wrong flag only shows up as a dead stream.
     rec = virtual_channels.validate_channel(
         {"name": "demo", "url": "https://example.com", "resolution": "720p",
-         "framerate": 30, "video_bitrate": 3000, "audio_bitrate": 96}
+         "framerate": 30, "video_bitrate": 3000, "audio_bitrate": 96,
+         "capture": "x11grab"}
     )
     session = VirtualSession(rec, 99)
     argv = session._ffmpeg_argv()
@@ -1609,9 +2115,32 @@ if __name__ == "__main__":
     assert argv[-1].endswith("index.m3u8") and argv[-2].endswith("seg_%06d.ts")
     assert ("-fps_mode" in argv) != ("-vsync" in argv), "exactly one CFR flag"
 
+    # Tab capture: Chromium encodes, ffmpeg only remuxes.
+    tab = VirtualSession(virtual_channels.validate_channel(
+        {"name": "tab", "url": "https://example.com", "framerate": 30}), 99)
+    targv = tab._ffmpeg_argv()
+    tjoined = " ".join(targv)
+    assert "pipe:0" in targv and "x11grab" not in tjoined and "pulse" not in tjoined
+    assert targv[targv.index("-c:v") + 1] == "copy", "no second encode without a crop"
+    assert "-c:a aac" in tjoined, "MPEG-TS players do not take Opus"
+    assert "-nostdin" not in targv, "stdin IS the input on this path"
+    assert targv[-1].endswith("index.m3u8") and "delete_segments" in tjoined
+    assert any(a.startswith("--load-extension=") for a in tab._browser_args())
+    assert f"--allowlisted-extension-id={extension_id()}" in tab._browser_args()
+    assert not any(a.startswith("--load-extension=") for a in session._browser_args()), \
+        "x11grab sessions carry no capture extension"
+    assert re.fullmatch(r"[a-p]{32}", extension_id()), extension_id()
+    cropped = VirtualSession(virtual_channels.validate_channel(
+        {"name": "crop", "url": "https://example.com", "crop_x": 10, "crop_y": 10,
+         "crop_w": 640, "crop_h": 360}), 99)
+    cjoined = " ".join(cropped._ffmpeg_argv())
+    assert "crop=640:360:10:10" in cjoined and "libx264" in cjoined, "a crop needs a re-encode"
+    assert not tab.accepts_capture(tab.capture_secret), "no encoder yet, no feed"
+    assert capture_target("tab", tab.capture_secret) is None, "not registered until capture starts"
+
     silent = VirtualSession(
         virtual_channels.validate_channel(
-            {"name": "silent", "url": "https://e.com", "audio": False}
+            {"name": "silent", "url": "https://e.com", "audio": False, "capture": "x11grab"}
         ), 99,
     )
     sargv = silent._ffmpeg_argv()

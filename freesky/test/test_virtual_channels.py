@@ -87,12 +87,22 @@ def test_rename_does_not_leave_a_duplicate():
 # --- ffmpeg command ---------------------------------------------------------
 
 
+# --- x11grab encoder command -----------------------------------------------
+# These pin the libx264 command for the x11grab path. Tab capture (the default)
+# does not encode video in ffmpeg at all; its command is tested further down.
+
+
+def _x11(**fields):
+    fields.setdefault("name", "d")
+    fields.setdefault("url", "https://e.com")
+    fields["capture"] = "x11grab"
+    return virtual_channels.validate_channel(fields)
+
+
 def test_gop_matches_segment_length():
     """If the GOP and the segment length disagree, segments stop starting on a
     keyframe and EXT-X-INDEPENDENT-SEGMENTS becomes a lie that stalls players."""
-    record = virtual_channels.validate_channel(
-        {"name": "d", "url": "https://e.com", "framerate": 20}
-    )
+    record = _x11(framerate=20)
     argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
     assert argv[argv.index("-g") + 1] == str(20 * virtual_session.SEGMENT_SECONDS)
     assert argv[argv.index("-keyint_min") + 1] == argv[argv.index("-g") + 1]
@@ -130,7 +140,7 @@ def test_silent_channel_has_no_audio_input():
 def test_both_inputs_get_a_deep_thread_queue():
     """With the tiny default queue, a momentary x11grab stall drops audio packets
     and the stream desyncs permanently."""
-    record = virtual_channels.validate_channel({"name": "d", "url": "https://e.com"})
+    record = _x11()
     argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
     assert argv.count("-thread_queue_size") == 2
 
@@ -138,7 +148,7 @@ def test_both_inputs_get_a_deep_thread_queue():
 def test_exactly_one_cfr_flag():
     """-fps_mode replaced -vsync in ffmpeg 5.1; sending both, or the wrong one for
     the installed version, is an immediate 'Unrecognized option' exit."""
-    record = virtual_channels.validate_channel({"name": "d", "url": "https://e.com"})
+    record = _x11()
     argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
     assert ("-fps_mode" in argv) != ("-vsync" in argv)
 
@@ -519,6 +529,7 @@ class _FakeSettingsState:
         self.vc_resolution = virtual_channels.DEFAULT_RESOLUTION
         self.vc_framerate = str(virtual_channels.DEFAULT_FRAMERATE)
         self.vc_preset = virtual_channels.DEFAULT_PRESET
+        self.vc_capture = virtual_channels.DEFAULT_CAPTURE
         self.vc_video_bitrate = "2500"
         self.vc_audio = True
         self.vc_audio_bitrate = "128"
@@ -648,9 +659,7 @@ def test_every_framerate_gives_a_whole_gop():
     players than a slightly higher latency."""
     for fps in virtual_channels.FRAMERATES:
         assert (fps * virtual_session.SEGMENT_SECONDS) % 1 == 0
-        record = virtual_channels.validate_channel(
-            {"name": "d", "url": "https://e.com", "framerate": fps}
-        )
+        record = _x11(framerate=fps)
         argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
         assert argv[argv.index("-g") + 1] == str(fps * virtual_session.SEGMENT_SECONDS)
 
@@ -667,7 +676,7 @@ def test_audio_resampler_uses_a_stretching_async_value():
 def test_encoder_threads_are_pinned():
     """Unpinned, x264 spawns ~1.5x ncpu threads and starves the very browser it
     is capturing — which shows up as duplicated frames, not as a slow encode."""
-    record = virtual_channels.validate_channel({"name": "d", "url": "https://e.com"})
+    record = _x11()
     argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
     assert argv[argv.index("-threads") + 1] == str(virtual_session.ENCODER_THREADS)
 
@@ -1008,7 +1017,7 @@ def test_crop_exactly_filling_the_screen_is_allowed():
 
 def test_crop_is_applied_to_the_x11grab_input_not_a_filter():
     """Grabbing the region directly is cheaper than grabbing all and cropping."""
-    record = _rec(crop_x=100, crop_y=50, crop_w=640, crop_h=360)
+    record = _rec(crop_x=100, crop_y=50, crop_w=640, crop_h=360, capture="x11grab")
     argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
     i = argv.index("-video_size")
     assert argv[i + 1] == "640x360"
@@ -1019,7 +1028,7 @@ def test_crop_is_applied_to_the_x11grab_input_not_a_filter():
 
 
 def test_uncropped_session_grabs_the_whole_display():
-    record = _rec()
+    record = _rec(capture="x11grab")
     argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
     i = argv.index("-video_size")
     assert argv[i + 1] == "1280x720"
@@ -1211,3 +1220,202 @@ def test_reap_orphans_does_not_kill_this_process():
     assert isinstance(killed, list)
     # Still running, which is the assertion that matters.
     assert os.getpid() > 0
+
+
+def test_backend_runs_in_production_mode():
+    """`reflex run` defaults to DEV, and dev mode enables a file watcher.
+
+    Dev granian runs with reload=True, reload_tick=100 and
+    reload_paths=[Path.cwd()] -- and start.sh cds to /app, so the whole app tree
+    is watched, including the ./data volume. Chromium writing its profile into
+    /app/data/virtual-profiles then restarted the worker mid-request, and
+    workers_kill_timeout=2 dropped the connection ~2.2s in. That was the "HTTP
+    502 after 2.2s" on every control-panel start, and the "it reloads every time
+    settings change" symptom, since users.json and friends live there too.
+
+    Reproduced and fixed empirically: one .ldb write took the dev backend down
+    for 2.2s; under --env prod the identical write changed nothing.
+    """
+    body = _start_sh()
+    assert "reflex run --env prod" in body, (
+        "start.sh must pass --env prod; REFLEX_ENV and rxconfig's env=PROD do "
+        "NOT override the CLI default of DEV, and dev mode watches /app"
+    )
+
+
+def test_hot_reload_override_is_pinned_away_from_the_data_volume():
+    """Belt and braces if --env prod is ever dropped from the run line."""
+    body = _start_sh()
+    assert "REFLEX_HOT_RELOAD_OVERRIDE_PATHS" in body
+    assert "/app/freesky" in body, "the watcher must point at source, not /app"
+
+
+# --- tab capture (the default path) -----------------------------------------
+# Frames come from Chromium's compositor via freesky/virtual_capture_ext and
+# arrive already H.264-encoded on a loopback WebSocket; ffmpeg only remuxes.
+# The failure that motivated it: x11grab on a busy host delivered ~2 distinct
+# pictures a second (5000 duplicated + 2000 dropped frames in three minutes)
+# while the page itself was presenting 44fps. Wall-clock sampling cannot be
+# made smooth under load; compositor timestamps can.
+
+
+def _tab(**fields):
+    fields.setdefault("name", "d")
+    fields.setdefault("url", "https://e.com")
+    return virtual_channels.validate_channel(fields)
+
+
+def test_tab_capture_is_the_default():
+    assert virtual_channels.DEFAULT_CAPTURE == "tab"
+    assert _tab()["capture"] == "tab"
+    assert _tab(capture="x11grab")["capture"] == "x11grab"
+    with pytest.raises(virtual_channels.VirtualChannelError):
+        _tab(capture="screencast")
+
+
+def test_switching_capture_path_restarts_the_session():
+    """The extension flags and the encoder command are baked in at launch."""
+    assert virtual_channels.needs_restart(_tab(), _tab(capture="x11grab"))
+
+
+def test_tab_ffmpeg_remuxes_and_does_not_encode_video():
+    """The whole point: Chromium already encoded it. A second libx264 pass would
+    cost the CPU that was starving the browser in the first place."""
+    argv = virtual_session.VirtualSession(_tab(), 99)._ffmpeg_argv()
+    joined = " ".join(argv)
+    assert "pipe:0" in argv, "the feed arrives on stdin"
+    assert argv[argv.index("-c:v") + 1] == "copy"
+    assert "libx264" not in argv and "x11grab" not in joined and "pulse" not in joined
+    assert "-nostdin" not in argv, "stdin IS the input here"
+    assert "-c:a aac" in joined, "MPEG-TS players do not take Opus"
+    assert "delete_segments" in joined and "independent_segments" in joined
+    assert argv[-1].endswith("index.m3u8")
+
+
+def test_tab_crop_reencodes_with_a_filter():
+    """A crop is the one thing that forces decode + libx264 on this path."""
+    argv = virtual_session.VirtualSession(
+        _tab(crop_x=100, crop_y=50, crop_w=640, crop_h=360), 99
+    )._ffmpeg_argv()
+    joined = " ".join(argv)
+    assert "crop=640:360:100:50" in joined
+    assert "libx264" in argv and "copy" not in argv
+    assert argv[argv.index("-g") + 1] == str(_tab()["framerate"] * virtual_session.SEGMENT_SECONDS)
+
+
+def test_tab_silent_channel_drops_audio():
+    argv = virtual_session.VirtualSession(_tab(audio=False), 99)._ffmpeg_argv()
+    assert "-an" in argv and "aac" not in argv
+
+
+def test_tab_sessions_load_and_trust_the_extension():
+    """Without --allowlisted-extension-id, getMediaStreamId fails with
+    "Extension has not been invoked for the current page"."""
+    args = virtual_session.VirtualSession(_tab(), 99)._browser_args()
+    ext_id = virtual_session.extension_id()
+    assert f"--load-extension={virtual_session.EXT_DIR}" in args
+    assert f"--disable-extensions-except={virtual_session.EXT_DIR}" in args
+    assert f"--allowlisted-extension-id={ext_id}" in args
+    # x11grab sessions do not carry an extension they never drive.
+    x11 = virtual_session.VirtualSession(_x11(), 99)._browser_args()
+    assert not any(a.startswith("--load-extension") for a in x11)
+
+
+def test_extension_id_is_derived_from_the_manifest_key():
+    """Chromium ids an extension by the SHA-256 of its public key, a-p encoded.
+    Hard-coding the id next to the manifest is how the two drift apart."""
+    import base64
+    import hashlib
+
+    manifest = json.load(open(os.path.join(virtual_session.EXT_DIR, "manifest.json")))
+    digest = hashlib.sha256(base64.b64decode(manifest["key"])).hexdigest()[:32]
+    expected = "".join(chr(ord("a") + int(c, 16)) for c in digest)
+    assert virtual_session.extension_id() == expected
+    assert re.fullmatch(r"[a-p]{32}", expected)
+    assert "tabCapture" in manifest["permissions"] and "offscreen" in manifest["permissions"]
+    assert manifest["manifest_version"] == 3, "MV2 extensions no longer load in current Chromium"
+    for name in ("sw.js", "offscreen.html", "offscreen.js"):
+        assert os.path.exists(os.path.join(virtual_session.EXT_DIR, name)), name
+
+
+def test_recorder_asks_for_one_keyframe_per_segment():
+    """With -c:v copy the keyframe cadence is Chromium's, so the extension has to
+    request it; otherwise segments cut at whatever interval OpenH264 picks."""
+    src = open(os.path.join(virtual_session.EXT_DIR, "offscreen.js")).read()
+    assert "videoKeyFrameIntervalDuration" in src
+    session = virtual_session.VirtualSession(_tab(), 99)
+    assert session.record["framerate"] * virtual_session.SEGMENT_SECONDS > 0
+
+
+def test_capture_feed_is_admitted_only_by_the_session_secret(client, monkeypatch):
+    """A valid *user* token must not be enough to push video into a channel."""
+    session = virtual_session.VirtualSession(_tab(name="feed"), 99)
+    # Not registered: nothing to feed.
+    assert virtual_session.capture_target("feed", session.capture_secret) is None
+    virtual_session._capture_targets[session.capture_secret] = session
+    try:
+        assert virtual_session.capture_target("feed", session.capture_secret) is session
+        assert virtual_session.capture_target("other", session.capture_secret) is None
+        assert virtual_session.capture_target("feed", "wrong") is None
+        # Right key, but no encoder to feed yet.
+        assert not session.accepts_capture(session.capture_secret)
+        with pytest.raises(Exception):
+            with client.websocket_connect("/api/virtual-capture/feed?key=wrong"):
+                pass
+    finally:
+        virtual_session._capture_targets.pop(session.capture_secret, None)
+
+
+def test_status_reports_host_cpu_picture(client):
+    """Stutter is nearly always CPU; the page should show the number that
+    explains it (quota throttling) without a shell into the container."""
+    body = client.get("/api/virtual-sessions/status").json()
+    assert "host" in body
+    for key in ("cpus", "quota", "load", "throttled_pct"):
+        assert key in body["host"]
+
+
+def test_session_status_carries_capture_mode_and_cpu():
+    status = virtual_session.VirtualSession(_tab(), 99).status()
+    assert status["capture"] == "tab"
+    assert status["capture_connected"] is False
+    assert status["cpu_browser"] == "-" and status["cpu_encoder"] == "-"
+
+
+def test_framerates_include_the_60hz_grid_rates():
+    """Tab capture takes every Nth compositor frame off a 60Hz timer, so the
+    rates that divide 60 give even intervals. 30 is the default for that
+    reason; 25 is kept for x11grab, which samples on its own clock."""
+    assert virtual_channels.DEFAULT_FRAMERATE == 30
+    for fps in (20, 30, 60):
+        assert fps in virtual_channels.FRAMERATES
+    assert 50 in virtual_channels.FRAMERATES, "50fps sources exist"
+
+
+def test_diagnostics_endpoint_works_for_a_registered_session(client):
+    """Regression: the handler referenced virtual_session without importing it
+    once the host CPU picture was added, and every diagnostics call was a 500."""
+    session = virtual_session.VirtualSession(_tab(name="diag"), 99)
+    virtual_session.manager._sessions["diag"] = session
+    try:
+        body = client.get("/api/virtual-control/diag/diagnostics").json()
+    finally:
+        virtual_session.manager._sessions.pop("diag", None)
+    assert body["feed"]["mode"] == "tab"
+    assert body["capture"]["framerate"] == virtual_channels.DEFAULT_FRAMERATE
+    assert "host" in body and "cpu" in body
+    assert "error" in body["page"], "no live page, reported rather than raised"
+
+
+def test_tab_copy_path_snaps_timestamps_to_the_frame_grid():
+    """Compositor timestamps sit on a 60Hz grid; snapping to 1/fps is what turns
+    a 17/33/50ms pattern into an even 33ms without drifting over hours."""
+    argv = virtual_session.VirtualSession(_tab(framerate=30), 99)._ffmpeg_argv()
+    bsf = argv[argv.index("-bsf:v") + 1]
+    assert bsf.startswith("setts=ts=")
+    assert "round(TS*TB*30)/(TB*30)" in bsf
+    assert "PREV_OUTPTS+1/(TB*30)" in bsf, "never earlier than one slot past the last"
+    # The re-encode path is CFR already and must not carry the bsf.
+    cropped = virtual_session.VirtualSession(
+        _tab(crop_w=640, crop_h=360), 99)._ffmpeg_argv()
+    assert "-bsf:v" not in cropped
