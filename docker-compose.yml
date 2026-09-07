@@ -133,15 +133,20 @@ services:
     shm_size: "1gb"
 
     # Resource Limits
-    # Virtual channels are CPU-bound on software rendering, and the failure
-    # mode is the browser being starved until it stops painting. Give the
-    # container at least 2 CPUs per concurrent 720p channel; the encoder itself
-    # needs only a fraction of one.
-    cpus: ${CPU_LIMIT:-4}
-
+    #
+    # The CPU limit lives under deploy.resources.limits, NOT as a top-level
+    # `cpus:`. Compose treats the two as the same setting and refuses the file
+    # outright ("can't set distinct values on 'cpus' and
+    # 'deploy.resources.limits.cpus'") when both appear, so they cannot be
+    # combined even with matching values.
     deploy:
       resources:
         limits:
+          # Virtual channels are CPU-bound on software rendering, and the
+          # failure mode is the browser being starved until it stops painting.
+          # Budget at least 2 CPUs per concurrent 720p channel; the encoder
+          # itself needs only a fraction of one.
+          cpus: "${CPU_LIMIT:-4}"
           # 512M was right when this was a pure HTTP proxy. A virtual channel
           # adds a headful Chromium (~500-700M) plus an ffmpeg x264 encoder
           # (~150M) per session. Concurrent sessions are uncapped by default, so
