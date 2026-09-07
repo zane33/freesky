@@ -33,6 +33,7 @@ Nothing here runs until a virtual channel is actually requested, so the cost on
 an install that never uses the feature is one import.
 """
 import asyncio
+import base64
 import contextlib
 import logging
 import os
@@ -79,6 +80,13 @@ MAX_SESSIONS = int(os.environ.get("MAX_VIRTUAL_SESSIONS", "0"))
 # How long to wait for the first segments after the browser is ready before
 # giving up on a session.
 _FIRST_SEGMENT_TIMEOUT = float(os.environ.get("VIRTUAL_START_TIMEOUT", "45"))
+
+# Live-preview settings for the admin control panel. Frames are pushed by
+# Chromium's compositor (CDP screencast) and downscaled on the way out, so the
+# preview costs far less than the stream it sits beside.
+CONTROL_MAX_WIDTH = int(os.environ.get("VIRTUAL_CONTROL_MAX_WIDTH", "960"))
+CONTROL_QUALITY = int(os.environ.get("VIRTUAL_CONTROL_QUALITY", "50"))
+CONTROL_FPS = float(os.environ.get("VIRTUAL_CONTROL_FPS", "10"))
 
 # A stream is considered dead when its playlist has not been rewritten in this
 # many segment durations. Process liveness is NOT a sufficient check: ffmpeg can
@@ -235,9 +243,16 @@ class VirtualSession:
         self._page = None
         self._log_tail: list = []
         # Serialises page operations. Playwright's API is not safe against two
-        # coroutines driving the same page at once, and the admin control panel
-        # streams screenshots while also dispatching clicks.
+        # coroutines driving the same page at once. Preview frames deliberately
+        # do NOT take this lock — see the screencast section below.
         self._page_lock = asyncio.Lock()
+
+        # Live preview state. _viewers is a refcount so several admins watching
+        # the same channel share one screencast rather than starting several.
+        self._cdp = None
+        self._viewers = 0
+        self._last_frame: bytes = b""
+        self._frame_event = asyncio.Event()
 
     # -- lifecycle --
 
@@ -553,6 +568,15 @@ class VirtualSession:
                     self._ffmpeg.kill()
         self._ffmpeg = None
 
+        self._viewers = 0
+        if self._cdp is not None:
+            cdp, self._cdp = self._cdp, None
+            with contextlib.suppress(Exception):
+                await cdp.send("Page.stopScreencast")
+        # Release anyone blocked in preview_frames so their request ends rather
+        # than hanging on an event that will never be set again.
+        self._frame_event.set()
+
         for closer in (
             getattr(self._context, "close", None),
             getattr(self._playwright, "stop", None),
@@ -587,11 +611,102 @@ class VirtualSession:
     # click at (x, y) on the panel lands at (x, y) in the page with no mapping.
 
     async def screenshot(self) -> bytes:
-        """One JPEG frame of the live page."""
+        """One JPEG frame of the live page.
+
+        Fallback only. Every call is a full compositor capture that has to take
+        the page lock, which is exactly what made the control panel feel laggy:
+        a click could sit behind an in-flight screenshot. The screencast path
+        below is what the panel actually uses.
+        """
         if self._page is None:
             raise VirtualSessionError("Session has no page")
         async with self._page_lock:
             return await self._page.screenshot(type="jpeg", quality=60, timeout=10000)
+
+    # -- live preview via CDP screencast --------------------------------------
+    # Chromium pushes a frame whenever the page repaints, already JPEG-encoded
+    # and already downscaled to CONTROL_MAX_WIDTH. That is dramatically cheaper
+    # than asking for a full-size screenshot on a timer, and — because frames
+    # arrive as events rather than as calls we make — it never contends with
+    # input dispatch for the page lock.
+
+    def _on_screencast_frame(self, params: dict) -> None:
+        """CDP event handler. Runs on the event loop, so it must not block."""
+        data = params.get("data")
+        if data:
+            try:
+                self._last_frame = base64.b64decode(data)
+            except (ValueError, TypeError):
+                return
+            # Wake every viewer waiting on the next frame.
+            self._frame_event.set()
+        # Chromium stops sending frames until each one is acknowledged, so a
+        # missed ack silently freezes the preview.
+        session_id = params.get("sessionId")
+        if session_id is not None and self._cdp is not None:
+            asyncio.create_task(self._ack_frame(session_id))
+
+    async def _ack_frame(self, session_id) -> None:
+        with contextlib.suppress(Exception):
+            await self._cdp.send("Page.screencastFrameAck", {"sessionId": session_id})
+
+    async def open_preview(self) -> bool:
+        """Start (or join) the screencast. False if it could not be started."""
+        self._viewers += 1
+        if self._cdp is not None:
+            return True
+        if self._page is None or self._context is None:
+            self._viewers -= 1
+            return False
+        try:
+            self._cdp = await self._context.new_cdp_session(self._page)
+            self._cdp.on("Page.screencastFrame", self._on_screencast_frame)
+            # everyNthFrame throttles at the source, so a page painting at 30fps
+            # costs us CONTROL_FPS frames rather than 30 we would then discard.
+            every_nth = max(1, round(self.record["framerate"] / max(CONTROL_FPS, 1)))
+            height = round(CONTROL_MAX_WIDTH * self.height / self.width)
+            await self._cdp.send("Page.startScreencast", {
+                "format": "jpeg",
+                "quality": CONTROL_QUALITY,
+                "maxWidth": CONTROL_MAX_WIDTH,
+                "maxHeight": height,
+                "everyNthFrame": every_nth,
+            })
+            return True
+        except Exception as exc:
+            logger.warning("virtual[%s]: screencast unavailable (%s)", self.name, exc)
+            self._cdp = None
+            self._viewers -= 1
+            return False
+
+    async def close_preview(self) -> None:
+        """Drop one viewer; stop the screencast when the last one leaves."""
+        self._viewers = max(0, self._viewers - 1)
+        if self._viewers > 0 or self._cdp is None:
+            return
+        cdp, self._cdp = self._cdp, None
+        with contextlib.suppress(Exception):
+            await cdp.send("Page.stopScreencast")
+        with contextlib.suppress(Exception):
+            await cdp.detach()
+        self._last_frame = b""
+
+    async def preview_frames(self):
+        """Yield each new preview frame as it arrives.
+
+        Waits on an event rather than polling, so a still page costs nothing and
+        a moving one is delivered at the rate Chromium produces it.
+        """
+        # Send whatever we already have so a joining viewer sees the page
+        # immediately instead of waiting for the next repaint.
+        if self._last_frame:
+            yield self._last_frame
+        while True:
+            await self._frame_event.wait()
+            self._frame_event.clear()
+            if not self._last_frame:
+                continue
+            yield self._last_frame
 
     async def dispatch_input(self, event: dict) -> None:
         """Apply one input event from the control panel.
@@ -661,6 +776,27 @@ class VirtualSession:
         async with self._page_lock:
             await self._page.goto(url, wait_until="domcontentloaded", timeout=45000)
         self.last_access = time.monotonic()
+
+    async def page_size(self) -> tuple:
+        """The live page's CSS pixel size.
+
+        The control panel needs this to map a click, and it must come from the
+        page rather than from the configured geometry: the preview is
+        deliberately downscaled, so the frame's own dimensions are NOT the
+        coordinate space, and a kiosk window is often a pixel or two off the
+        nominal screen size.
+        """
+        if self._page is None:
+            return (self.width, self.height)
+        try:
+            size = await self._page.evaluate(
+                "() => [window.innerWidth, window.innerHeight]"
+            )
+            if size and size[0] and size[1]:
+                return (int(size[0]), int(size[1]))
+        except Exception:
+            pass
+        return (self.width, self.height)
 
     @property
     def page_url(self) -> str:

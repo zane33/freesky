@@ -1,5 +1,6 @@
 import os
 import asyncio
+import contextlib
 import sys
 import base64
 import glob
@@ -1828,7 +1829,7 @@ _MJPEG_BOUNDARY = "freeskyframe"
 # Frames per second for the control preview. Deliberately low: this is for
 # aiming a mouse, not for watching, and each frame is a full Playwright
 # screenshot that competes with the encoder for CPU.
-_CONTROL_FPS = float(os.environ.get("VIRTUAL_CONTROL_FPS", "4"))
+_CONTROL_FPS = float(os.environ.get("VIRTUAL_CONTROL_FPS", "10"))
 
 
 def _admin_from_request(request: Request) -> Optional[dict]:
@@ -1887,7 +1888,9 @@ async def virtual_control_start(name: str, request: Request):
         return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             content={"error": "start_failed",
                                      "message": f"{type(exc).__name__}: {exc}"})
-    return JSONResponse({"started": True, "name": name, "url": session.page_url})
+    width, height = await session.page_size()
+    return JSONResponse({"started": True, "name": name, "url": session.page_url,
+                         "width": width, "height": height})
 
 
 @fastapi_app.get("/api/virtual-control/{name}/stream.mjpeg")
@@ -1901,28 +1904,45 @@ async def virtual_control_stream(name: str, request: Request):
     if error is not None:
         return error
 
-    interval = 1.0 / max(_CONTROL_FPS, 0.5)
+    def _part(jpeg: bytes) -> bytes:
+        return (
+            f"--{_MJPEG_BOUNDARY}\r\n"
+            f"Content-Type: image/jpeg\r\n"
+            f"Content-Length: {len(jpeg)}\r\n\r\n"
+        ).encode() + jpeg + b"\r\n"
+
+    # Preferred path: Chromium pushes downscaled frames from its compositor as
+    # the page repaints. Nothing here polls, and no page lock is taken, so a
+    # click is never queued behind a frame capture.
+    streaming = await session.open_preview()
 
     async def frames():
         try:
+            if streaming:
+                async for jpeg in session.preview_frames():
+                    # The panel being open is itself a sign someone is using
+                    # this channel, so keep the reaper off it.
+                    session.last_access = time.monotonic()
+                    yield _part(jpeg)
+                return
+            # Fallback for a session whose CDP screencast could not start.
+            interval = 1.0 / max(_CONTROL_FPS, 0.5)
             while True:
-                # The panel being open is itself a sign someone is using this
-                # channel, so keep the reaper off it.
                 session.last_access = time.monotonic()
                 try:
                     jpeg = await session.screenshot()
                 except Exception as exc:
                     logger.debug(f"Control frame for {name} failed: {exc}")
                     return
-                yield (
-                    f"--{_MJPEG_BOUNDARY}\r\n"
-                    f"Content-Type: image/jpeg\r\n"
-                    f"Content-Length: {len(jpeg)}\r\n\r\n"
-                ).encode() + jpeg + b"\r\n"
+                yield _part(jpeg)
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             # Normal: the admin closed the panel.
             raise
+        finally:
+            if streaming:
+                with contextlib.suppress(Exception):
+                    await session.close_preview()
 
     return StreamingResponse(
         frames(),
@@ -2095,24 +2115,36 @@ async function post(path, body) {
 // page's real viewport. Every pointer event is scaled back into page
 // coordinates here — without this, clicks land in the wrong place on any
 // display narrower than the capture width.
+// The remote page's own CSS pixel size, reported by /start. This is the
+// coordinate space clicks must be expressed in. It is deliberately NOT the
+// frame's naturalWidth: the preview is downscaled for bandwidth, so the image
+// is smaller than the page and scaling by it would land every click short.
+let PAGE = {w: CFG.width, h: CFG.height};
+
 function toPageCoords(ev) {
   const r = frame.getBoundingClientRect();
-  // Scale from the RENDERED size to the frame's real pixel size. naturalWidth
-  // is the authority rather than CFG.width: if the browser ever renders at a
-  // different size than configured, trusting the config would misplace every
-  // click, whereas the decoded frame is by definition what the admin is
-  // looking at.
-  const nw = frame.naturalWidth || CFG.width;
-  const nh = frame.naturalHeight || CFG.height;
   return {
-    x: Math.round((ev.clientX - r.left) * (nw / r.width)),
-    y: Math.round((ev.clientY - r.top) * (nh / r.height)),
+    x: Math.round((ev.clientX - r.left) * (PAGE.w / r.width)),
+    y: Math.round((ev.clientY - r.top) * (PAGE.h / r.height)),
   };
 }
 
+// A move is only useful if it is the latest one. Sending while a previous
+// request is still in flight builds a queue the server works through long after
+// the pointer has moved on, which is what makes remote control feel laggy.
+// Clicks and keys are never dropped.
+let movePending = false;
+
 function send(event) {
   if (!controlling) return;
-  post("/input", event).catch(e => say("input failed: " + e.message, true));
+  const droppable = event.type === "move";
+  if (droppable) {
+    if (movePending) return;
+    movePending = true;
+  }
+  post("/input", event)
+    .catch(e => say("input failed: " + e.message, true))
+    .finally(() => { if (droppable) movePending = false; });
 }
 
 frame.addEventListener("click", ev => {
@@ -2141,7 +2173,7 @@ let lastMove = 0;
 frame.addEventListener("pointermove", ev => {
   if (!controlling) return;
   const now = performance.now();
-  if (now - lastMove < 120) return;
+  if (now - lastMove < 60) return;
   lastMove = now;
   const p = toPageCoords(ev);
   send({type: "move", x: p.x, y: p.y});
@@ -2199,6 +2231,7 @@ document.getElementById("go").addEventListener("click", async () => {
     say("Starting session (this can take up to a minute on a slow page)...");
     const r = await post("/start", {});
     if (r.url) urlEl.value = r.url;
+    if (r.width && r.height) PAGE = {w: r.width, h: r.height};
     frame.src = base + "/stream.mjpeg" + qs + "&t=" + Date.now();
     say("Viewing only. Press “Take control” to drive the browser.");
   } catch (e) {
