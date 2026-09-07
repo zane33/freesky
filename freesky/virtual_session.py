@@ -285,10 +285,13 @@ EXT_DIR = os.environ.get(
 )
 # Where the extension delivers the recording. Loopback straight to the backend,
 # bypassing the reverse proxy: this is an internal pipe, not a client request.
-CAPTURE_WS_BASE = os.environ.get(
-    "VIRTUAL_CAPTURE_WS",
-    f"ws://127.0.0.1:{os.environ.get('BACKEND_PORT', '8005')}",
-)
+# `or`, not a get() default: docker-compose passes the variable through as an
+# empty string when it is unset in .env, and an empty base produced a relative
+# URL that the extension rejected ("scheme must be ws or wss").
+CAPTURE_WS_BASE = (
+    os.environ.get("VIRTUAL_CAPTURE_WS", "").strip()
+    or f"ws://127.0.0.1:{os.environ.get('BACKEND_PORT', '').strip() or '8005'}"
+).rstrip("/")
 # MediaRecorder emits a chunk this often. Smaller means less latency between
 # the compositor and ffmpeg; 250ms is well under one segment and keeps the
 # message rate trivial.

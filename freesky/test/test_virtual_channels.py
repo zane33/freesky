@@ -1419,3 +1419,22 @@ def test_tab_copy_path_snaps_timestamps_to_the_frame_grid():
     cropped = virtual_session.VirtualSession(
         _tab(crop_w=640, crop_h=360), 99)._ffmpeg_argv()
     assert "-bsf:v" not in cropped
+
+
+def test_capture_ws_base_ignores_an_empty_environment_value(monkeypatch):
+    """docker-compose passes VIRTUAL_CAPTURE_WS through as "" when unset. That
+    produced a relative feed URL and the extension refused to open it:
+    "Failed to construct 'WebSocket': The URL's scheme must be ws or wss"."""
+    import importlib
+
+    monkeypatch.setenv("VIRTUAL_CAPTURE_WS", "")
+    monkeypatch.setenv("BACKEND_PORT", "8005")
+    module = importlib.reload(virtual_session)
+    try:
+        assert module.CAPTURE_WS_BASE == "ws://127.0.0.1:8005"
+        monkeypatch.setenv("VIRTUAL_CAPTURE_WS", "ws://10.0.0.5:9000/")
+        module = importlib.reload(virtual_session)
+        assert module.CAPTURE_WS_BASE == "ws://10.0.0.5:9000"
+    finally:
+        monkeypatch.delenv("VIRTUAL_CAPTURE_WS")
+        importlib.reload(virtual_session)
