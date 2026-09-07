@@ -215,6 +215,13 @@ if [ "$WORKERS" != "1" ]; then
     fi
 fi
 export GRANIAN_WORKERS="$WORKERS"
+
+# Belt and braces for the hot-reload trap above. If anyone ever drops --env prod
+# from the run line, this keeps the file watcher pointed at SOURCE only, instead
+# of Path.cwd() (= /app), which sweeps in the ./data volume that Chromium
+# profiles, session files and settings are all written to. Ignored entirely in
+# production mode, where there is no watcher.
+export REFLEX_HOT_RELOAD_OVERRIDE_PATHS="${REFLEX_HOT_RELOAD_OVERRIDE_PATHS:-/app/freesky}"
 # Get backend port from environment or use default
 BACKEND_PORT=${BACKEND_PORT:-8005}
 echo "Starting Reflex backend with $WORKERS granian worker(s) on port $BACKEND_PORT..."
@@ -235,7 +242,26 @@ backend_supervisor() {
     while true; do
         attempt=$((attempt + 1))
         echo "[$(date -Is)] Starting Reflex backend (attempt ${attempt})..."
-        cd /app && reflex run --backend-only --backend-host 0.0.0.0 --backend-port "$BACKEND_PORT"
+        # --env prod is LOAD-BEARING, not tidiness.
+        #
+        # `reflex run` defaults to DEV (reflex/reflex.py: `env: constants.Env =
+        # constants.Env.DEV`), and the CLI default wins over `env=rx.Env.PROD`
+        # in rxconfig.py. Exporting REFLEX_ENV=prod above does not change it
+        # either. Dev mode starts granian with reload=True, reload_tick=100 and
+        # reload_paths=[Path.cwd()] -- and cwd is /app, so the ENTIRE app tree is
+        # watched, including the ./data volume.
+        #
+        # That made virtual channels impossible: Chromium writes its profile
+        # into /app/data/virtual-profiles, the watcher fired, granian restarted
+        # the worker, and workers_kill_timeout=2 meant the in-flight request was
+        # dropped about 2.2 seconds in -- which is exactly the "HTTP 502 after
+        # 2.2s" the control panel reported on every single start. Saving any
+        # setting did the same thing, because users.json, app_settings.json and
+        # virtual_channels.json all live under /app/data too; that is the "it
+        # reloads the page every time settings change" symptom.
+        #
+        # Production mode has no file watcher at all.
+        cd /app && reflex run --env prod --backend-only --backend-host 0.0.0.0 --backend-port "$BACKEND_PORT"
         local code=$?
         echo "[$(date -Is)] Backend exited with code ${code}."
         if [ "$code" -eq 137 ] || [ "$code" -eq 139 ]; then
