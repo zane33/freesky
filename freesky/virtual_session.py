@@ -71,6 +71,13 @@ _PULSE_SOCKET = os.path.join(_PULSE_DIR, "native")
 
 # Segment length. Also the GOP length — they must match or `independent_segments`
 # is a lie and players stall at segment boundaries.
+# x264 thread cap and Chromium raster threads. Both exist to stop the two
+# fighting over a small container's cores: the encode is cheap (a fraction of a
+# core at 720p30), the browser is not, and the usual failure is Chromium being
+# starved until it stops painting — which shows up as ffmpeg duplicating frames.
+ENCODER_THREADS = int(os.environ.get("VIRTUAL_ENCODER_THREADS", "2"))
+RASTER_THREADS = int(os.environ.get("VIRTUAL_RASTER_THREADS", "2"))
+
 SEGMENT_SECONDS = int(os.environ.get("VIRTUAL_SEGMENT_SECONDS", "2"))
 PLAYLIST_SIZE = int(os.environ.get("VIRTUAL_PLAYLIST_SIZE", "6"))
 
@@ -442,28 +449,14 @@ class VirtualSession:
             with contextlib.suppress(OSError):
                 os.unlink(os.path.join(self.profile_dir, stale))
 
-    async def _start_browser(self) -> None:
-        """Headful Chromium on our display, playing into our sink."""
-        from playwright.async_api import async_playwright
+    def _browser_args(self) -> list:
+        """Chromium switches for this session.
 
-        env = dict(os.environ)
-        env["DISPLAY"] = f":{self.display}"
-        if self.record["audio"]:
-            env.update(_pulse_env())
-            env["PULSE_SINK"] = self.sink
-        else:
-            # No sink for this channel: make sure Chromium cannot grab whatever
-            # the host default happens to be.
-            env["PULSE_SERVER"] = "/nonexistent"
-
-        # The profile is PERSISTENT and deliberately not wiped: it carries the
-        # cookies and stored logins that let this channel resume after a restart
-        # without an admin signing in again. Only one session per channel ever
-        # runs, so there is no contention over it.
-        os.makedirs(self.profile_dir, exist_ok=True)
-        self._seed_profile()
-
-        args = [
+        Split out so the flag set can be asserted on directly, the same
+        way _ffmpeg_argv() is — a wrong switch here shows up only as a
+        stuttering stream, which is an expensive way to find it.
+        """
+        return [
             "--no-sandbox", "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             # Without this, a <video> with sound simply never starts. It is the
@@ -487,8 +480,55 @@ class VirtualSession:
             "--disable-print-preview",
             # Suppresses in-product-help promo bubbles.
             "--propagate-iph-for-testing",
-            "--use-gl=swiftshader",
+            # Rendering. SwiftShader was removed here deliberately: it is a
+            # WebGL/GLES emulator, and routing a plain <video> page's 2D
+            # composites through an emulated GL driver is the expensive path.
+            # With no GPU in the container, Skia's CPU raster is both cheaper
+            # and what Chromium's own docs point at. --disable-software-rasterizer
+            # stops it falling back into SwiftShader anyway.
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            # Frees the display scheduler from a synthetic 60Hz vblank timer.
+            # NOT --disable-frame-rate-limit: unbounded frame production has
+            # been reported to starve video decode, and this container is
+            # CPU-bound, so it would compete with the encoder for the cores the
+            # stream actually needs.
+            "--disable-gpu-vsync",
+            # Keeps raster from taking every core away from x11grab and x264.
+            f"--num-raster-threads={RASTER_THREADS}",
+            # Without this Chromium blanks its output when a navigation stalls,
+            # and we would capture white frames.
+            "--disable-new-content-rendering-timeout",
+            "--hide-scrollbars",
+            # Playwright already passes --disable-background-timer-throttling,
+            # --disable-backgrounding-occluded-windows and
+            # --disable-renderer-backgrounding, which matter here (a kiosk
+            # window under Xvfb can look "occluded", and a throttled renderer
+            # stops presenting frames), so they are not repeated.
         ]
+
+    async def _start_browser(self) -> None:
+        """Headful Chromium on our display, playing into our sink."""
+        from playwright.async_api import async_playwright
+
+        env = dict(os.environ)
+        env["DISPLAY"] = f":{self.display}"
+        if self.record["audio"]:
+            env.update(_pulse_env())
+            env["PULSE_SINK"] = self.sink
+        else:
+            # No sink for this channel: make sure Chromium cannot grab whatever
+            # the host default happens to be.
+            env["PULSE_SERVER"] = "/nonexistent"
+
+        # The profile is PERSISTENT and deliberately not wiped: it carries the
+        # cookies and stored logins that let this channel resume after a restart
+        # without an admin signing in again. Only one session per channel ever
+        # runs, so there is no contention over it.
+        os.makedirs(self.profile_dir, exist_ok=True)
+        self._seed_profile()
+
+        args = self._browser_args()
 
         # launch_persistent_context, NOT launch(): Playwright rejects a
         # --user-data-dir in args outright ("Pass user_data_dir parameter to
@@ -568,6 +608,8 @@ class VirtualSession:
 
         argv = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
+            # Trim input-side buffering; this is a live capture, not a file.
+            "-fflags", "nobuffer", "-flags", "low_delay",
             # Both inputs need a deep queue. With the tiny default, a momentary
             # x11grab stall drops pulse packets and the stream desyncs for good.
             "-thread_queue_size", "1024",
@@ -582,10 +624,15 @@ class VirtualSession:
                 "-f", "pulse", "-name", f"freesky-{self.name}",
                 "-sample_rate", "48000", "-channels", "2", "-fragment_size", "4096",
                 "-i", f"{self.sink}.monitor",
-                # aresample=async=1 is the current replacement for the deprecated
-                # global -async, and is what keeps a multi-hour session from
-                # drifting: it stretches/pads audio onto the video timeline.
-                "-filter_complex", "[1:a]aresample=async=1:min_hard_comp=0.100:first_pts=0[a]",
+                # async=1000, not async=1. Per ffmpeg's resampler docs, async=1
+                # enables only "filling and trimming" — it inserts silence or
+                # hard-cuts samples, which over a long session is audible as
+                # clicks and micro-gaps. A larger value is the maximum samples
+                # per second it may stretch or squeeze instead, which is the
+                # documented idiom for an independent capture clock (PulseAudio
+                # at a fixed 48kHz) against a wall-clock video timeline.
+                # 1000/48000 is about 2% maximum correction, applied smoothly.
+                "-filter_complex", "[1:a]aresample=async=1000:first_pts=0[a]",
                 "-map", "0:v", "-map", "[a]",
                 "-c:a", "aac", "-b:a", f"{record['audio_bitrate']}k", "-ar", "48000", "-ac", "2",
             ]
@@ -595,6 +642,11 @@ class VirtualSession:
         argv += [
             "-c:v", "libx264",
             "-preset", record["preset"],
+            # Pinned so x264 does not spawn ~1.5x ncpu threads and starve the
+            # browser it is capturing. Measured cost of the encode itself is
+            # only a fraction of a core at 720p30, so threads buy little here
+            # and contention costs a lot.
+            "-threads", str(ENCODER_THREADS),
             # Disables lookahead and B-frames: sub-frame encoder delay, which is
             # the right trade for live capture.
             "-tune", "zerolatency",
@@ -603,12 +655,19 @@ class VirtualSession:
             # GOP == segment length, and no scene-change keyframes, so every
             # segment starts on an IDR and independent_segments holds.
             "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0",
+            # SPS/PPS in-band on every IDR, so each segment really is
+            # independently decodable for a client joining mid-stream — which
+            # is what EXT-X-INDEPENDENT-SEGMENTS promises.
+            "-x264-params", "repeat-headers=1",
         ]
         # x11grab drops frames under load; libx264 with a fixed GOP is much
         # happier with a constant frame rate.
         argv += ["-fps_mode", "cfr"] if _ffmpeg_supports_fps_mode() else ["-vsync", "cfr"]
 
         argv += [
+            # Drops the MPEG-TS muxer's default 0.7s PCR preload, a fixed offset
+            # between the container timeline and real time.
+            "-muxdelay", "0", "-muxpreload", "0",
             "-f", "hls",
             "-hls_time", str(SEGMENT_SECONDS),
             "-hls_list_size", str(PLAYLIST_SIZE),

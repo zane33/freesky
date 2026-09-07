@@ -89,10 +89,10 @@ def test_gop_matches_segment_length():
     """If the GOP and the segment length disagree, segments stop starting on a
     keyframe and EXT-X-INDEPENDENT-SEGMENTS becomes a lie that stalls players."""
     record = virtual_channels.validate_channel(
-        {"name": "d", "url": "https://e.com", "framerate": 25}
+        {"name": "d", "url": "https://e.com", "framerate": 20}
     )
     argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
-    assert argv[argv.index("-g") + 1] == str(25 * virtual_session.SEGMENT_SECONDS)
+    assert argv[argv.index("-g") + 1] == str(20 * virtual_session.SEGMENT_SECONDS)
     assert argv[argv.index("-keyint_min") + 1] == argv[argv.index("-g") + 1]
     assert argv[argv.index("-sc_threshold") + 1] == "0"
 
@@ -387,26 +387,19 @@ def test_no_dead_password_manager_pref(seeded_profile):
 def test_no_dead_chromium_switches():
     """These were all removed from Chromium; shipping them is cargo cult."""
     record = virtual_channels.validate_channel({"name": "d", "url": "https://e.com"})
-    session = virtual_session.VirtualSession(record, 99)
-    # _start_browser builds the list inline, so read it from the source rather
-    # than launching a browser to get at it.
-    import inspect
-
-    source = inspect.getsource(session._start_browser)
+    args = virtual_session.VirtualSession(record, 99)._browser_args()
     for dead in ("--disable-save-password-bubble", "--disable-session-crashed-bubble",
-                 "--disable-translate", "PasswordManagerEnableAccountStore"):
-        assert dead not in source, f"{dead} is a no-op in modern Chromium"
+                 "--disable-translate", "--enable-zero-copy",
+                 "--enable-gpu-rasterization", "--ignore-gpu-blocklist"):
+        assert dead not in args, f"{dead} is a no-op or GPU-only in modern Chromium"
 
 
 def test_does_not_pass_its_own_disable_features():
     """Playwright already sends one comma-joined --disable-features list. A
     second occurrence of the switch is a merge hazard, so we add none."""
-    import inspect
-
     record = virtual_channels.validate_channel({"name": "d", "url": "https://e.com"})
-    session = virtual_session.VirtualSession(record, 99)
-    source = inspect.getsource(session._start_browser)
-    assert '"--disable-features=' not in source
+    args = virtual_session.VirtualSession(record, 99)._browser_args()
+    assert not any(a.startswith("--disable-features=") for a in args)
 
 
 def test_xdotool_key_translation():
@@ -498,7 +491,7 @@ def test_cosmetic_edit_does_not_need_a_restart():
 
 @pytest.mark.parametrize(
     "field,value",
-    [("url", "https://other.com"), ("resolution", "1080p"), ("framerate", 25),
+    [("url", "https://other.com"), ("resolution", "1080p"), ("framerate", 15),
      ("audio", False), ("video_bitrate", 900), ("preset", "ultrafast")],
 )
 def test_capture_edit_needs_a_restart(field, value):
@@ -642,3 +635,52 @@ def test_cosmetic_edit_does_not_restart_the_session():
     assert virtual_channels.get_channel("bbc")["title"] == "BBC News"
     rendered = " ".join(str(getattr(e, "name", e)) for e in events)
     assert "restart_vc_session" not in rendered, "a title change must not kill the browser"
+
+
+# --- capture tuning ---------------------------------------------------------
+
+
+def test_every_framerate_gives_a_whole_gop():
+    """A GOP that is not exactly one segment long makes ffmpeg cut at the next
+    keyframe instead, producing erratic segment durations — far worse for
+    players than a slightly higher latency."""
+    for fps in virtual_channels.FRAMERATES:
+        assert (fps * virtual_session.SEGMENT_SECONDS) % 1 == 0
+        record = virtual_channels.validate_channel(
+            {"name": "d", "url": "https://e.com", "framerate": fps}
+        )
+        argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
+        assert argv[argv.index("-g") + 1] == str(fps * virtual_session.SEGMENT_SECONDS)
+
+
+def test_audio_resampler_uses_a_stretching_async_value():
+    """async=1 only fills and trims — it inserts silence or hard-cuts samples,
+    audible as clicks over a long session. A larger value stretches instead."""
+    record = virtual_channels.validate_channel({"name": "d", "url": "https://e.com"})
+    joined = " ".join(virtual_session.VirtualSession(record, 99)._ffmpeg_argv())
+    assert "aresample=async=1000" in joined
+    assert "aresample=async=1:" not in joined
+
+
+def test_encoder_threads_are_pinned():
+    """Unpinned, x264 spawns ~1.5x ncpu threads and starves the very browser it
+    is capturing — which shows up as duplicated frames, not as a slow encode."""
+    record = virtual_channels.validate_channel({"name": "d", "url": "https://e.com"})
+    argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
+    assert argv[argv.index("-threads") + 1] == str(virtual_session.ENCODER_THREADS)
+
+
+def test_browser_does_not_use_swiftshader():
+    """SwiftShader is a WebGL emulator and the expensive software path; a
+    <video> page wants Skia CPU raster instead."""
+    record = virtual_channels.validate_channel({"name": "d", "url": "https://e.com"})
+    args = virtual_session.VirtualSession(record, 99)._browser_args()
+    assert not any("swiftshader" in a.lower() for a in args)
+    assert "--disable-gpu" in args and "--disable-software-rasterizer" in args
+    # Reported to starve video decode on a CPU-bound host.
+    assert "--disable-frame-rate-limit" not in args
+    # Playwright already passes these; a second copy is noise at best.
+    for duplicated in ("--disable-renderer-backgrounding",
+                       "--disable-background-timer-throttling",
+                       "--no-first-run"):
+        assert duplicated not in args

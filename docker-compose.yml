@@ -55,6 +55,14 @@ services:
       # does, so the panel shows exactly what viewers see - browser dialogs
       # included. Only size and frame rate are reduced. It is a second capture
       # alongside the encoder, so lower the width first if the panel feels slow.
+      # Thread caps. These stop x264 and Chromium's rasteriser fighting over a
+      # small container's cores. The encode is cheap (a fraction of a core at
+      # 720p30); the browser is not, and the usual failure is Chromium being
+      # starved until it stops painting - which shows up in the ffmpeg log as
+      # "More than 1000 frames duplicated". Raise both if you give the container
+      # more CPUs.
+      - VIRTUAL_ENCODER_THREADS=${VIRTUAL_ENCODER_THREADS:-2}
+      - VIRTUAL_RASTER_THREADS=${VIRTUAL_RASTER_THREADS:-2}
       - VIRTUAL_CONTROL_FPS=${VIRTUAL_CONTROL_FPS:-10}
       - VIRTUAL_CONTROL_MAX_WIDTH=${VIRTUAL_CONTROL_MAX_WIDTH:-960}
       # ffmpeg mjpeg quality: 2 best, 31 worst.
@@ -125,6 +133,12 @@ services:
     shm_size: "1gb"
 
     # Resource Limits
+    # Virtual channels are CPU-bound on software rendering, and the failure
+    # mode is the browser being starved until it stops painting. Give the
+    # container at least 2 CPUs per concurrent 720p channel; the encoder itself
+    # needs only a fraction of one.
+    cpus: ${CPU_LIMIT:-4}
+
     deploy:
       resources:
         limits:

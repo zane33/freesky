@@ -196,6 +196,9 @@ All optional. Defaults are in `docker-compose.yml`.
 | `VIRTUAL_SEGMENT_SECONDS` | `2` | Segment length, and therefore the GOP length. |
 | `VIRTUAL_PLAYLIST_SIZE` | `6` | Segments kept in the playlist window. |
 | `VIRTUAL_START_TIMEOUT` | `45` | Seconds to wait for the first segments before giving up. |
+| `VIRTUAL_ENCODER_THREADS` | `2` | x264 thread cap. Unpinned, x264 spawns ~1.5x ncpu threads and starves the browser it is capturing. |
+| `VIRTUAL_RASTER_THREADS` | `2` | Chromium raster threads, for the same reason. |
+| `CPU_LIMIT` | `4` | Container CPU limit. This is what actually decides whether a channel is smooth. |
 | `VIRTUAL_CONTROL_FPS` | `10` | Preview frame rate. |
 | `VIRTUAL_CONTROL_MAX_WIDTH` | `960` | Preview is downscaled to this width. Lower it first if the panel feels slow. |
 | `VIRTUAL_CONTROL_QUALITY` | `7` | Preview JPEG quality on ffmpeg's mjpeg scale — 2 is best, 31 is worst. |
@@ -312,6 +315,56 @@ under load and libx264 with a fixed GOP is much happier with a constant rate.
 
 ---
 
+## Performance and latency
+
+**The encoder is not the bottleneck.** Measured, a 720p30 `libx264 -preset
+veryfast -tune zerolatency` encode costs roughly a fifth to a third of one core,
+and the BGRA→YUV conversion about 0.05 of a core. If a channel stutters, the
+cause is upstream: Chromium not painting fast enough under software rendering.
+Tune the browser and the CPU budget, not the codec.
+
+Notable choices, all of which were measured or checked against source rather
+than taken from guides:
+
+- **No SwiftShader.** `--use-gl=swiftshader` was removed. SwiftShader is a
+  WebGL/GLES emulator; for a page that is essentially a `<video>` element, Skia's
+  CPU raster (`--disable-gpu --disable-software-rasterizer`) is both cheaper and
+  what Chromium's own documentation points to.
+- **`--disable-gpu-vsync`, but *not* `--disable-frame-rate-limit`.** The first
+  frees the display scheduler from a synthetic 60Hz timer. The second uncaps
+  frame production entirely, which on a CPU-bound host has been reported to
+  starve video decode — it would compete for the cores the stream needs.
+- **Thread caps on both sides** (`VIRTUAL_ENCODER_THREADS`,
+  `VIRTUAL_RASTER_THREADS`), so x264 and Chromium's rasteriser do not fight.
+- **`-tune zerolatency` is kept** — besides latency it is measurably *cheaper*
+  than the untuned preset, because it disables B-frames and lookahead.
+- **`aresample=async=1000`, not `async=1`.** `async=1` only fills and trims: it
+  inserts silence or hard-cuts samples, audible as clicks over a long session.
+  A larger value stretches and squeezes instead, which is the documented idiom
+  for an independent capture clock.
+- **`repeat-headers=1`** puts SPS/PPS in-band on every IDR, so each segment
+  really is independently decodable for a client joining mid-stream.
+- **`-muxdelay 0 -muxpreload 0`** removes the MPEG-TS muxer's default 0.7s
+  preload.
+
+### Latency
+
+With 2s segments a player sits about 3 segments back from the live edge, so
+expect **6-10s** end to end. That floor is set by HLS itself, not by this code.
+FFmpeg's HLS muxer cannot do LL-HLS (see the note above), so breaking below it
+means putting a real packager downstream — send `-f flv rtmp://...` to
+MediaMTX or OvenMediaEngine and let it produce LL-HLS. The capture stage would
+not change.
+
+The web player's hls.js config previously set `liveSyncDuration: 2`, which
+overrides `liveSyncDurationCount` and pinned playback to less than one segment
+of headroom — the player permanently chased a fragment that had barely been
+written, and stalled its way through playback. It now uses the documented floor
+of 3 segments plus `maxLiveSyncPlaybackRate`, which corrects drift by speeding
+up slightly rather than by a visible seek.
+
+---
+
 ## Security model
 
 The trust boundary is **admin**, and Settings is admin-gated.
@@ -387,13 +440,28 @@ with the password manager and other prompt-generating features disabled; if a
 new dialog type appears, add its suppression flag in `_start_browser`.
 
 **ffmpeg logs "More than 1000 frames duplicated".**
-The page is repainting more slowly than the channel's configured frame rate, so
-the encoder duplicates frames to hold a constant rate. It is informational, not
-an error, and is normal for a mostly-static page. If it coincides with a choppy
-stream the container is CPU bound: drop the channel to 720p or 480p, set the
-frame rate to match the source (25 for most broadcast content), or use a faster
-x264 preset. Rendering is software (`--use-gl=swiftshader`) as there is no GPU
-in the container, and that is the dominant cost for a video-heavy page.
+This is a *timestamp* message, not a picture-quality one: ffmpeg received frames
+whose wall-clock times were further apart than 1/framerate, and padded the
+constant-rate grid by repeating the last one. x11grab grabs unconditionally on a
+timer, so this does **not** mean "the page didn't change" — it means the grab
+loop was late, which on this container almost always means **Chromium was
+starved of CPU and stopped painting**.
+
+Things that do *not* fix it: a faster x264 preset, or a different muxer. The
+encode costs only a fraction of a core at 720p30 — it is not the bottleneck.
+
+Things that do:
+- Give the container more CPU (`CPU_LIMIT`; budget ~2 cores per concurrent 720p
+  channel).
+- Lower the channel's **frame rate** to something the browser can actually
+  sustain. Asking for 30 when it can paint 20 does not make the stream smoother;
+  it just burns CPU duplicating frames.
+- Lower the **resolution**. This cuts Chromium's raster cost roughly linearly,
+  which matters far more than the encoder saving.
+
+To confirm which it is, run the same capture against a static page: if the
+duplicate count stays near zero there, the capture path is fine and the problem
+is browser CPU contention.
 
 **Sessions do not appear in Settings.**
 Press **Sessions** to refresh — the panel is not polled, since each entry costs

@@ -68,8 +68,16 @@ RESOLUTIONS = {
 }
 DEFAULT_RESOLUTION = "720p"
 
-FRAMERATES = (15, 24, 25, 30)
-DEFAULT_FRAMERATE = 30
+# Every value here divides evenly into a 2-second GOP, so the encoder's
+# keyframe interval stays exactly one segment long whichever is chosen.
+#
+# The default is 25 rather than 30 deliberately. Under software rendering a
+# browser often cannot paint 30fps, and asking for more than it can produce does
+# not make the stream smoother — ffmpeg just duplicates frames to hold the rate,
+# burning CPU that the browser needed. Matching the achievable rate is what
+# actually looks better.
+FRAMERATES = (15, 20, 24, 25, 30)
+DEFAULT_FRAMERATE = 25
 
 # x264 presets worth offering. Anything slower than "veryfast" cannot keep up
 # with 1080p30 realtime capture on the CPUs this app typically runs on, so the

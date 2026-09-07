@@ -41,25 +41,45 @@ function InjectCSS() {
 // `storage` prop is for persisted player state (volume, quality) and silently swallowed
 // this config, leaving the player spinning after the manifest loaded.
 const hlsConfig = {
-  liveBackBufferLength: 60,
-  liveSyncDurationCount: 5,
-  liveMaxLatencyDurationCount: 15,
-  maxBufferLength: 180,
-  maxMaxBufferLength: 300,
+  // Live-edge targeting.
+  //
+  // liveSyncDuration / liveMaxLatencyDuration were REMOVED here, not merely
+  // retuned. hls.js documents that liveSyncDuration takes precedence over
+  // liveSyncDurationCount when both are set, so `liveSyncDuration: 2` pinned
+  // playback to 2s behind the live edge — with 2s segments that is less than
+  // one segment of headroom, so the player was permanently chasing a fragment
+  // that had barely been written, and stalled and rebuffered its way through
+  // playback. That reads as "laggy" but is a buffering bug, not a bitrate one.
+  //
+  // 3 is hls.js's default and its documented floor: "decreasing this value is
+  // likely to cause playback stalls".
+  liveSyncDurationCount: 3,
+  liveMaxLatencyDurationCount: 10,
+  // The important one. Instead of seeking when it drifts behind, the player
+  // speeds up slightly until it is back at the target. Default is 1, i.e.
+  // disabled, which leaves drift to be corrected by a visible jump.
+  maxLiveSyncPlaybackRate: 1.5,
+  // 180s of forward buffer on a live stream delays startup and pins memory for
+  // nothing: segments ahead of the live edge do not exist yet.
+  maxBufferLength: 30,
+  maxMaxBufferLength: 60,
+  // backBufferLength supersedes the deprecated liveBackBufferLength, and caps
+  // memory growth on a channel left playing for hours.
+  backBufferLength: 30,
   manifestLoadingTimeOut: 5000,
   manifestLoadingMaxRetry: 2,
   levelLoadingTimeOut: 8000,
   levelLoadingMaxRetry: 1,
-  fragLoadingTimeOut: 15000,
-  fragLoadingMaxRetry: 2,
+  // A virtual channel's first segment can take a while on a cold start, and an
+  // upstream channel may fail over between feeds.
+  fragLoadingTimeOut: 20000,
+  fragLoadingMaxRetry: 3,
   startFragPrefetch: true,
   testBandwidth: false,
   startLevel: -1,
   capLevelToPlayerSize: false,
   maxStarvationDelay: 4,
   maxLoadingDelay: 4,
-  liveSyncDuration: 2,
-  liveMaxLatencyDuration: 8,
 };
 
 export function Player({ title, src }) {
