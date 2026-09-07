@@ -90,6 +90,7 @@ class SettingsState(rx.State):
     vc_logo: str = ""
     vc_tags: str = "Virtual"
     vc_enabled: bool = True
+    vc_autostart: bool = False
 
     # --- virtual channels ---------------------------------------------------
 
@@ -159,6 +160,10 @@ class SettingsState(rx.State):
     def set_vc_enabled(self, value: bool):
         self.vc_enabled = value
 
+    @rx.event
+    def set_vc_autostart(self, value: bool):
+        self.vc_autostart = value
+
     def _load_virtual(self, token: str = ""):
         """Re-read the store into the list the page renders.
 
@@ -199,6 +204,7 @@ class SettingsState(rx.State):
         self.vc_logo = ""
         self.vc_tags = "Virtual"
         self.vc_enabled = True
+        self.vc_autostart = False
         self.vc_error = ""
 
     @rx.event
@@ -225,7 +231,14 @@ class SettingsState(rx.State):
         self.vc_logo = record["logo"]
         self.vc_tags = ", ".join(record["tags"])
         self.vc_enabled = record["enabled"]
+        self.vc_autostart = record["autostart"]
         self.vc_error = ""
+        # A half-confirmed delete on some other row would otherwise stay armed
+        # while the admin edits a different channel.
+        self.vc_confirm_delete = ""
+        # The form sits below the channel list, so with more than a handful of
+        # channels the pencil click had no visible effect at all.
+        yield rx.scroll_to("vc-form")
 
     @rx.event
     def save_vc(self):
@@ -252,22 +265,55 @@ class SettingsState(rx.State):
             "logo": self.vc_logo,
             "tags": self.vc_tags,
             "enabled": self.vc_enabled,
+            "autostart": self.vc_autostart,
         }
+        # Captured before reset_vc_form() clears it below. The running session is
+        # keyed by the OLD name, so a rename has to stop that one — reading
+        # self.vc_editing after the reset silently restarted the wrong session
+        # and leaked the old browser under a name that no longer existed.
+        old_name = self.vc_editing
+        previous = virtual_channels.get_channel(old_name) if old_name else {}
+
         try:
-            if self.vc_editing and self.vc_editing != self.vc_name.strip().lower():
-                virtual_channels.upsert_channel({**record, "name": self.vc_editing})
-                saved = virtual_channels.rename_channel(self.vc_editing, self.vc_name)
-            else:
-                saved = virtual_channels.upsert_channel(record)
+            # Validate the WHOLE record under its final name before writing
+            # anything. The previous version wrote the edited fields under the
+            # old name first and only then renamed, so a bad new name left the
+            # other edits committed to disk while showing an error that implied
+            # nothing had happened.
+            cleaned = virtual_channels.validate_channel(record)
+            if cleaned["name"] != old_name and virtual_channels.get_channel(cleaned["name"]):
+                # Covers both adding a duplicate name and renaming onto an
+                # existing channel. Without it the other channel was silently
+                # overwritten and vanished from the playlist, under a toast that
+                # said the save had succeeded.
+                raise virtual_channels.VirtualChannelError(
+                    f"A virtual channel named '{cleaned['name']}' already exists."
+                )
+            saved = virtual_channels.upsert_channel(cleaned)
+            if old_name and old_name != saved["name"]:
+                virtual_channels.delete_channel(old_name)
         except virtual_channels.VirtualChannelError as exc:
             self.vc_error = str(exc)
             return
+        self.vc_error = ""
+
+        # A running session is expensive and may be signed in to a site, so it
+        # is only torn down when the change genuinely cannot be applied to it —
+        # a new URL, geometry or codec setting. Renaming a channel also forces
+        # one, because the id (and so the session key) changed. Everything else
+        # is pushed onto the live session in place.
+        renamed = bool(old_name) and old_name != saved["name"]
+        restart = renamed or virtual_channels.needs_restart(previous, saved)
+
         self._load_virtual(self.vc_token)
         self.reset_vc_form()
-        # Edits to geometry or URL only take effect on a fresh session, and an
-        # admin who just changed the bitrate expects the next play to use it.
-        yield SettingsState.stop_vc_session(saved["name"])
-        yield rx.toast(f"Saved virtual channel '{saved['name']}'")
+
+        if restart:
+            yield SettingsState.restart_vc_session(old_name or saved["name"])
+            yield rx.toast(f"Saved '{saved['name']}' — restarting its session")
+        else:
+            yield SettingsState.apply_vc_settings(saved["name"])
+            yield rx.toast(f"Saved '{saved['name']}'")
 
     @rx.event
     def toggle_vc_enabled(self, name: str):
@@ -300,6 +346,30 @@ class SettingsState(rx.State):
         self._load_virtual(self.vc_token)
         yield SettingsState.stop_vc_session(name)
         yield rx.toast(f"Deleted virtual channel '{name}'")
+
+    @rx.event
+    async def apply_vc_settings(self, name: str):
+        """Push a cosmetic settings change onto a running session, if any.
+
+        Deliberately does NOT start one: saving a channel should never be the
+        thing that launches a browser.
+        """
+        import sys as _sys
+
+        module = _sys.modules.get("freesky.virtual_session")
+        if module is None:
+            return  # feature never used in this process; nothing is running
+        record = virtual_channels.get_channel(name)
+        if record is not None:
+            module.manager.apply_live_settings(record)
+
+    @rx.event
+    async def restart_vc_session(self, name: str):
+        """Stop a session so the next request rebuilds it with new settings."""
+        from freesky import virtual_session
+
+        await virtual_session.manager.stop(name)
+        yield SettingsState.refresh_vc_sessions
 
     @rx.event
     async def refresh_vc_sessions(self):
@@ -770,6 +840,11 @@ def virtual_channel_row(record: dict) -> rx.Component:
             rx.badge(record["resolution"], variant="soft"),
             rx.badge(f"{record['framerate']}fps", variant="soft", color_scheme="gray"),
             rx.cond(
+                record["autostart"].to(bool),
+                rx.badge("always on", variant="soft", color_scheme="blue"),
+                rx.fragment(),
+            ),
+            rx.cond(
                 record["audio"].to(bool),
                 rx.badge(rx.icon("volume-2", size=12), "audio", variant="soft", color_scheme="green"),
                 rx.badge(rx.icon("volume-x", size=12), "silent", variant="soft", color_scheme="gray"),
@@ -1069,6 +1144,23 @@ def virtual_form() -> rx.Component:
                 align="center",
                 spacing="2",
             ),
+            rx.hstack(
+                rx.switch(
+                    checked=SettingsState.vc_autostart,
+                    on_change=SettingsState.set_vc_autostart,
+                ),
+                rx.text(
+                    "Keep running",
+                    size="2",
+                    title=(
+                        "Start this channel with FreeSky and never stop it for "
+                        "being idle. It survives a restart already signed in, "
+                        "because its browser profile is kept."
+                    ),
+                ),
+                align="center",
+                spacing="2",
+            ),
             rx.spacer(),
             rx.button("Cancel", on_click=SettingsState.reset_vc_form, variant="soft", size="2"),
             rx.button("Save", on_click=SettingsState.save_vc, size="2"),
@@ -1078,6 +1170,7 @@ def virtual_form() -> rx.Component:
         ),
         spacing="3",
         width="100%",
+        id="vc-form",
     )
 
 

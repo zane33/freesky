@@ -1775,6 +1775,29 @@ async def virtual_segment(name: str, segment: str):
 # the settings page, matching how /api/services/status is exposed.
 
 
+async def start_virtual_sessions():
+    """Lifespan task: bring up virtual channels marked autostart.
+
+    Registered in freesky.py. Runs after a short delay so the backend is
+    answering health checks before several browsers start competing for CPU —
+    otherwise a container with a few autostart channels looks unhealthy for the
+    first minute of its life and can be restarted by the orchestrator.
+    """
+    from freesky import virtual_channels as _vc
+
+    if not any(r.get("autostart") and r.get("enabled") for r in _vc.list_channels()):
+        return
+    try:
+        await asyncio.sleep(5)
+        from freesky import virtual_session
+
+        await virtual_session.manager.start_autostart_channels()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"Autostart of virtual channels failed: {e}", exc_info=True)
+
+
 async def close_virtual_sessions():
     """Lifespan task: idle until shutdown, then stop every virtual session.
 

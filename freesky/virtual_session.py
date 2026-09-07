@@ -34,6 +34,7 @@ an install that never uses the feature is one import.
 """
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -56,6 +57,15 @@ _DISPLAY_BASE = int(os.environ.get("VIRTUAL_DISPLAY_BASE", "99"))
 
 # Runtime dir for the container-local PulseAudio daemon. Deliberately not the
 # host's socket: we want our own daemon at the same UID as Chromium and ffmpeg.
+# Browser profiles. These live on the DATA VOLUME, not in /tmp, because they
+# hold the cookies and stored logins that let a channel come back after a
+# restart already signed in instead of at a login page. One directory per
+# channel, kept across sessions and across container restarts.
+PROFILE_ROOT = os.environ.get(
+    "VIRTUAL_PROFILE_ROOT",
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "virtual-profiles"),
+)
+
 _PULSE_DIR = os.environ.get("VIRTUAL_PULSE_DIR", "/tmp/freesky-pulse")
 _PULSE_SOCKET = os.path.join(_PULSE_DIR, "native")
 
@@ -256,7 +266,7 @@ class VirtualSession:
         self.sink = f"fsk_{self.name}".replace("-", "_")[:60]
         self.out_dir = os.path.join(HLS_ROOT, self.name)
         self.playlist_path = os.path.join(self.out_dir, "index.m3u8")
-        self.profile_dir = os.path.join("/tmp", f"freesky-chrome-{self.name}")
+        self.profile_dir = os.path.join(PROFILE_ROOT, self.name)
 
         self.last_access = time.monotonic()
         self.started_at = time.monotonic()
@@ -335,6 +345,103 @@ class VirtualSession:
         )
         self._sink_module = out.strip()
 
+    def _seed_profile(self) -> None:
+        """Write the profile preferences that suppress Chromium's own dialogs.
+
+        This is not cosmetic: browser UI is drawn into the browser's X window,
+        so a "Save password?" bubble lands in the captured stream that viewers
+        watch. There is no command-line switch for it in modern Chromium —
+        `--disable-save-password-bubble` was removed, as was the
+        `profile.password_manager_enabled` pref that most guides still
+        recommend. `credentials_enable_service` is the surviving control, and
+        its upstream comment describes exactly this behaviour ("when it is
+        false, it doesn't ask if you want to save passwords").
+
+        Two details make the difference between this working and silently doing
+        nothing:
+
+        * **The "First Run" sentinel.** Without it Chromium treats the profile
+          as brand new and overwrites the Preferences file we just wrote. This
+          is the same thing ChromeDriver does, for the same reason.
+        * **`profile.exit_type: "Normal"`.** Chromium writes "Crashed" at
+          startup and only rewrites it on a clean shutdown. We stop sessions
+          abruptly, so without resetting this every launch the next session
+          shows a "Restore pages?" bubble — on the stream.
+
+        Only untracked prefs are written here. Chromium HMAC-protects a set of
+        tracked prefs (homepage, startup/session restore, search providers) and
+        silently resets any unsigned value, so those cannot be seeded this way.
+        """
+        default_dir = os.path.join(self.profile_dir, "Default")
+        os.makedirs(default_dir, exist_ok=True)
+        prefs_path = os.path.join(default_dir, "Preferences")
+
+        # Merge into whatever Chromium last wrote rather than replacing it. The
+        # profile is persistent, so this file also carries session state we want
+        # to keep; overwriting it wholesale would quietly discard that on every
+        # launch and defeat the point of a persistent profile.
+        existing = {}
+        try:
+            with open(prefs_path) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (FileNotFoundError, ValueError, OSError):
+            existing = {}
+
+        prefs = {
+            # The save-password bubble.
+            "credentials_enable_service": False,
+            # The auto-sign-in toast.
+            "credentials_enable_autosignin": False,
+            "profile": {
+                # "Your password was found in a data breach" bubble.
+                "password_manager_leak_detection": False,
+                # See the docstring: stops the "Restore pages?" bubble.
+                "exit_type": "Normal",
+                # 2 == block. Belt and braces alongside --deny-permission-prompts.
+                "default_content_setting_values": {
+                    "notifications": 2,
+                    "geolocation": 2,
+                    "media_stream_mic": 2,
+                    "media_stream_camera": 2,
+                },
+            },
+            # Address- and card-save bubbles, and the autofill dropdown.
+            "autofill": {"profile_enabled": False, "credit_card_enabled": False},
+            "bookmark_bar": {"show_on_all_tabs": False},
+            "translate": {"enabled": False},
+            "download": {"prompt_for_download": False},
+            "signin": {"allowed": False},
+        }
+        merged = dict(existing)
+        for key, value in prefs.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                nested = dict(merged[key])
+                nested.update(value)
+                merged[key] = nested
+            else:
+                merged[key] = value
+
+        tmp = f"{prefs_path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(merged, f)
+        os.replace(tmp, prefs_path)
+
+        # Empty file, and the space in the name is part of it.
+        first_run = os.path.join(self.profile_dir, "First Run")
+        if not os.path.exists(first_run):
+            with open(first_run, "w"):
+                pass
+
+        # Chromium refuses to start on a profile that another instance appears
+        # to hold. When a session is killed rather than closed, these are left
+        # behind and the NEXT start fails — which, with a persistent profile,
+        # would be permanent rather than self-healing.
+        for stale in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(self.profile_dir, stale))
+
     async def _start_browser(self) -> None:
         """Headful Chromium on our display, playing into our sink."""
         from playwright.async_api import async_playwright
@@ -349,11 +456,12 @@ class VirtualSession:
             # the host default happens to be.
             env["PULSE_SERVER"] = "/nonexistent"
 
-        # Fresh profile per session. Reusing one makes a second Chromium either
-        # attach to the first or refuse to start, and stale profiles grow with
-        # cache until they fill the disk.
-        shutil.rmtree(self.profile_dir, ignore_errors=True)
+        # The profile is PERSISTENT and deliberately not wiped: it carries the
+        # cookies and stored logins that let this channel resume after a restart
+        # without an admin signing in again. Only one session per channel ever
+        # runs, so there is no contention over it.
         os.makedirs(self.profile_dir, exist_ok=True)
+        self._seed_profile()
 
         args = [
             "--no-sandbox", "--disable-setuid-sandbox",
@@ -366,10 +474,19 @@ class VirtualSession:
             "--window-position=0,0",
             "--force-device-scale-factor=1",
             "--start-fullscreen",
-            "--disable-infobars",
+            # Native prompts that would otherwise be drawn over the stream.
+            # Playwright already passes --disable-infobars, --no-first-run,
+            # --no-default-browser-check, --disable-popup-blocking,
+            # --disable-component-update, --disable-sync and a comma-joined
+            # --disable-features list, so those are not repeated here.
+            # Deliberately NOT passing our own --disable-features either: a
+            # second occurrence of that switch is a merge hazard.
+            "--deny-permission-prompts",
             "--disable-notifications",
-            "--no-first-run", "--no-default-browser-check",
-            "--disable-features=TranslateUI",
+            "--noerrdialogs",
+            "--disable-print-preview",
+            # Suppresses in-product-help promo bubbles.
+            "--propagate-iph-for-testing",
             "--use-gl=swiftshader",
         ]
 
@@ -610,8 +727,8 @@ class VirtualSession:
                 self._xvfb.kill()
         self._xvfb = None
 
-        # Profile dirs grow with cache and are a classic disk-fill.
-        shutil.rmtree(self.profile_dir, ignore_errors=True)
+        # The profile deliberately survives: it is what makes the channel come
+        # back signed in. Only the HLS output is transient.
         shutil.rmtree(self.out_dir, ignore_errors=True)
 
     # -- interactive control --------------------------------------------
@@ -899,6 +1016,40 @@ class SessionManager:
         if self._janitor is None or self._janitor.done():
             self._janitor = asyncio.create_task(self._reap_loop())
 
+    async def start_autostart_channels(self) -> None:
+        """Bring up every channel marked autostart.
+
+        Called from the app's lifespan, so a container restart puts these back
+        exactly as they were — and because the browser profile is persistent,
+        they come back signed in rather than at a login page.
+
+        Failures are logged and skipped: one channel whose site is down must not
+        stop the others, and the normal on-demand path will retry when someone
+        tunes in.
+        """
+        for record in virtual_channels.list_channels():
+            if not (record.get("autostart") and record.get("enabled")):
+                continue
+            name = record["name"]
+            try:
+                logger.info("virtual[%s]: autostart", name)
+                await self.acquire(name)
+            except Exception as exc:
+                logger.error("virtual[%s]: autostart failed: %s", name, exc)
+
+    def apply_live_settings(self, record: dict) -> bool:
+        """Push a non-capture settings change onto a running session.
+
+        Title, logo, tags, idle timeout and autostart do not affect how the
+        browser or the encoder were started, so they can take effect without
+        tearing the session down. Returns True if a session was updated.
+        """
+        session = self._sessions.get(record.get("name", ""))
+        if session is None:
+            return False
+        session.record = record
+        return True
+
     async def _reap_loop(self) -> None:
         """Tear down idle and dead sessions.
 
@@ -911,14 +1062,23 @@ class SessionManager:
                 now = time.monotonic()
                 for name, session in list(self._sessions.items()):
                     idle = now - session.last_access
+                    keep_hot = session.record.get("autostart")
+                    if not session.is_alive():
+                        # A stalled session is restarted rather than left dead,
+                        # for an autostart channel that is the whole point.
+                        logger.warning("virtual[%s]: stream stalled, stopping", name)
+                        with contextlib.suppress(Exception):
+                            await self.stop(name)
+                        if keep_hot:
+                            with contextlib.suppress(Exception):
+                                await self.acquire(name)
+                        continue
+                    if keep_hot:
+                        continue  # kept running on purpose
                     if idle > session.record["idle_timeout"]:
                         logger.info("virtual[%s]: idle %ds, stopping", name, int(idle))
-                    elif not session.is_alive():
-                        logger.warning("virtual[%s]: stream stalled, stopping", name)
-                    else:
-                        continue
-                    with contextlib.suppress(Exception):
-                        await self.stop(name)
+                        with contextlib.suppress(Exception):
+                            await self.stop(name)
         except asyncio.CancelledError:
             pass
 

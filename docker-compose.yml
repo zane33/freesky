@@ -40,6 +40,10 @@ services:
       # the tmpfs mounted below - they are write-heavy, live for seconds, and are
       # never worth touching disk.
       - VIRTUAL_HLS_ROOT=/streams
+      # Browser profiles live on the ./data volume, NOT in the container's
+      # filesystem: they hold the cookies and stored logins that let a channel
+      # come back after a restart already signed in instead of at a login page.
+      - VIRTUAL_PROFILE_ROOT=/app/data/virtual-profiles
       # 0 = no limit on concurrent browser sessions, which is the default:
       # running several virtual channels side by side is the point of the
       # feature. Each session costs roughly 1.5-2 CPU cores and ~900MB at

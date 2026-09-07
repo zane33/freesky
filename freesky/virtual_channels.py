@@ -79,6 +79,27 @@ PRESETS = ("ultrafast", "superfast", "veryfast")
 DEFAULT_PRESET = "veryfast"
 
 
+# Fields whose value is baked into a running session: the browser was launched
+# with this geometry, and the encoder was started with these codec settings.
+# Changing one of them requires a new session; changing anything else (a title,
+# a logo, the idle timeout) can be applied to the live session in place.
+#
+# This distinction exists because restarting on every save meant an admin who
+# fixed a typo in a channel's name tore down a browser they had just signed in
+# to.
+CAPTURE_FIELDS = (
+    "url", "resolution", "framerate", "preset", "video_bitrate",
+    "audio", "audio_bitrate", "warmup", "click_selectors", "hide_selectors",
+)
+
+
+def needs_restart(old_record: dict, new_record: dict) -> bool:
+    """True when the change cannot be applied to a running session."""
+    if not old_record:
+        return False
+    return any(old_record.get(f) != new_record.get(f) for f in CAPTURE_FIELDS)
+
+
 class VirtualChannelError(ValueError):
     """A virtual channel record was rejected.
 
@@ -250,6 +271,13 @@ def validate_channel(record: dict) -> dict:
         "tags": tags,
         "logo": logo,
         "enabled": bool(record.get("enabled", True)),
+        # Keep this channel hot: start it when FreeSky starts, and never reap it
+        # for being idle. This is what makes a channel survive a container
+        # restart already signed in — the browser profile is persistent, so the
+        # session comes back exactly where it left off rather than at a login
+        # page. Costs a browser and an encoder around the clock, so it is off by
+        # default and opted into per channel.
+        "autostart": bool(record.get("autostart", False)),
     }
 
 
@@ -342,6 +370,12 @@ def rename_channel(old: str, new: str) -> dict:
     if cleaned["name"] == old:
         return cleaned
     data = _load()
+    if cleaned["name"] in data:
+        # Without this the target channel was silently replaced and disappeared
+        # from the playlist — a rename must never destroy another channel.
+        raise VirtualChannelError(
+            f"A virtual channel named {cleaned['name']!r} already exists."
+        )
     data.pop(old, None)
     data[cleaned["name"]] = cleaned
     _save(data)
@@ -410,6 +444,17 @@ if __name__ == "__main__":
                 pass
 
         assert len(list_channels()) == 2, "news + y"
+        # A rename must never clobber another channel.
+        upsert_channel({"name": "other", "url": "https://e.com/2"})
+        try:
+            rename_channel("news", "other")
+            raise AssertionError("rename onto an existing name must be rejected")
+        except VirtualChannelError:
+            pass
+        assert get_channel("other")["url"] == "https://e.com/2", "target untouched"
+        assert get_channel("news") is not None, "source untouched"
+        delete_channel("other")
+
         renamed = rename_channel("news", "world-news")
         assert renamed["name"] == "world-news" and get_channel("news") is None
         assert delete_channel("virt-world-news") is True, "delete accepts an id"
@@ -419,5 +464,18 @@ if __name__ == "__main__":
         with open(CHANNELS_FILE, "w") as f:
             f.write("{ not json")
         assert list_channels() == [] and get_channel("y") is None
+
+        # A cosmetic edit must not require tearing down a live browser.
+        base = validate_channel({"name": "a", "url": "https://e.com"})
+        assert not needs_restart(base, {**base, "title": "New name"})
+        assert not needs_restart(base, {**base, "logo": "/x.png", "idle_timeout": 300})
+        assert not needs_restart(base, {**base, "autostart": True})
+        assert needs_restart(base, {**base, "url": "https://other.com"})
+        assert needs_restart(base, {**base, "resolution": "1080p"})
+        assert needs_restart(base, {**base, "audio": False})
+        assert not needs_restart({}, base), "a new channel has nothing to restart"
+
+        assert base["autostart"] is False, "opt-in, since it runs around the clock"
+        assert validate_channel({**base, "autostart": True})["autostart"] is True
 
         print("virtual_channels ok")

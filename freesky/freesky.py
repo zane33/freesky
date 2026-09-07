@@ -438,3 +438,7 @@ app.register_lifespan_task(backend.update_channels)
 # lifespan, so @fastapi_app.on_event("shutdown") never fires; without this, a
 # reload leaves orphaned Chromium and ffmpeg processes holding X displays.
 app.register_lifespan_task(backend.close_virtual_sessions)
+# Bring back any virtual channel marked "keep running", so a restart resumes
+# where it left off. Their browser profiles are persistent, so they return
+# signed in rather than at a login page.
+app.register_lifespan_task(backend.start_virtual_sessions)

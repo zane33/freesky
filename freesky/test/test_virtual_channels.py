@@ -335,3 +335,310 @@ def test_virtual_stream_type_survives_from_dict():
         {"id": "virt-a", "name": "V", "tags": [], "logo": "", "stream_type": "virtual"}
     )
     assert channel.stream_type == "virtual"
+
+
+# --- Chromium dialog suppression --------------------------------------------
+# Browser UI is drawn into the browser's X window, so an unsuppressed dialog is
+# captured and broadcast to viewers. These assertions encode findings verified
+# against the shipped Chrome for Testing binary, because the widely-copied
+# advice for this is largely dead flags.
+
+
+@pytest.fixture
+def seeded_profile(tmp_path):
+    record = virtual_channels.validate_channel({"name": "s", "url": "https://e.com"})
+    session = virtual_session.VirtualSession(record, 99)
+    session.profile_dir = str(tmp_path / "profile")
+    session._seed_profile()
+    return session
+
+
+def test_save_password_bubble_is_disabled_by_pref(seeded_profile):
+    """`credentials_enable_service` is the surviving control for the bubble.
+
+    There is no command-line switch for it any more, so if this pref is not
+    written the bubble appears on the live stream.
+    """
+    prefs = json.load(open(os.path.join(seeded_profile.profile_dir, "Default", "Preferences")))
+    assert prefs["credentials_enable_service"] is False
+
+
+def test_first_run_sentinel_exists(seeded_profile):
+    """Without it Chromium treats the profile as new and overwrites the
+    Preferences file we just wrote, silently undoing every suppression."""
+    assert os.path.isfile(os.path.join(seeded_profile.profile_dir, "First Run"))
+
+
+def test_exit_type_is_normal(seeded_profile):
+    """Sessions are stopped abruptly. Chromium writes "Crashed" at startup and
+    only clears it on a clean shutdown, so without resetting this each launch
+    the next session shows a "Restore pages?" bubble — on the stream."""
+    prefs = json.load(open(os.path.join(seeded_profile.profile_dir, "Default", "Preferences")))
+    assert prefs["profile"]["exit_type"] == "Normal"
+
+
+def test_no_dead_password_manager_pref(seeded_profile):
+    """`profile.password_manager_enabled` no longer exists in Chromium. Writing
+    it would look like the bubble was handled while doing nothing."""
+    prefs = json.load(open(os.path.join(seeded_profile.profile_dir, "Default", "Preferences")))
+    assert "password_manager_enabled" not in prefs["profile"]
+
+
+def test_no_dead_chromium_switches():
+    """These were all removed from Chromium; shipping them is cargo cult."""
+    record = virtual_channels.validate_channel({"name": "d", "url": "https://e.com"})
+    session = virtual_session.VirtualSession(record, 99)
+    # _start_browser builds the list inline, so read it from the source rather
+    # than launching a browser to get at it.
+    import inspect
+
+    source = inspect.getsource(session._start_browser)
+    for dead in ("--disable-save-password-bubble", "--disable-session-crashed-bubble",
+                 "--disable-translate", "PasswordManagerEnableAccountStore"):
+        assert dead not in source, f"{dead} is a no-op in modern Chromium"
+
+
+def test_does_not_pass_its_own_disable_features():
+    """Playwright already sends one comma-joined --disable-features list. A
+    second occurrence of the switch is a merge hazard, so we add none."""
+    import inspect
+
+    record = virtual_channels.validate_channel({"name": "d", "url": "https://e.com"})
+    session = virtual_session.VirtualSession(record, 99)
+    source = inspect.getsource(session._start_browser)
+    assert '"--disable-features=' not in source
+
+
+def test_xdotool_key_translation():
+    """Browser key names are not X keysyms; Enter/Backspace/arrows must map."""
+    assert virtual_session._xdotool_key("Enter") == "Return"
+    assert virtual_session._xdotool_key("Backspace") == "BackSpace"
+    assert virtual_session._xdotool_key("ArrowLeft") == "Left"
+    assert virtual_session._xdotool_key("PageDown") == "Next"
+    assert virtual_session._xdotool_key("a") == "a", "plain keys pass through"
+
+
+# --- persistent profiles ----------------------------------------------------
+# The profile is what carries cookies and stored logins between sessions and
+# across container restarts. Wiping it, or overwriting its Preferences, silently
+# turns "resumes signed in" back into "lands on a login page".
+
+
+def test_profile_lives_on_the_data_volume():
+    """Not /tmp: a profile in /tmp does not survive a container restart."""
+    record = virtual_channels.validate_channel({"name": "p", "url": "https://e.com"})
+    session = virtual_session.VirtualSession(record, 99)
+    assert session.profile_dir.startswith(virtual_session.PROFILE_ROOT)
+    assert not session.profile_dir.startswith("/tmp/")
+
+
+def test_seeding_preserves_existing_profile_data(tmp_path):
+    """Seeding must MERGE. Chromium stores session state in this same file, so
+    replacing it wholesale on every launch would discard what we are trying to
+    keep."""
+    record = virtual_channels.validate_channel({"name": "p", "url": "https://e.com"})
+    session = virtual_session.VirtualSession(record, 99)
+    session.profile_dir = str(tmp_path / "profile")
+
+    default = os.path.join(session.profile_dir, "Default")
+    os.makedirs(default)
+    with open(os.path.join(default, "Preferences"), "w") as f:
+        json.dump(
+            {"profile": {"content_settings": {"keep": 1}, "exit_type": "Crashed"},
+             "some_saved_state": {"token": "keepme"}},
+            f,
+        )
+
+    session._seed_profile()
+
+    prefs = json.load(open(os.path.join(default, "Preferences")))
+    assert prefs["some_saved_state"] == {"token": "keepme"}, "unrelated keys survive"
+    assert prefs["profile"]["content_settings"] == {"keep": 1}, "nested keys survive"
+    # ...while our suppressions are still applied on top.
+    assert prefs["credentials_enable_service"] is False
+    assert prefs["profile"]["exit_type"] == "Normal", "reset every launch"
+
+
+def test_seeding_clears_stale_singleton_locks(tmp_path):
+    """A killed session leaves these behind and Chromium then refuses to start.
+    With a persistent profile that failure would be permanent, not self-healing.
+    """
+    record = virtual_channels.validate_channel({"name": "p", "url": "https://e.com"})
+    session = virtual_session.VirtualSession(record, 99)
+    session.profile_dir = str(tmp_path / "profile")
+    os.makedirs(session.profile_dir)
+    for stale in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        open(os.path.join(session.profile_dir, stale), "w").close()
+
+    session._seed_profile()
+
+    for stale in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        assert not os.path.exists(os.path.join(session.profile_dir, stale))
+
+
+def test_stop_does_not_delete_the_profile():
+    """Teardown clears HLS output only. Deleting the profile here is what would
+    make every restart require signing in again."""
+    import inspect
+
+    source = inspect.getsource(virtual_session.VirtualSession.stop)
+    assert "self.out_dir" in source
+    assert "profile_dir" not in source, "the profile must survive a stop()"
+
+
+# --- saving must not needlessly restart a session ---------------------------
+
+
+def test_cosmetic_edit_does_not_need_a_restart():
+    base = virtual_channels.validate_channel({"name": "a", "url": "https://e.com"})
+    assert not virtual_channels.needs_restart(base, {**base, "title": "Renamed"})
+    assert not virtual_channels.needs_restart(base, {**base, "idle_timeout": 600})
+    assert not virtual_channels.needs_restart(base, {**base, "autostart": True})
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("url", "https://other.com"), ("resolution", "1080p"), ("framerate", 25),
+     ("audio", False), ("video_bitrate", 900), ("preset", "ultrafast")],
+)
+def test_capture_edit_needs_a_restart(field, value):
+    base = virtual_channels.validate_channel({"name": "a", "url": "https://e.com"})
+    assert virtual_channels.needs_restart(base, {**base, field: value})
+
+
+# --- editing a virtual channel ----------------------------------------------
+# save_vc is driven directly through its underlying function with a stand-in
+# `self`. The handler only touches its own vc_* attributes and module-level
+# functions, so this exercises the real save logic without a Reflex runtime —
+# and these are all bugs that reached a running server.
+
+
+class _FakeSettingsState:
+    """Minimal stand-in for SettingsState, carrying just the form fields."""
+
+    def __init__(self, **overrides):
+        self.vc_editing = ""
+        self.vc_name = ""
+        self.vc_title = ""
+        self.vc_url = "https://example.com/live"
+        self.vc_resolution = virtual_channels.DEFAULT_RESOLUTION
+        self.vc_framerate = str(virtual_channels.DEFAULT_FRAMERATE)
+        self.vc_preset = virtual_channels.DEFAULT_PRESET
+        self.vc_video_bitrate = "2500"
+        self.vc_audio = True
+        self.vc_audio_bitrate = "128"
+        self.vc_warmup = "6"
+        self.vc_idle_timeout = "120"
+        self.vc_click_selectors = ""
+        self.vc_hide_selectors = ""
+        self.vc_logo = ""
+        self.vc_tags = "Virtual"
+        self.vc_enabled = True
+        self.vc_autostart = False
+        self.vc_error = ""
+        self.vc_token = ""
+        self.vc_list = []
+        self.reset_called = False
+        self.__dict__.update(overrides)
+
+    def _load_virtual(self, token=""):
+        self.vc_list = virtual_channels.list_channels()
+
+    def reset_vc_form(self):
+        self.reset_called = True
+        self.vc_editing = ""
+
+
+def _run_save(state):
+    """Drive save_vc and return the events it yielded."""
+    from freesky.pages.settings import SettingsState
+
+    result = SettingsState.save_vc.fn(state)
+    return list(result) if result is not None else []
+
+
+def test_save_rejects_rename_onto_an_existing_channel():
+    """This silently destroyed the target channel: it disappeared from the
+    playlist while the UI reported a successful save."""
+    virtual_channels.upsert_channel({"name": "bbc", "url": "https://a.com/1"})
+    virtual_channels.upsert_channel({"name": "cnn", "url": "https://b.com/2"})
+
+    state = _FakeSettingsState(vc_editing="bbc", vc_name="cnn", vc_url="https://a.com/1")
+    _run_save(state)
+
+    assert "already exists" in state.vc_error
+    names = sorted(c["name"] for c in virtual_channels.list_channels())
+    assert names == ["bbc", "cnn"], "neither channel may be lost"
+    assert virtual_channels.get_channel("cnn")["url"] == "https://b.com/2", "target untouched"
+
+
+def test_save_rejects_adding_a_duplicate_name():
+    virtual_channels.upsert_channel({"name": "bbc", "url": "https://a.com/1"})
+
+    state = _FakeSettingsState(vc_name="bbc", vc_url="https://evil.com/x")
+    _run_save(state)
+
+    assert "already exists" in state.vc_error
+    assert virtual_channels.get_channel("bbc")["url"] == "https://a.com/1"
+
+
+def test_failed_rename_does_not_half_commit_other_edits():
+    """The old code wrote the edited fields under the old name and only then
+    renamed, so an invalid name left the other edits committed to disk behind an
+    error message that implied nothing had happened."""
+    virtual_channels.upsert_channel(
+        {"name": "bbc", "title": "BBC", "url": "https://a.com/1"}
+    )
+
+    state = _FakeSettingsState(
+        vc_editing="bbc", vc_name="BBC One!", vc_title="Changed",
+        vc_url="https://evil.com/x",
+    )
+    _run_save(state)
+
+    assert state.vc_error, "an invalid name must be reported"
+    stored = virtual_channels.get_channel("bbc")
+    assert stored["url"] == "https://a.com/1", "URL must not have been written"
+    assert stored["title"] == "BBC", "title must not have been written"
+
+
+def test_successful_rename_moves_the_record():
+    virtual_channels.upsert_channel({"name": "bbc", "title": "BBC", "url": "https://a.com/1"})
+
+    state = _FakeSettingsState(
+        vc_editing="bbc", vc_name="bbc-one", vc_title="BBC One", vc_url="https://a.com/1"
+    )
+    _run_save(state)
+
+    assert not state.vc_error
+    assert virtual_channels.get_channel("bbc") is None, "old id must not linger"
+    assert virtual_channels.get_channel("bbc-one")["title"] == "BBC One"
+
+
+def test_rename_restarts_the_session_under_its_OLD_name():
+    """The session is keyed by the old name. reset_vc_form() clears vc_editing,
+    so reading it afterwards restarted a session that never existed and leaked
+    the real one — a browser and an encoder left running forever."""
+    virtual_channels.upsert_channel({"name": "bbc", "url": "https://a.com/1"})
+
+    state = _FakeSettingsState(vc_editing="bbc", vc_name="bbc-one", vc_url="https://a.com/1")
+    events = _run_save(state)
+
+    payloads = [str(getattr(e, "args", e)) for e in events]
+    assert any("bbc" in p and "bbc-one" not in p for p in payloads), (
+        f"expected a restart keyed on the old name, got {payloads}"
+    )
+
+
+def test_cosmetic_edit_does_not_restart_the_session():
+    virtual_channels.upsert_channel({"name": "bbc", "title": "BBC", "url": "https://a.com/1"})
+
+    state = _FakeSettingsState(
+        vc_editing="bbc", vc_name="bbc", vc_title="BBC News", vc_url="https://a.com/1"
+    )
+    events = _run_save(state)
+
+    assert not state.vc_error
+    assert virtual_channels.get_channel("bbc")["title"] == "BBC News"
+    rendered = " ".join(str(getattr(e, "name", e)) for e in events)
+    assert "restart_vc_session" not in rendered, "a title change must not kill the browser"
