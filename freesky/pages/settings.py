@@ -848,6 +848,8 @@ def channel_row(channel: Channel) -> rx.Component:
 def _describe_host(host: dict) -> str:
     """One readable line from virtual_session.host_load()."""
     parts = []
+    if host.get("cpu_model"):
+        parts.append(host["cpu_model"])
     load = host.get("load")
     if load:
         parts.append(f"load {load[0]} on {host.get('cpus', '?')} CPUs")
@@ -858,6 +860,10 @@ def _describe_host(host: dict) -> str:
         note = " - the quota is pausing the container; use cpuset or raise CPU_LIMIT" \
             if throttled >= 5 else ""
         parts.append(f"throttled {throttled}% of periods{note}")
+    if host.get("gpu_mode"):
+        parts.append("GPU mode on" + ("" if host.get("gpu_device") else " but /dev/dri is NOT visible"))
+    elif host.get("gpu_device"):
+        parts.append("/dev/dri visible (VIRTUAL_GPU=1 can be tried)")
     return "Host CPU: " + ", ".join(parts)
 
 

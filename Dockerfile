@@ -113,6 +113,10 @@ FROM python:3.13-slim
 #   fonts-*          - without these every captured page renders as tofu boxes
 #   libdrm2/libpango/libcairo2/libxss1 - headful Chromium needs these beyond the
 #                        headless set already listed above
+#   libgl1/libegl1/libgles2, libva*, mesa-va-drivers, intel-media-va-driver,
+#                      vainfo - user-space for the opt-in GPU mode (VIRTUAL_GPU=1
+#                      with /dev/dri mapped in): EGL compositing and VA-API
+#                      decode on an Intel/AMD iGPU. Inert without the device.
 RUN apt-get update -y && apt-get install -y \
     caddy \
     redis-server \
@@ -151,6 +155,14 @@ RUN apt-get update -y && apt-get install -y \
     libpango-1.0-0 \
     libcairo2 \
     libxss1 \
+    libgl1 \
+    libegl1 \
+    libgles2 \
+    libva2 \
+    libva-drm2 \
+    mesa-va-drivers \
+    intel-media-va-driver \
+    vainfo \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*

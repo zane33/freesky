@@ -68,6 +68,15 @@ services:
       # over loopback. This is where it delivers to; only change it if the
       # backend listens somewhere other than 127.0.0.1:BACKEND_PORT.
       - VIRTUAL_CAPTURE_WS=${VIRTUAL_CAPTURE_WS:-}
+      # EXPERIMENTAL GPU mode. Software compositing runs on one thread and
+      # tops out around 1080p30; 1080p50/60 needs the iGPU. Set VIRTUAL_GPU=1
+      # AND map the render node in with a docker-compose.override.yml:
+      #   services:
+      #     freesky:
+      #       devices:
+      #         - /dev/dri:/dev/dri
+      # The Sessions line in Settings reports whether /dev/dri is visible.
+      - VIRTUAL_GPU=${VIRTUAL_GPU:-}
       - VIRTUAL_CONTROL_FPS=${VIRTUAL_CONTROL_FPS:-10}
       - VIRTUAL_CONTROL_MAX_WIDTH=${VIRTUAL_CONTROL_MAX_WIDTH:-960}
       # ffmpeg mjpeg quality: 2 best, 31 worst.

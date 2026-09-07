@@ -240,6 +240,20 @@ _PULSE_SOCKET = os.path.join(_PULSE_DIR, "native")
 DISK_CACHE_BYTES = int(os.environ.get("VIRTUAL_DISK_CACHE_BYTES", str(256 * 1024 * 1024)))
 
 ENCODER_THREADS = int(os.environ.get("VIRTUAL_ENCODER_THREADS", "2"))
+
+# Opt-in GPU acceleration for the browser (EXPERIMENTAL).
+#
+# In software mode Chromium composites and captures on ONE thread in its GPU
+# process. Measured at 1080p that thread saturates a core at about 30 presented
+# frames a second, whatever the core count: 1080p50/60 is out of reach of
+# software compositing on a serial thread. With a DRM render node mapped into
+# the container (/dev/dri) and the VA-API drivers installed (Dockerfile), this
+# switches Chromium to EGL on that device for compositing and to VA-API for
+# video decode. Requires `devices: [/dev/dri:/dev/dri]` in docker-compose and
+# an Intel or AMD iGPU. Not verified on this project's hardware; the status
+# line reports whether /dev/dri is visible so it can be tried deliberately.
+GPU = os.environ.get("VIRTUAL_GPU", "").strip() == "1"
+GPU_DEVICE = "/dev/dri/renderD128"
 RASTER_THREADS = int(os.environ.get("VIRTUAL_RASTER_THREADS", "2"))
 
 SEGMENT_SECONDS = int(os.environ.get("VIRTUAL_SEGMENT_SECONDS", "2"))
@@ -842,20 +856,13 @@ class VirtualSession:
             "--disable-print-preview",
             # Suppresses in-product-help promo bubbles.
             "--propagate-iph-for-testing",
-            # Rendering. SwiftShader was removed here deliberately: it is a
-            # WebGL/GLES emulator, and routing a plain <video> page's 2D
-            # composites through an emulated GL driver is the expensive path.
-            # With no GPU in the container, Skia's CPU raster is both cheaper
-            # and what Chromium's own docs point at. --disable-software-rasterizer
-            # stops it falling back into SwiftShader anyway.
-            "--disable-gpu",
-            "--disable-software-rasterizer",
             # Frees the display scheduler from a synthetic 60Hz vblank timer.
             # NOT --disable-frame-rate-limit: unbounded frame production has
             # been reported to starve video decode, and this container is
             # CPU-bound, so it would compete with the encoder for the cores the
             # stream actually needs.
             "--disable-gpu-vsync",
+        ] + self._render_args() + [
             # Keeps raster from taking every core away from x11grab and x264.
             f"--num-raster-threads={RASTER_THREADS}",
             # Without this Chromium blanks its output when a navigation stalls,
@@ -873,6 +880,34 @@ class VirtualSession:
             # window under Xvfb can look "occluded", and a throttled renderer
             # stops presenting frames), so they are not repeated.
         ] + self._capture_args()
+
+    def _render_args(self) -> list:
+        """Software rendering by default; GPU via EGL/VA-API when opted in.
+
+        Software: SwiftShader was removed here deliberately. It is a WebGL/GLES
+        emulator, and routing a plain <video> page's 2D composites through an
+        emulated GL driver is the expensive path. With no GPU in the container,
+        Skia's CPU raster is both cheaper and what Chromium's own docs point at.
+        --disable-software-rasterizer stops it falling back into SwiftShader.
+
+        GPU (VIRTUAL_GPU=1): ANGLE on EGL talks to the render node directly, so
+        no GLX and no X compositor is needed under Xvfb; the composited frame is
+        still handed to X as pixels. VA-API decode moves the H.264/HEVC decode
+        of the page's video off the CPU. Both need /dev/dri in the container.
+        """
+        if not GPU:
+            return ["--disable-gpu", "--disable-software-rasterizer"]
+        return [
+            "--use-gl=angle", "--use-angle=gl-egl",
+            "--ignore-gpu-blocklist",
+            "--enable-gpu-rasterization", "--enable-zero-copy",
+            # A second --enable-features occurrence replaces Playwright's
+            # (CDPScreenshotNewSurface, screenshot-only), which is acceptable
+            # here and only here.
+            "--enable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,"
+            "VaapiIgnoreDriverChecks,AcceleratedVideoDecodeLinuxGL",
+            "--disable-features=UseChromeOSDirectVideoDecoder",
+        ]
 
     def _capture_args(self) -> list:
         """Switches that load and trust the tab-capture extension.
@@ -2016,6 +2051,13 @@ def _read(path: str) -> str:
 _throttle_sample: Optional[tuple] = None
 
 
+def _cpu_model() -> str:
+    for line in _read("/proc/cpuinfo").splitlines():
+        if line.lower().startswith("model name"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
 def host_load() -> dict:
     """The CPU picture a stuttering stream is usually explained by.
 
@@ -2031,7 +2073,12 @@ def host_load() -> dict:
     """
     global _throttle_sample
     out: dict = {"cpus": os.cpu_count() or 0, "quota": 0.0, "load": None,
-                 "throttled_pct": None, "cgroup": ""}
+                 "throttled_pct": None, "cgroup": "",
+                 # What the box is, and whether a GPU render node is visible
+                 # inside the container. Decides whether VIRTUAL_GPU=1 can work.
+                 "cpu_model": _cpu_model(),
+                 "gpu_device": os.path.exists(GPU_DEVICE),
+                 "gpu_mode": GPU}
     try:
         out["load"] = [round(x, 2) for x in os.getloadavg()]
     except OSError:

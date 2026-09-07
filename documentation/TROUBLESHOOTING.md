@@ -242,6 +242,10 @@ away with presets, thread caps or bitrates.
 4. Pick a frame rate that divides 60 (20, 30, 60) for tab capture; the
    compositor runs at 60Hz and those give even intervals without relying on the
    snap.
+5. At **1080p**, do not expect more than 30fps from a CPU-only host: the
+   software compositor is single-threaded and saturates one core there. See
+   [VIRTUAL_CHANNELS.md](VIRTUAL_CHANNELS.md#1080p-and-high-frame-rates) for
+   the GPU option.
 
 `/api/virtual-control/<name>/diagnostics` (admin token) reports all of the
 above in one JSON document: encoder counters, the capture feed's state and the

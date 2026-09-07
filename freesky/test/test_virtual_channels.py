@@ -1466,3 +1466,22 @@ def test_capture_uses_the_extension_service_worker_not_the_sites():
     session._context = _Ctx([site])
     with pytest.raises(virtual_session.VirtualSessionError, match="no service worker"):
         asyncio.run(session._extension_worker(timeout=0.3))
+
+
+def test_gpu_mode_swaps_software_rendering_flags(monkeypatch):
+    """Default: software raster, no GPU. VIRTUAL_GPU=1: EGL + VA-API and no
+    --disable-gpu, or the whole opt-in would silently do nothing."""
+    soft = virtual_session.VirtualSession(_tab(), 99)._browser_args()
+    assert "--disable-gpu" in soft and "--use-gl=angle" not in soft
+    monkeypatch.setattr(virtual_session, "GPU", True)
+    gpu = virtual_session.VirtualSession(_tab(), 99)._browser_args()
+    assert "--disable-gpu" not in gpu and "--disable-software-rasterizer" not in gpu
+    assert "--use-gl=angle" in gpu and "--use-angle=gl-egl" in gpu
+    assert any(a.startswith("--enable-features=") and "VaapiVideoDecoder" in a for a in gpu)
+
+
+def test_host_load_reports_hardware(client):
+    host = client.get("/api/virtual-sessions/status").json()["host"]
+    for key in ("cpu_model", "gpu_device", "gpu_mode"):
+        assert key in host
+    assert host["gpu_mode"] is False

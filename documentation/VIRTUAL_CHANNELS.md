@@ -18,7 +18,8 @@ plays inside its own player, a dashboard, a webcam page, a scoreboard.
 2. [Creating a channel](#creating-a-channel)
 3. [Controlling a live session](#controlling-a-live-session)
 4. [Running many channels at once](#running-many-channels-at-once)
-5. [One worker, always](#one-worker-always)
+5. [1080p and high frame rates](#1080p-and-high-frame-rates)
+6. [One worker, always](#one-worker-always)
 6. [Cropping: streaming part of the screen](#cropping-streaming-part-of-the-screen)
 7. [Configuration reference](#configuration-reference)
 8. [API reference](#api-reference)
@@ -258,6 +259,33 @@ that mode the least recently watched session is evicted to make room.
 
 ---
 
+## 1080p and high frame rates
+
+720p30 is comfortable on a modern 4-core budget. 1080p30 works with about
+twice the browser CPU. **1080p50/60 does not work under software rendering,
+and no amount of cores fixes it.** Measured: with a 60fps capture at 1080p the
+browser's GPU process sits at ~100% of *one* core while the page presents only
+~16 frames a second and the capture yields ~30 distinct pictures — Chromium's
+software compositor and the capture copy run on a single thread, so the
+ceiling is the speed of one core, not the count. On the 8-core deployment
+host that thread is slower still.
+
+What helps, in order:
+
+1. **Match the source, don't exceed it.** Sky Sport is 50fps; capturing at 60
+   encodes the compositor's repeat frames for nothing. Use 50, or 25 if the
+   host cannot sustain 50 (a clean 2:1 of the source, 40ms every frame).
+2. **Give the container real cores** (`CPUSET`), not a quota. Throttling shows
+   up as stutter before it shows up as load.
+3. **GPU mode** (`VIRTUAL_GPU=1` plus `/dev/dri` mapped in; drivers are in the
+   image). This moves compositing and video decode to the iGPU and is the only
+   route to 1080p50/60. The Sessions line reports the CPU model and whether
+   `/dev/dri` is visible inside the container, so you can tell whether it is
+   worth trying before touching anything. It is experimental: it was not
+   verified on this project's hardware. If the session fails to start with it
+   on, the startup log in the control panel names the stage; turn it back off.
+4. Otherwise, 1080p30 or 720p50 are the honest options for a CPU-only host.
+
 ## One worker, always
 
 The backend must run as a **single** granian worker process. `start.sh` enforces
@@ -347,6 +375,7 @@ All optional. Defaults are in `docker-compose.yml`.
 | `VIRTUAL_CAPTURE_TIMESLICE_MS` | `250` | How often the recorder emits a chunk. |
 | `VIRTUAL_CAPTURE_EXT_DIR` | `freesky/virtual_capture_ext` | The unpacked extension. |
 | `VIRTUAL_DISPLAY_TCP` | unset | Development only: talk to Xvfb over TCP loopback instead of the unix socket, for machines where `/tmp/.X11-unix` is not writable (WSL). Never needed in Docker. |
+| `VIRTUAL_GPU` | unset | `1` switches Chromium to EGL compositing and VA-API decode on `/dev/dri` (must be mapped into the container). Experimental; see [1080p and high frame rates](#1080p-and-high-frame-rates). |
 | `CPU_LIMIT` | `4` | Container CPU quota. See `CPUSET`. |
 | `CPUSET` | unset | Pin the container to these cores (e.g. `0-3`) instead of metering it with a quota. Prefer this: a quota pauses the whole container when spent, which stutters the stream. |
 | `VIRTUAL_CONTROL_FPS` | `10` | Preview frame rate. |
