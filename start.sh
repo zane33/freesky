@@ -177,7 +177,34 @@ BACKEND_PORT=${BACKEND_PORT:-8005}
 echo "Starting Reflex backend with $WORKERS workers on port $BACKEND_PORT..."
 
 # Start the Reflex backend (which includes the FastAPI backend via api_transformer)
-cd /app && reflex run --backend-only --backend-host 0.0.0.0 --backend-port $BACKEND_PORT &
+#
+# Supervised, not fire-and-forget. Caddy is exec'd below and keeps running
+# whatever happens to the backend, so a backend that dies later leaves the whole
+# site answering 502 until someone restarts the container by hand. The most
+# likely way for that to happen here is the kernel OOM-killer picking off the
+# Python process when a virtual channel's Chromium spikes -- a container-level
+# event the app itself cannot catch or report.
+#
+# Restarting keeps the exit code and a timestamp in the log so the cause is
+# still visible afterwards.
+backend_supervisor() {
+    local attempt=0
+    while true; do
+        attempt=$((attempt + 1))
+        echo "[$(date -Is)] Starting Reflex backend (attempt ${attempt})..."
+        cd /app && reflex run --backend-only --backend-host 0.0.0.0 --backend-port "$BACKEND_PORT"
+        local code=$?
+        echo "[$(date -Is)] Backend exited with code ${code}."
+        if [ "$code" -eq 137 ] || [ "$code" -eq 139 ]; then
+            echo "  Exit ${code} means the process was killed (137 = SIGKILL, usually the"
+            echo "  OOM-killer). Check the container memory limit and how many virtual"
+            echo "  channels are running -- a 1080p session costs roughly 1.6GB."
+        fi
+        echo "[$(date -Is)] Restarting backend in 3s..."
+        sleep 3
+    done
+}
+backend_supervisor &
 
 # Wait for backend to be ready
 echo "Waiting for backend..."
