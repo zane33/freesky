@@ -121,10 +121,36 @@ scroll something into place before the channel goes out. The panel starts the
 session if it is not already running, and keeping the panel open keeps the
 session alive.
 
-The live view is a low-frame-rate preview (default 4fps, `VIRTUAL_CONTROL_FPS`).
-It is for aiming a mouse, not for watching — each frame is a full screenshot
-that competes with the encoders for CPU. The *stream* itself is unaffected and
-stays at the channel's configured frame rate.
+### How the live view works
+
+**The panel shows exactly what viewers see.** It captures the same X display the
+encoder captures, at reduced resolution (`VIRTUAL_CONTROL_MAX_WIDTH`, default
+960px) and frame rate (`VIRTUAL_CONTROL_FPS`, default 10) — only the size and
+smoothness are reduced, never the content.
+
+This is deliberate and was not the first design. The panel originally used a CDP
+screencast, which captures the page's compositor surface. That is cheaper and
+smoother, but it captures **only the page**: Chromium's own UI — a "Save
+password?" bubble, an autofill dropdown, an infobar, a permission prompt — is
+drawn by the browser into its X window, not by the page. Those dialogs therefore
+appeared in the stream, where viewers saw them, while being invisible in the
+panel where an admin might have dismissed them. Two capture layers meant two
+different pictures, so there is now only one.
+
+For the same reason, **input is injected at the X level** (via `xdotool`) rather
+than through the page. A page-level click cannot reach a save-password bubble,
+because as far as the page is concerned that bubble does not exist. Coordinates
+are therefore X display coordinates, which are the channel's configured
+geometry. If `xdotool` is missing the panel degrades to page-level input, which
+still works for page content; the preflight in Settings reports its absence.
+
+The panel also **drops pointer-move events while one is still in flight**. A
+move is only useful if it is the latest one; sending them regardless builds a
+queue the server works through long after the pointer has moved on. Clicks and
+keystrokes are never dropped.
+
+The stream itself is unaffected and stays at the channel's configured
+resolution and frame rate.
 
 The panel is a plain HTML page served by the backend rather than a Reflex route,
 because faithful remote control needs raw pointer and keyboard events with exact
@@ -170,7 +196,9 @@ All optional. Defaults are in `docker-compose.yml`.
 | `VIRTUAL_SEGMENT_SECONDS` | `2` | Segment length, and therefore the GOP length. |
 | `VIRTUAL_PLAYLIST_SIZE` | `6` | Segments kept in the playlist window. |
 | `VIRTUAL_START_TIMEOUT` | `45` | Seconds to wait for the first segments before giving up. |
-| `VIRTUAL_CONTROL_FPS` | `4` | Frame rate of the admin control panel's preview. |
+| `VIRTUAL_CONTROL_FPS` | `10` | Preview frame rate. |
+| `VIRTUAL_CONTROL_MAX_WIDTH` | `960` | Preview is downscaled to this width. Lower it first if the panel feels slow. |
+| `VIRTUAL_CONTROL_QUALITY` | `7` | Preview JPEG quality on ffmpeg's mjpeg scale — 2 is best, 31 is worst. |
 | `VIRTUAL_DISPLAY_BASE` | `99` | First X display number to allocate. |
 | `VIRTUAL_PULSE_DIR` | `/tmp/freesky-pulse` | Runtime dir for the container-local PulseAudio daemon. |
 | `MEMORY_LIMIT` | `8G` | Container memory limit. **This is what actually decides how many channels you can run.** |
@@ -343,6 +371,29 @@ session. Alternatively lower channels to 480p, or set `MAX_VIRTUAL_SESSIONS`.
 **Chromium crashes with blank pages.**
 `shm_size` is too small. It must be well above Docker's 64 MB default; the
 shipped value is 1 GB.
+
+**The control panel feels laggy.**
+Lower `VIRTUAL_CONTROL_MAX_WIDTH` (e.g. 640) and/or `VIRTUAL_CONTROL_FPS`. The
+preview runs a second capture of the display alongside the encoder, so it is not
+free. If input specifically is slow while the picture is fine, the container is
+CPU bound — see the next entry.
+
+**A "Save password?" or other browser dialog appears on the stream.**
+It is Chromium's own UI, drawn into the browser window, so it is captured like
+anything else on screen. Open **Control** and dismiss it — the panel captures
+the same display and injects input at the X level, so it can click browser UI,
+not just page content. To stop it recurring, the container launches Chromium
+with the password manager and other prompt-generating features disabled; if a
+new dialog type appears, add its suppression flag in `_start_browser`.
+
+**ffmpeg logs "More than 1000 frames duplicated".**
+The page is repainting more slowly than the channel's configured frame rate, so
+the encoder duplicates frames to hold a constant rate. It is informational, not
+an error, and is normal for a mostly-static page. If it coincides with a choppy
+stream the container is CPU bound: drop the channel to 720p or 480p, set the
+frame rate to match the source (25 for most broadcast content), or use a faster
+x264 preset. Rendering is software (`--use-gl=swiftshader`) as there is no GPU
+in the container, and that is the dominant cost for a video-heavy page.
 
 **Sessions do not appear in Settings.**
 Press **Sessions** to refresh — the panel is not polled, since each entry costs

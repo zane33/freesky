@@ -401,6 +401,10 @@ class SettingsState(rx.State):
         self.users = users.list_users()
         self.trusted_networks = ", ".join(app_settings.trusted_networks())
         self.sources = channel_prefs.sources()
+        # The admin's own token, so each virtual-channel row can carry a working
+        # link to its control panel. require_admin() above only returns a
+        # redirect, so the state has to be fetched explicitly.
+        auth = await self.get_state(AuthState)
         self.vc_token = auth.stream_token
         self._load_virtual(self.vc_token)
 

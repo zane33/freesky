@@ -33,7 +33,6 @@ Nothing here runs until a virtual channel is actually requested, so the cost on
 an install that never uses the feature is one import.
 """
 import asyncio
-import base64
 import contextlib
 import logging
 import os
@@ -81,11 +80,19 @@ MAX_SESSIONS = int(os.environ.get("MAX_VIRTUAL_SESSIONS", "0"))
 # giving up on a session.
 _FIRST_SEGMENT_TIMEOUT = float(os.environ.get("VIRTUAL_START_TIMEOUT", "45"))
 
-# Live-preview settings for the admin control panel. Frames are pushed by
-# Chromium's compositor (CDP screencast) and downscaled on the way out, so the
-# preview costs far less than the stream it sits beside.
+# Live-preview settings for the admin control panel.
+#
+# The preview captures the SAME X display the encoder does, so what the admin
+# sees is exactly what viewers see — including Chromium's own UI (a save-password
+# bubble, an autofill dropdown, a permission prompt), which is drawn by the
+# browser into its X window. A CDP screencast was tried here and rejected: it
+# captures only the page's compositor surface, so browser dialogs were invisible
+# in the panel while being plainly visible in the stream.
+#
+# Only the resolution and frame rate are reduced, never the content.
 CONTROL_MAX_WIDTH = int(os.environ.get("VIRTUAL_CONTROL_MAX_WIDTH", "960"))
-CONTROL_QUALITY = int(os.environ.get("VIRTUAL_CONTROL_QUALITY", "50"))
+# ffmpeg mjpeg quality scale: 2 is best, 31 is worst.
+CONTROL_QUALITY = int(os.environ.get("VIRTUAL_CONTROL_QUALITY", "7"))
 CONTROL_FPS = float(os.environ.get("VIRTUAL_CONTROL_FPS", "10"))
 
 # A stream is considered dead when its playlist has not been rewritten in this
@@ -95,6 +102,22 @@ CONTROL_FPS = float(os.environ.get("VIRTUAL_CONTROL_FPS", "10"))
 _STALL_FACTOR = 4
 
 _SEGMENT_RE = re.compile(r"^seg_\d{6}\.ts$")
+
+
+# Browser key names (KeyboardEvent.key) mapped to the X keysym names xdotool
+# expects. Anything not listed is passed through, which is correct for plain
+# letters and digits.
+_XDOTOOL_KEYS = {
+    "Enter": "Return", "Escape": "Escape", "Backspace": "BackSpace",
+    "Tab": "Tab", "Delete": "Delete", " ": "space",
+    "ArrowUp": "Up", "ArrowDown": "Down", "ArrowLeft": "Left", "ArrowRight": "Right",
+    "Home": "Home", "End": "End", "PageUp": "Prior", "PageDown": "Next",
+    "Control": "ctrl", "Shift": "shift", "Alt": "alt", "Meta": "super",
+}
+
+
+def _xdotool_key(key: str) -> str:
+    return _XDOTOOL_KEYS.get(key, key)
 
 
 class VirtualSessionError(RuntimeError):
@@ -133,7 +156,11 @@ def preflight() -> list:
     Surfaced in the settings UI so "the stream won't start" turns into "ffmpeg is
     not installed" rather than a log dive.
     """
-    return [b for b in ("Xvfb", "ffmpeg", "pulseaudio", "pactl") if not shutil.which(b)]
+    # xdotool is included because the control panel's input goes through it.
+    # Its absence degrades rather than breaks (input falls back to page-level
+    # CDP, which cannot reach browser UI), but an admin should be told.
+    return [b for b in ("Xvfb", "ffmpeg", "pulseaudio", "pactl", "xdotool")
+            if not shutil.which(b)]
 
 
 # --- PulseAudio -------------------------------------------------------------
@@ -243,16 +270,8 @@ class VirtualSession:
         self._page = None
         self._log_tail: list = []
         # Serialises page operations. Playwright's API is not safe against two
-        # coroutines driving the same page at once. Preview frames deliberately
-        # do NOT take this lock — see the screencast section below.
+        # coroutines driving the same page at once.
         self._page_lock = asyncio.Lock()
-
-        # Live preview state. _viewers is a refcount so several admins watching
-        # the same channel share one screencast rather than starting several.
-        self._cdp = None
-        self._viewers = 0
-        self._last_frame: bytes = b""
-        self._frame_event = asyncio.Event()
 
     # -- lifecycle --
 
@@ -568,15 +587,6 @@ class VirtualSession:
                     self._ffmpeg.kill()
         self._ffmpeg = None
 
-        self._viewers = 0
-        if self._cdp is not None:
-            cdp, self._cdp = self._cdp, None
-            with contextlib.suppress(Exception):
-                await cdp.send("Page.stopScreencast")
-        # Release anyone blocked in preview_frames so their request ends rather
-        # than hanging on an event that will never be set again.
-        self._frame_event.set()
-
         for closer in (
             getattr(self._context, "close", None),
             getattr(self._playwright, "stop", None),
@@ -610,171 +620,105 @@ class VirtualSession:
     # the x11grab capture because they are already in page coordinates, so a
     # click at (x, y) on the panel lands at (x, y) in the page with no mapping.
 
-    async def screenshot(self) -> bytes:
-        """One JPEG frame of the live page.
+    # -- live preview: exactly what viewers see --------------------------------
+    # Grabs the same X display the encoder captures, so the panel and the stream
+    # cannot diverge. This matters for more than tidiness: Chromium's own UI —
+    # a save-password bubble, an autofill dropdown, an infobar — is drawn by the
+    # browser into its X window, so it appears in the stream. Capturing the page
+    # instead (CDP screencast) hid exactly those dialogs from the admin who
+    # needed to dismiss them.
 
-        Fallback only. Every call is a full compositor capture that has to take
-        the page lock, which is exactly what made the control panel feel laggy:
-        a click could sit behind an in-flight screenshot. The screencast path
-        below is what the panel actually uses.
-        """
-        if self._page is None:
-            raise VirtualSessionError("Session has no page")
-        async with self._page_lock:
-            return await self._page.screenshot(type="jpeg", quality=60, timeout=10000)
-
-    # -- live preview via CDP screencast --------------------------------------
-    # Chromium pushes a frame whenever the page repaints, already JPEG-encoded
-    # and already downscaled to CONTROL_MAX_WIDTH. That is dramatically cheaper
-    # than asking for a full-size screenshot on a timer, and — because frames
-    # arrive as events rather than as calls we make — it never contends with
-    # input dispatch for the page lock.
-
-    def _on_screencast_frame(self, params: dict) -> None:
-        """CDP event handler. Runs on the event loop, so it must not block."""
-        data = params.get("data")
-        if data:
-            try:
-                self._last_frame = base64.b64decode(data)
-            except (ValueError, TypeError):
-                return
-            # Wake every viewer waiting on the next frame.
-            self._frame_event.set()
-        # Chromium stops sending frames until each one is acknowledged, so a
-        # missed ack silently freezes the preview.
-        session_id = params.get("sessionId")
-        if session_id is not None and self._cdp is not None:
-            asyncio.create_task(self._ack_frame(session_id))
-
-    async def _ack_frame(self, session_id) -> None:
-        with contextlib.suppress(Exception):
-            await self._cdp.send("Page.screencastFrameAck", {"sessionId": session_id})
-
-    async def open_preview(self) -> bool:
-        """Start (or join) the screencast. False if it could not be started."""
-        self._viewers += 1
-        if self._cdp is not None:
-            return True
-        if self._page is None or self._context is None:
-            self._viewers -= 1
-            return False
+    async def screen_frames(self, max_width: int = 0):
+        """Yield JPEG frames of the whole X display."""
+        width = max_width or CONTROL_MAX_WIDTH
+        argv = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-f", "x11grab",
+            # Unlike the stream, draw the pointer: an admin aiming a mouse needs
+            # to see where it is.
+            "-draw_mouse", "1",
+            "-framerate", str(int(max(CONTROL_FPS, 1))),
+            "-video_size", f"{self.width}x{self.height}",
+            "-i", f":{self.display}.0",
+            # -2 keeps the height even, which the encoder requires.
+            "-vf", f"scale={width}:-2",
+            "-q:v", str(CONTROL_QUALITY), "-f", "mjpeg", "pipe:1",
+        ]
+        env = dict(os.environ)
+        env["DISPLAY"] = f":{self.display}"
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, env=env,
+        )
         try:
-            self._cdp = await self._context.new_cdp_session(self._page)
-            self._cdp.on("Page.screencastFrame", self._on_screencast_frame)
-            # everyNthFrame throttles at the source, so a page painting at 30fps
-            # costs us CONTROL_FPS frames rather than 30 we would then discard.
-            every_nth = max(1, round(self.record["framerate"] / max(CONTROL_FPS, 1)))
-            height = round(CONTROL_MAX_WIDTH * self.height / self.width)
-            await self._cdp.send("Page.startScreencast", {
-                "format": "jpeg",
-                "quality": CONTROL_QUALITY,
-                "maxWidth": CONTROL_MAX_WIDTH,
-                "maxHeight": height,
-                "everyNthFrame": every_nth,
-            })
-            return True
-        except Exception as exc:
-            logger.warning("virtual[%s]: screencast unavailable (%s)", self.name, exc)
-            self._cdp = None
-            self._viewers -= 1
-            return False
+            buf = b""
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    return
+                buf += chunk
+                # ffmpeg's mjpeg muxer writes complete JPEGs back to back, so
+                # split on the end-of-image marker rather than guessing lengths.
+                while True:
+                    end = buf.find(b"\xff\xd9")
+                    if end == -1:
+                        break
+                    frame, buf = buf[:end + 2], buf[end + 2:]
+                    start = frame.find(b"\xff\xd8")
+                    if start != -1:
+                        yield frame[start:]
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                proc.terminate()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=5)
 
-    async def close_preview(self) -> None:
-        """Drop one viewer; stop the screencast when the last one leaves."""
-        self._viewers = max(0, self._viewers - 1)
-        if self._viewers > 0 or self._cdp is None:
+    async def dispatch_screen_input(self, event: dict) -> None:
+        """Apply an input event at the X level, via xdotool.
+
+        Needed for anything that is browser UI rather than page content: a
+        CDP/Playwright click cannot reach a save-password bubble, because as far
+        as the page is concerned it does not exist. Falls back to the page-level
+        path when xdotool is not installed.
+        """
+        if not shutil.which("xdotool"):
+            await self.dispatch_input(event)
             return
-        cdp, self._cdp = self._cdp, None
-        with contextlib.suppress(Exception):
-            await cdp.send("Page.stopScreencast")
-        with contextlib.suppress(Exception):
-            await cdp.detach()
-        self._last_frame = b""
-
-    async def preview_frames(self):
-        """Yield each new preview frame as it arrives.
-
-        Waits on an event rather than polling, so a still page costs nothing and
-        a moving one is delivered at the rate Chromium produces it.
-        """
-        # Send whatever we already have so a joining viewer sees the page
-        # immediately instead of waiting for the next repaint.
-        if self._last_frame:
-            yield self._last_frame
-        while True:
-            await self._frame_event.wait()
-            self._frame_event.clear()
-            if not self._last_frame:
-                continue
-            yield self._last_frame
-
-    async def dispatch_input(self, event: dict) -> None:
-        """Apply one input event from the control panel.
-
-        Coordinates arrive already scaled to the page viewport by the panel, so
-        nothing here needs to know how large the admin's browser window is.
-        Unknown event types are ignored rather than raising: the panel is the
-        only caller, and a new event type should degrade to "nothing happened"
-        rather than 500.
-        """
-        if self._page is None:
-            raise VirtualSessionError("Session has no page")
 
         kind = str(event.get("type", ""))
-        x = float(event.get("x", 0) or 0)
-        y = float(event.get("y", 0) or 0)
-        button = str(event.get("button", "left"))
-        if button not in ("left", "middle", "right"):
-            button = "left"
+        display = f":{self.display}"
+        x, y = int(event.get("x", 0) or 0), int(event.get("y", 0) or 0)
+        button = {"left": "1", "middle": "2", "right": "3"}.get(
+            str(event.get("button", "left")), "1"
+        )
+        argv = None
+        if kind == "move":
+            argv = ["xdotool", "mousemove", "--sync", str(x), str(y)]
+        elif kind == "click":
+            clicks = max(1, int(event.get("clicks", 1) or 1))
+            argv = ["xdotool", "mousemove", "--sync", str(x), str(y),
+                    "click", "--repeat", str(clicks), button]
+        elif kind == "down":
+            argv = ["xdotool", "mousemove", "--sync", str(x), str(y),
+                    "mousedown", button]
+        elif kind == "up":
+            argv = ["xdotool", "mousemove", "--sync", str(x), str(y),
+                    "mouseup", button]
+        elif kind == "wheel":
+            # X wheel buttons: 4 = up, 5 = down.
+            argv = ["xdotool", "mousemove", "--sync", str(x), str(y),
+                    "click", "5" if float(event.get("dy", 0) or 0) > 0 else "4"]
+        elif kind == "text":
+            argv = ["xdotool", "type", "--delay", "12", "--", str(event.get("text", ""))]
+        elif kind == "key":
+            argv = ["xdotool", "key", "--", _xdotool_key(str(event.get("key", "")))]
+        else:
+            # back/forward/reload are page-level operations with no X equivalent.
+            await self.dispatch_input(event)
+            return
 
-        async with self._page_lock:
-            page = self._page
-            if kind == "move":
-                await page.mouse.move(x, y)
-            elif kind == "down":
-                await page.mouse.move(x, y)
-                await page.mouse.down(button=button)
-            elif kind == "up":
-                await page.mouse.move(x, y)
-                await page.mouse.up(button=button)
-            elif kind == "click":
-                await page.mouse.click(x, y, button=button,
-                                       click_count=int(event.get("clicks", 1) or 1))
-            elif kind == "wheel":
-                await page.mouse.move(x, y)
-                await page.mouse.wheel(
-                    float(event.get("dx", 0) or 0), float(event.get("dy", 0) or 0)
-                )
-            elif kind == "key":
-                # Playwright key names ("Enter", "ArrowLeft", "a"). The panel
-                # sends event.key straight through, which already matches.
-                await page.keyboard.press(str(event.get("key", "")))
-            elif kind == "text":
-                await page.keyboard.insert_text(str(event.get("text", "")))
-            elif kind == "back":
-                await page.go_back()
-            elif kind == "forward":
-                await page.go_forward()
-            elif kind == "reload":
-                await page.reload()
-
-        self.last_access = time.monotonic()
-
-    async def navigate(self, url: str) -> None:
-        """Point the live session at a different page.
-
-        Deliberately transient: it does NOT rewrite the stored record, so the
-        channel goes back to its configured URL on the next session. Editing the
-        channel in Settings is how you change it permanently.
-        """
-        if self._page is None:
-            raise VirtualSessionError("Session has no page")
-        # Same scheme restriction as the stored record: this is a live browser on
-        # the container's network, and file:// would make it a filesystem viewer.
-        if not str(url).startswith(("http://", "https://")):
-            raise VirtualSessionError("URL must start with http:// or https://")
-        async with self._page_lock:
-            await self._page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        with contextlib.suppress(VirtualSessionError):
+            await _run(argv, timeout=10, env_extra={"DISPLAY": display})
         self.last_access = time.monotonic()
 
     async def page_size(self) -> tuple:

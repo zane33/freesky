@@ -10,6 +10,7 @@ import re
 import time
 from functools import lru_cache
 from typing import Optional, Dict, Set
+from rxconfig import config
 from freesky.free_sky_hybrid import StepDaddyHybrid as StepDaddy
 from freesky.free_sky import Channel
 from fastapi import Response, status, FastAPI, Request
@@ -345,7 +346,13 @@ async def prefetch_popular_stream(channel_id: str):
         # Silent failure for prefetch
 
 def _process_stream_content(content: str, referer: str) -> str:
-    """Process stream content for proxying"""
+    """Rewrite an M3U8 so segments and keys are fetched through our proxy.
+
+    Note: `config` here is the Reflex config, imported at the top of this
+    module. It used to be missing entirely, so every call that reached the
+    `config.proxy_content` check below raised NameError — which surfaced as a
+    dead channel on the vidembed and fallback paths that use this function.
+    """
     if content.startswith('#EXTM3U'):
         # Process M3U8 playlists
         lines = content.split('\n')
@@ -1895,10 +1902,12 @@ async def virtual_control_start(name: str, request: Request):
 
 @fastapi_app.get("/api/virtual-control/{name}/stream.mjpeg")
 async def virtual_control_stream(name: str, request: Request):
-    """Live view of the session's page as multipart JPEG.
+    """Live view of the session as multipart JPEG.
 
-    multipart/x-mixed-replace renders natively in an <img>, so the panel needs no
-    player, no WebSocket and no polling loop.
+    Captures the same X display the encoder does, so the panel shows exactly
+    what viewers see — browser dialogs included. Only the resolution and frame
+    rate are reduced. multipart/x-mixed-replace renders natively in an <img>, so
+    the panel needs no player, no WebSocket and no polling loop.
     """
     session, error = await _control_session(name, request)
     if error is not None:
@@ -1911,38 +1920,16 @@ async def virtual_control_stream(name: str, request: Request):
             f"Content-Length: {len(jpeg)}\r\n\r\n"
         ).encode() + jpeg + b"\r\n"
 
-    # Preferred path: Chromium pushes downscaled frames from its compositor as
-    # the page repaints. Nothing here polls, and no page lock is taken, so a
-    # click is never queued behind a frame capture.
-    streaming = await session.open_preview()
-
     async def frames():
         try:
-            if streaming:
-                async for jpeg in session.preview_frames():
-                    # The panel being open is itself a sign someone is using
-                    # this channel, so keep the reaper off it.
-                    session.last_access = time.monotonic()
-                    yield _part(jpeg)
-                return
-            # Fallback for a session whose CDP screencast could not start.
-            interval = 1.0 / max(_CONTROL_FPS, 0.5)
-            while True:
+            async for jpeg in session.screen_frames():
+                # The panel being open is itself a sign someone is using this
+                # channel, so keep the reaper off it.
                 session.last_access = time.monotonic()
-                try:
-                    jpeg = await session.screenshot()
-                except Exception as exc:
-                    logger.debug(f"Control frame for {name} failed: {exc}")
-                    return
                 yield _part(jpeg)
-                await asyncio.sleep(interval)
         except asyncio.CancelledError:
             # Normal: the admin closed the panel.
             raise
-        finally:
-            if streaming:
-                with contextlib.suppress(Exception):
-                    await session.close_preview()
 
     return StreamingResponse(
         frames(),
@@ -1968,7 +1955,10 @@ async def virtual_control_input(name: str, request: Request):
         return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST,
                             content={"error": "bad_event"})
     try:
-        await session.dispatch_input(event)
+        # X-level input, matching the X-level preview. A page-level (CDP) click
+        # cannot reach browser UI such as a save-password bubble, which as far
+        # as the page is concerned does not exist.
+        await session.dispatch_screen_input(event)
     except virtual_session.VirtualSessionError as exc:
         return JSONResponse(status_code=status.HTTP_409_CONFLICT,
                             content={"error": "input_failed", "message": str(exc)})
@@ -2115,11 +2105,11 @@ async function post(path, body) {
 // page's real viewport. Every pointer event is scaled back into page
 // coordinates here — without this, clicks land in the wrong place on any
 // display narrower than the capture width.
-// The remote page's own CSS pixel size, reported by /start. This is the
-// coordinate space clicks must be expressed in. It is deliberately NOT the
-// frame's naturalWidth: the preview is downscaled for bandwidth, so the image
-// is smaller than the page and scaling by it would land every click short.
-let PAGE = {w: CFG.width, h: CFG.height};
+// The X display's size — the coordinate space clicks are expressed in, and the
+// same geometry the encoder captures. Deliberately NOT the frame's
+// naturalWidth: the preview is downscaled for bandwidth, so scaling by the
+// image size would land every click short.
+const PAGE = {w: CFG.width, h: CFG.height};
 
 function toPageCoords(ev) {
   const r = frame.getBoundingClientRect();
@@ -2205,7 +2195,7 @@ toggle.addEventListener("click", () => {
   toggle.textContent = controlling ? "Release control" : "Take control";
   say(controlling
     ? "Control is live - clicks, scrolling and typing go to the remote browser."
-    : "Viewing only.");
+    : "Viewing only. This is exactly what viewers see.");
 });
 
 document.querySelectorAll("[data-nav]").forEach(b => {
@@ -2231,7 +2221,6 @@ document.getElementById("go").addEventListener("click", async () => {
     say("Starting session (this can take up to a minute on a slow page)...");
     const r = await post("/start", {});
     if (r.url) urlEl.value = r.url;
-    if (r.width && r.height) PAGE = {w: r.width, h: r.height};
     frame.src = base + "/stream.mjpeg" + qs + "&t=" + Date.now();
     say("Viewing only. Press “Take control” to drive the browser.");
   } catch (e) {

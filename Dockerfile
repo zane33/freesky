@@ -74,6 +74,9 @@ FROM python:3.13-slim
 # The xvfb/pulseaudio/ffmpeg block serves virtual channels (a web page restreamed
 # as live HLS, see freesky/virtual_session.py):
 #   xvfb, x11-utils  - a private X display per session, which ffmpeg's x11grab captures
+#   xdotool          - X-level mouse/keyboard injection for the admin control panel,
+#                      so a click can reach Chromium's own UI (a save-password
+#                      bubble, an autofill dropdown) and not just page content
 #   pulseaudio(-utils) - the per-session null-sink Chromium plays into and whose
 #                        .monitor ffmpeg records. Chromium runs HEADFUL against the
 #                        X display precisely because headless Chrome has no reliable
@@ -106,6 +109,7 @@ RUN apt-get update -y && apt-get install -y \
     libasound2 \
     xvfb \
     x11-utils \
+    xdotool \
     pulseaudio \
     pulseaudio-utils \
     ffmpeg \
