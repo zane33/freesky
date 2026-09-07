@@ -7,10 +7,10 @@ player (VLC, Dispatcharr, Jellyfin, the built-in web player) the result is
 indistinguishable from any other channel: it appears in /playlist.m3u8 and is
 fetched from /api/stream/{id}.m3u8.
 
-Same file-backed pattern as channel_prefs.py / app_settings.py /
-drm_providers.py: one JSON file under the ./data volume, a threading.Lock around
-writes, and os.replace so a crash mid-write cannot truncate the file into a
-half-record. Path comes from VIRTUAL_CHANNELS_FILE.
+Same file-backed pattern as channel_prefs.py / app_settings.py: one JSON file
+under the ./data volume, a threading.Lock around writes, and os.replace so a
+crash mid-write cannot truncate the file into a half-record. Path comes from
+VIRTUAL_CHANNELS_FILE.
 
 The `name` is a slug and doubles as the channel id suffix, because the id is
 embedded in a URL path, in an M3U tvg-id, and in a filesystem directory name for

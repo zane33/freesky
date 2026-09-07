@@ -23,26 +23,24 @@ logger = logging.getLogger(__name__)
 class Channel:
     """One playable channel.
 
-    `provider` and `stream_type` carry the DRM routing information. They default
-    to the plain-HLS behaviour every existing construction site expects, so
-    positional `Channel(id, name, tags, logo)` calls keep working untouched.
+    `stream_type` says where the playlist comes from. It defaults to the plain
+    proxied behaviour every existing construction site expects, so positional
+    `Channel(id, name, tags, logo)` calls keep working untouched.
 
     Attributes:
         id: Upstream channel identifier.
         name: Display name.
         tags: Category tags used by the UI filters.
         logo: Logo URL or local proxy path.
-        provider: Name of the DRM provider record in `drm_providers`, or "" for
-            the default HLS path.
-        stream_type: "hls" for a proxied M3U8 playlist, "drm" for a channel that
-            can only be played in-browser through EME/Widevine.
+        stream_type: "hls" for a playlist proxied from an upstream source,
+            "virtual" for one produced locally by a browser session (see
+            freesky/virtual_session.py). Both are ordinary HLS to a player.
     """
 
     id: str
     name: str
     tags: List[str]
     logo: str
-    provider: str = ""
     stream_type: str = "hls"
 
     @classmethod
@@ -60,10 +58,9 @@ class Channel:
             name=data.get("name", "Unknown"),
             tags=data.get("tags", []),
             logo=data.get("logo", "/missing.png"),
-            provider=str(data.get("provider", "") or ""),
             # Anything we don't recognise is treated as plain HLS rather than
             # blocking playback on a typo in saved channel data.
-            stream_type=stream_type if stream_type in ("hls", "drm") else "hls",
+            stream_type=stream_type if stream_type in ("hls", "virtual") else "hls",
         )
 
 

@@ -305,3 +305,33 @@ def test_panel_config_is_json_encoded(admin_and_standard):
     line = next(ln for ln in res.text.splitlines() if ln.startswith("const CFG = "))
     payload = line[len("const CFG = "):].rstrip(";")
     assert json.loads(payload)["name"] == "cam"
+
+
+# --- Channel model after the DRM removal ------------------------------------
+
+
+def test_legacy_drm_record_degrades_to_hls():
+    """Saved channel data from before DRM was removed must not crash the app.
+
+    fallback_channels.json and any cached record may still carry `provider` and
+    stream_type "drm". from_dict tolerates unknown keys, and an unrecognised
+    stream_type falls back to plain HLS rather than propagating a type nothing
+    handles any more.
+    """
+    from freesky.free_sky import Channel
+
+    channel = Channel.from_dict(
+        {"id": "1", "name": "X", "tags": [], "logo": "/l.png",
+         "provider": "acme", "stream_type": "drm"}
+    )
+    assert channel.stream_type == "hls"
+    assert not hasattr(channel, "provider")
+
+
+def test_virtual_stream_type_survives_from_dict():
+    from freesky.free_sky import Channel
+
+    channel = Channel.from_dict(
+        {"id": "virt-a", "name": "V", "tags": [], "logo": "", "stream_type": "virtual"}
+    )
+    assert channel.stream_type == "virtual"
