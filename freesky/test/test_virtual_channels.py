@@ -12,6 +12,7 @@ and whether its output is served safely.
 import json
 import os
 import tempfile
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -759,3 +760,71 @@ def test_ffmpeg_emits_machine_readable_progress():
     # -nostats too, or the human progress line (carriage-return delimited)
     # would never terminate a readline().
     assert "-nostats" in argv
+
+
+# --- cold start ------------------------------------------------------------
+# Building a session means an X display, a browser and an encoder, and for the
+# playlist route also the first HLS segments. Doing all of that inside one HTTP
+# request exceeded the reverse proxy's header timeout, so the control panel only
+# ever saw a 502 while the session was in fact coming up correctly.
+
+
+def test_start_can_skip_waiting_for_segments():
+    """The control panel needs the browser, not the stream."""
+    import inspect
+
+    sig = inspect.signature(virtual_session.VirtualSession.start)
+    assert sig.parameters["wait_for_stream"].default is True
+    sig = inspect.signature(virtual_session.SessionManager.acquire)
+    assert sig.parameters["wait_for_stream"].default is True
+
+
+def test_control_start_does_not_wait_for_the_stream():
+    import inspect
+
+    from freesky import backend
+
+    source = inspect.getsource(backend.virtual_control_start)
+    assert "wait_for_stream=False" in source
+
+
+def test_warming_session_is_not_reaped_as_stalled(tmp_path):
+    """A session with no playlist yet is warming up, not dead. Judging it by
+    playlist freshness alone made it get torn down and rebuilt in a loop."""
+    record = virtual_channels.validate_channel({"name": "w", "url": "https://e.com"})
+    session = virtual_session.VirtualSession(record, 99)
+    session.out_dir = str(tmp_path)
+    session.playlist_path = os.path.join(str(tmp_path), "index.m3u8")
+
+    class _LiveProc:
+        returncode = None
+
+    session._ffmpeg = _LiveProc()
+
+    # Just started, no playlist on disk yet.
+    assert session.is_alive(), "a freshly started session must survive its warm-up"
+
+    # Past the grace period with still no playlist, it is genuinely dead.
+    session.started_at -= virtual_session._STARTUP_GRACE + 1
+    assert not session.is_alive()
+
+
+def test_playlist_freshness_still_governs_a_warm_session(tmp_path):
+    record = virtual_channels.validate_channel({"name": "w", "url": "https://e.com"})
+    session = virtual_session.VirtualSession(record, 99)
+    session.playlist_path = os.path.join(str(tmp_path), "index.m3u8")
+
+    class _LiveProc:
+        returncode = None
+
+    session._ffmpeg = _LiveProc()
+    open(session.playlist_path, "w").close()
+    # Well past the grace period, but the playlist is fresh -> alive.
+    session.started_at -= virtual_session._STARTUP_GRACE + 100
+    assert session.is_alive()
+
+    # Stale playlist -> stalled, regardless of grace.
+    stale = time.time() - virtual_session.SEGMENT_SECONDS * 10
+    os.utime(session.playlist_path, (stale, stale))
+    assert not session.is_alive()
+

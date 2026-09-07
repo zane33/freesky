@@ -156,7 +156,12 @@
 			header_down -Server
 			transport http {
 				dial_timeout 3s
-				response_header_timeout 60s
+				# A cold start builds an X display, a browser and an encoder, and
+				# the playlist route additionally waits for the first HLS
+				# segments. 60s was not enough on a slow page and the panel got a
+				# 502 while the session was still coming up correctly. Keep this
+				# comfortably above VIRTUAL_START_TIMEOUT (45s) plus warm-up.
+				response_header_timeout 180s
 			}
 		}
 	}

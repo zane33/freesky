@@ -121,6 +121,12 @@ CONTROL_FPS = float(os.environ.get("VIRTUAL_CONTROL_FPS", "10"))
 # happily keeps capturing a blank root window.
 _STALL_FACTOR = 4
 
+# A session is still considered healthy for this long after it starts, even
+# before the playlist exists. Without it, a session started for the control
+# panel (which does not wait for segments) would immediately look "stalled" and
+# be torn down and rebuilt in a loop.
+_STARTUP_GRACE = float(os.environ.get("VIRTUAL_STARTUP_GRACE", "90"))
+
 _SEGMENT_RE = re.compile(r"^seg_\d{6}\.ts$")
 
 
@@ -299,8 +305,15 @@ class VirtualSession:
 
     # -- lifecycle --
 
-    async def start(self) -> None:
-        """Bring the whole pipeline up, or raise and leave nothing behind."""
+    async def start(self, wait_for_stream: bool = True) -> None:
+        """Bring the whole pipeline up, or raise and leave nothing behind.
+
+        `wait_for_stream=False` returns as soon as the browser and encoder are
+        running, without waiting for the first HLS segments. The admin control
+        panel only needs the browser — making it wait for segments too pushed a
+        cold start past a minute, which the reverse proxy answered with a 502
+        long before the session was ready.
+        """
         try:
             await self._start_display()
             if self.record["audio"]:
@@ -308,7 +321,8 @@ class VirtualSession:
                 await self._start_sink()
             await self._start_browser()
             await self._start_ffmpeg()
-            await self._await_first_segments()
+            if wait_for_stream:
+                await self._await_first_segments()
         except Exception as exc:
             self.error = str(exc)
             logger.error("virtual[%s]: start failed: %s", self.name, exc)
@@ -1042,7 +1056,10 @@ class VirtualSession:
         try:
             age = time.time() - os.path.getmtime(self.playlist_path)
         except OSError:
-            return False
+            # No playlist yet. That is expected while the page loads and the
+            # encoder fills its first segment, so a freshly started session is
+            # given a grace period rather than being reaped as stalled.
+            return (time.monotonic() - self.started_at) < _STARTUP_GRACE
         return age < SEGMENT_SECONDS * _STALL_FACTOR
 
     def status(self) -> dict:
@@ -1102,8 +1119,12 @@ class SessionManager:
                 raise VirtualSessionError("No free X display")
         return display
 
-    async def acquire(self, name: str) -> VirtualSession:
-        """Return a live session for `name`, starting or restarting as needed."""
+    async def acquire(self, name: str, wait_for_stream: bool = True) -> VirtualSession:
+        """Return a live session for `name`, starting or restarting as needed.
+
+        `wait_for_stream=False` is for callers that only need the browser (the
+        control panel); it skips waiting for the encoder's first segments.
+        """
         record = virtual_channels.get_channel(name)
         if record is None:
             raise VirtualSessionError(f"No virtual channel named {name!r}.")
@@ -1121,6 +1142,12 @@ class SessionManager:
             if session is not None:
                 if session.is_alive():
                     session.last_access = time.monotonic()
+                    # The session may have been started by the control panel,
+                    # which does not wait for segments. A player asking for the
+                    # playlist still has to, or it would be handed a session
+                    # whose playlist file does not exist yet.
+                    if wait_for_stream and not os.path.exists(session.playlist_path):
+                        await session._await_first_segments()
                     return session
                 # Dead but still registered — clean up before rebuilding, or the
                 # display and sink leak.
@@ -1142,7 +1169,7 @@ class SessionManager:
                 self._reserved.add(display)
             try:
                 session = VirtualSession(record, display)
-                await session.start()
+                await session.start(wait_for_stream=wait_for_stream)
                 self._sessions[name] = session
             finally:
                 # Released either way: once registered the session's own

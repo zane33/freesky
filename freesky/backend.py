@@ -1906,7 +1906,10 @@ async def virtual_control_start(name: str, request: Request):
     if _admin_from_request(request) is None:
         return Response(status_code=status.HTTP_401_UNAUTHORIZED)
     try:
-        session = await virtual_session.manager.acquire(name)
+        # The panel needs the browser, not the stream. Waiting for ffmpeg's
+        # first segments as well pushed a cold start past Caddy's header
+        # timeout, so the panel only ever saw a 502.
+        session = await virtual_session.manager.acquire(name, wait_for_stream=False)
     except virtual_session.VirtualSessionError as exc:
         return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             content={"error": "start_failed", "message": str(exc)})
