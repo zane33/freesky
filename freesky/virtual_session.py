@@ -75,6 +75,9 @@ _PULSE_SOCKET = os.path.join(_PULSE_DIR, "native")
 # fighting over a small container's cores: the encode is cheap (a fraction of a
 # core at 720p30), the browser is not, and the usual failure is Chromium being
 # starved until it stops painting — which shows up as ffmpeg duplicating frames.
+# HTTP disk cache for each channel's persistent profile.
+DISK_CACHE_BYTES = int(os.environ.get("VIRTUAL_DISK_CACHE_BYTES", str(256 * 1024 * 1024)))
+
 ENCODER_THREADS = int(os.environ.get("VIRTUAL_ENCODER_THREADS", "2"))
 RASTER_THREADS = int(os.environ.get("VIRTUAL_RASTER_THREADS", "2"))
 
@@ -278,6 +281,10 @@ class VirtualSession:
         self.last_access = time.monotonic()
         self.started_at = time.monotonic()
         self.error = ""
+        # Live encoder metrics, parsed from ffmpeg's -progress stream. This is
+        # the only way to tell "the browser is not painting" (dup climbing,
+        # speed ~1.0) apart from "we cannot encode fast enough" (speed < 1.0).
+        self.metrics: dict = {}
 
         self._xvfb: Optional[subprocess.Popen] = None
         self._ffmpeg: Optional[asyncio.subprocess.Process] = None
@@ -500,6 +507,11 @@ class VirtualSession:
             # and we would capture white frames.
             "--disable-new-content-rendering-timeout",
             "--hide-scrollbars",
+            # A defined HTTP disk cache in the persistent profile, so a restart
+            # re-uses the site's assets instead of re-downloading them. Only
+            # --disable-back-forward-cache is passed by Playwright, and that is
+            # the in-memory bfcache, not this.
+            f"--disk-cache-size={DISK_CACHE_BYTES}",
             # Playwright already passes --disable-background-timer-throttling,
             # --disable-backgrounding-occluded-windows and
             # --disable-renderer-backgrounding, which matter here (a kiosk
@@ -608,6 +620,10 @@ class VirtualSession:
 
         argv = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
+            # Machine-readable progress on stdout, leaving stderr for warnings.
+            # -nostats suppresses the human progress line, which is carriage-
+            # return delimited and would never terminate a readline().
+            "-nostats", "-progress", "pipe:1",
             # Trim input-side buffering; this is a live capture, not a file.
             "-fflags", "nobuffer", "-flags", "low_delay",
             # Both inputs need a deep queue. With the tiny default, a momentary
@@ -700,11 +716,12 @@ class VirtualSession:
 
         self._ffmpeg = await asyncio.create_subprocess_exec(
             *self._ffmpeg_argv(),
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
         asyncio.create_task(self._drain_ffmpeg_log())
+        asyncio.create_task(self._drain_ffmpeg_progress())
 
     async def _drain_ffmpeg_log(self) -> None:
         """Keep the last few stderr lines so a failure has a diagnosis.
@@ -721,6 +738,38 @@ class VirtualSession:
                 self._log_tail.append(line)
                 del self._log_tail[:-40]
                 logger.debug("virtual[%s] ffmpeg: %s", self.name, line)
+        except (asyncio.CancelledError, ValueError):
+            pass
+
+    async def _drain_ffmpeg_progress(self) -> None:
+        """Parse ffmpeg's -progress stream into self.metrics.
+
+        ffmpeg writes a block of key=value lines terminated by `progress=`.
+        The interesting ones:
+
+          fps         frames actually encoded per second
+          speed       encode speed relative to realtime; below 1.0x means the
+                      encoder cannot keep up
+          dup_frames  frames ffmpeg REPEATED to hold the constant rate, i.e.
+                      frames the capture never delivered
+          drop_frames frames discarded because their timestamps bunched up
+
+        dup climbing while speed stays at ~1.0x is the signature of a browser
+        that is not painting; speed below 1.0x is the encoder falling behind.
+        Without this the two are indistinguishable from the outside.
+        """
+        assert self._ffmpeg is not None and self._ffmpeg.stdout is not None
+        block: dict = {}
+        try:
+            async for raw in self._ffmpeg.stdout:
+                line = raw.decode(errors="replace").strip()
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                block[key.strip()] = value.strip()
+                if key.strip() == "progress":
+                    self.metrics = progress_metrics(block)
+                    block = {}
         except (asyncio.CancelledError, ValueError):
             pass
 
@@ -897,6 +946,58 @@ class VirtualSession:
             await _run(argv, timeout=10, env_extra={"DISPLAY": display})
         self.last_access = time.monotonic()
 
+    async def diagnostics(self) -> dict:
+        """What the page thinks it is doing, measured in the page.
+
+        This is the other half of the ffmpeg metrics: those say how many frames
+        arrived, this says how many the site actually rendered and at what size.
+        A site that quietly picked a 480p/15fps rendition, or whose decoder is
+        dropping frames, looks identical from outside the browser.
+        """
+        if self._page is None:
+            raise VirtualSessionError("Session has no page")
+        script = """
+        async () => {
+          const out = {
+            url: location.href,
+            visibility: document.visibilityState,
+            hidden: document.hidden,
+            secureContext: window.isSecureContext,
+            devicePixelRatio: window.devicePixelRatio,
+            inner: [window.innerWidth, window.innerHeight],
+            videos: [],
+          };
+          for (const v of document.querySelectorAll('video')) {
+            const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+            const info = {
+              size: [v.videoWidth, v.videoHeight],
+              paused: v.paused, muted: v.muted, readyState: v.readyState,
+              currentTime: Math.round(v.currentTime * 10) / 10,
+              dropped: q ? q.droppedVideoFrames : null,
+              total: q ? q.totalVideoFrames : null,
+            };
+            // Measure the real presented frame rate over ~1s. This is the
+            // number that decides whether the capture can ever be smooth.
+            if (v.requestVideoFrameCallback && !v.paused) {
+              info.fps = await new Promise(res => {
+                let n = 0; const t0 = performance.now();
+                const tick = () => {
+                  n++;
+                  if (performance.now() - t0 < 1000) v.requestVideoFrameCallback(tick);
+                  else res(Math.round(n * 1000 / (performance.now() - t0) * 10) / 10);
+                };
+                v.requestVideoFrameCallback(tick);
+                setTimeout(() => res(n), 1500);
+              });
+            }
+            out.videos.push(info);
+          }
+          return out;
+        }
+        """
+        async with self._page_lock:
+            return await self._page.evaluate(script)
+
     async def page_size(self) -> tuple:
         """The live page's CSS pixel size.
 
@@ -953,6 +1054,12 @@ class VirtualSession:
             "idle": int(time.monotonic() - self.last_access),
             "alive": self.is_alive(),
             "url": self.page_url,
+            # Flat, not nested: Reflex cannot index a nested dict inside an
+            # rx.foreach over List[dict], so the row would fail to render.
+            "fps": self.metrics.get("fps", "-"),
+            "speed": self.metrics.get("speed", "-"),
+            "dup": self.metrics.get("dup", "-"),
+            "drop": self.metrics.get("drop", "-"),
             "error": self.error,
             "log": self._log_tail[-5:],
         }
@@ -1143,6 +1250,23 @@ class SessionManager:
 
 
 manager = SessionManager()
+
+
+def progress_metrics(block: dict) -> dict:
+    """Project one ffmpeg -progress block onto the fields worth showing.
+
+    Separated from the reader so it can be tested against real ffmpeg output
+    without running a capture.
+    """
+    return {
+        "fps": block.get("fps", ""),
+        "speed": block.get("speed", ""),
+        "frames": block.get("frame", ""),
+        "dup": block.get("dup_frames", "0"),
+        "drop": block.get("drop_frames", "0"),
+        "bitrate": block.get("bitrate", ""),
+        "out_time": block.get("out_time", ""),
+    }
 
 
 def segment_is_safe(segment: str) -> bool:

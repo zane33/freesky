@@ -925,6 +925,13 @@ def virtual_session_row(session: dict) -> rx.Component:
         rx.text(session["resolution"], size="1", color="gray"),
         rx.text(f"up {session['uptime']}s", size="1", color="gray"),
         rx.text(f"idle {session['idle']}s", size="1", color="gray"),
+        # Encoder telemetry. "speed" below 1.0x means the encoder cannot keep
+        # up; a climbing "dup" with speed at 1.0x means the browser is not
+        # painting fast enough. They need opposite fixes, so both are shown.
+        rx.text(f"{session['fps']} fps", size="1", color="gray"),
+        rx.text(f"speed {session['speed']}", size="1", color="gray"),
+        rx.text(f"dup {session['dup']}", size="1", color="gray"),
+        rx.text(f"drop {session['drop']}", size="1", color="gray"),
         rx.spacer(),
         rx.link(
             rx.button("Control", size="1", variant="soft"),

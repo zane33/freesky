@@ -2014,6 +2014,31 @@ async def virtual_control_navigate(name: str, request: Request):
     return JSONResponse({"ok": True, "url": session.page_url})
 
 
+@fastapi_app.get("/api/virtual-control/{name}/diagnostics")
+async def virtual_control_diagnostics(name: str, request: Request):
+    """What the page is rendering, plus what the encoder is receiving.
+
+    The two together are what separate "the browser is not painting" from "the
+    encoder cannot keep up" — from outside the container those look identical,
+    and each has a completely different fix.
+    """
+    session, error = await _control_session(name, request)
+    if error is not None:
+        return error
+    try:
+        page = await session.diagnostics()
+    except Exception as exc:
+        page = {"error": f"{type(exc).__name__}: {exc}"}
+    return JSONResponse({
+        "encoder": session.metrics,
+        "page": page,
+        "capture": {"width": session.width, "height": session.height,
+                    "framerate": session.record["framerate"],
+                    "display": session.display},
+        "ffmpeg_log": session._log_tail[-8:],
+    })
+
+
 @fastapi_app.get("/api/virtual-control/{name}/panel", response_class=Response)
 async def virtual_control_panel(name: str, request: Request):
     """The control panel itself: a self-contained HTML page.

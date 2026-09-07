@@ -684,3 +684,78 @@ def test_browser_does_not_use_swiftshader():
                        "--disable-background-timer-throttling",
                        "--no-first-run"):
         assert duplicated not in args
+
+
+# --- encoder telemetry ------------------------------------------------------
+# Without these numbers, "the stream is laggy" cannot be diagnosed from outside
+# the container: a browser that is not painting and an encoder that cannot keep
+# up look identical, and they need opposite fixes.
+
+
+import shutil as _shutil
+import subprocess as _subprocess
+
+
+def test_progress_metrics_projection():
+    block = {
+        "frame": "750", "fps": "24.90", "bitrate": "2500.1kbits/s",
+        "dup_frames": "37", "drop_frames": "0", "speed": "0.98x",
+        "out_time": "00:00:30.00", "progress": "continue",
+    }
+    m = virtual_session.progress_metrics(block)
+    assert m["fps"] == "24.90" and m["speed"] == "0.98x"
+    assert m["dup"] == "37" and m["drop"] == "0"
+
+
+def test_progress_metrics_defaults_are_safe():
+    """An early block arrives before every counter exists; the UI must still
+    render rather than KeyError."""
+    m = virtual_session.progress_metrics({})
+    assert m["dup"] == "0" and m["drop"] == "0" and m["fps"] == ""
+
+
+@pytest.mark.skipif(not _shutil.which("ffmpeg"), reason="ffmpeg not installed")
+def test_progress_stream_parses_real_ffmpeg_output():
+    """Parse the actual -progress stream, so a change in ffmpeg's key names is
+    caught here rather than by an empty telemetry column in Settings."""
+    proc = _subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-nostats",
+         "-progress", "pipe:1", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25",
+         "-t", "1", "-c:v", "libx264", "-preset", "ultrafast", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=90,
+    )
+    assert proc.returncode == 0, proc.stderr[:300]
+
+    block, seen = {}, []
+    for line in proc.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        block[key.strip()] = value.strip()
+        if key.strip() == "progress":
+            seen.append(virtual_session.progress_metrics(block))
+            block = {}
+
+    assert seen, "ffmpeg produced no progress blocks"
+    last = seen[-1]
+    assert last["frames"] and int(last["frames"]) > 0
+    assert last["dup"].isdigit() and last["drop"].isdigit()
+    assert last["speed"], "speed is how we tell encoder overload from a stalled browser"
+
+
+def test_status_exposes_flat_metrics():
+    """Flat keys, not a nested dict: Reflex cannot index a nested dict inside an
+    rx.foreach, and the sessions table would fail to render."""
+    record = virtual_channels.validate_channel({"name": "d", "url": "https://e.com"})
+    status = virtual_session.VirtualSession(record, 99).status()
+    for key in ("fps", "speed", "dup", "drop"):
+        assert key in status and not isinstance(status[key], dict)
+
+
+def test_ffmpeg_emits_machine_readable_progress():
+    record = virtual_channels.validate_channel({"name": "d", "url": "https://e.com"})
+    argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
+    assert "-progress" in argv and argv[argv.index("-progress") + 1] == "pipe:1"
+    # -nostats too, or the human progress line (carriage-return delimited)
+    # would never terminate a readline().
+    assert "-nostats" in argv
