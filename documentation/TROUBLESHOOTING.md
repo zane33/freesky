@@ -166,3 +166,69 @@ Caddy rejects it with *"server listening on [:3000] is HTTP, but attempts to
 configure TLS connection policies"* — so the HTTP and HTTPS listeners must be
 separate blocks. `start.sh` appends the HTTPS block to a copy of the Caddyfile
 at `/tmp/Caddyfile` (a copy, so a `docker restart` cannot stack duplicates).
+
+---
+
+## Virtual Channels (web page → HLS)
+
+Full detail in [VIRTUAL_CHANNELS.md](VIRTUAL_CHANNELS.md#troubleshooting). The
+short version:
+
+### "Virtual channels need these to be installed: Xvfb, ffmpeg, …"
+
+**Cause**: the running image predates the virtual-channels feature.
+
+**Solution**: rebuild the image. The Dockerfile installs `xvfb`, `x11-utils`,
+`pulseaudio`, `ffmpeg`, `dbus`, `dumb-init` and the font packages. Confirm with:
+
+```bash
+curl http://localhost:8005/api/virtual-sessions/status
+```
+
+`missing_binaries` should be `[]`.
+
+### Virtual channel plays as a black screen
+
+**Cause**: the page loaded but never started playing — almost always autoplay,
+a consent dialog, or a login.
+
+**Solutions**:
+- Add the play button's CSS selector to **Click these** in the channel's settings.
+- Add any cookie/consent overlay to **Hide these**.
+- Open **Control** on the channel to see what the browser is actually showing,
+  and click through it by hand.
+- Raise **Warm-up seconds** if the page is slow to paint.
+
+### Virtual channel has no audio
+
+**Solutions**:
+- Confirm **Capture audio** is enabled on the channel.
+- Use **Control** to check the page's own player is not muted.
+- Audio that worked and then stopped usually means a stalled session — stop it
+  in Settings and let the next request rebuild it.
+
+### Container is OOM-killed once several virtual channels run
+
+**Cause**: concurrent sessions are uncapped by default and each 720p30 session
+costs roughly 900 MB. The container memory limit is the real ceiling, and when
+it is hit **every** channel dies, not just the newest.
+
+**Solutions**:
+- Raise `MEMORY_LIMIT` (budget ~1 GB base + ~900 MB per concurrent session).
+- Drop channels to 480p, or set `MAX_VIRTUAL_SESSIONS` to a hard cap.
+
+### Chromium crashes with blank pages / "page crash"
+
+**Cause**: `/dev/shm` too small (Docker's default is 64 MB).
+
+**Solution**: `shm_size: "1gb"` in `docker-compose.yml` — already the shipped
+value; check it was not overridden.
+
+### First tune-in times out in the player
+
+**Cause**: a cold start launches a browser and an encoder and waits for the
+first segments, which can take ~45s.
+
+**Solutions**: request the channel once in a browser to warm it, lower
+**Warm-up seconds**, or raise the player's own timeout. Caddy's `@api_virtual`
+block already allows 60s.

@@ -10,6 +10,7 @@ A self-hosted IPTV proxy built with [Reflex](https://reflex.dev), enabling you t
 - **🔎 Event Search**: Quickly find the right channel for live events or sports.
 - **📄 Playlist Integration**: Download the `playlist.m3u8` and use it with Jellyfin or any IPTV client.
 - **⚙️ Customizable Hosting**: Host the application locally or deploy it via Docker with various configuration options.
+- **🖥️ Virtual Channels**: Turn any web page into a live channel. FreeSky opens it in a real browser on a virtual display, records the screen and audio, and serves it as HLS — with a remote-control panel for signing in or dismissing dialogs. See [VIRTUAL_CHANNELS.md](VIRTUAL_CHANNELS.md).
 
 ---
 

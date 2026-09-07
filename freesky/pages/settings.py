@@ -10,7 +10,7 @@ from typing import List
 
 from rxconfig import api_url, backend_port
 
-from freesky import backend, channel_prefs, users, app_settings, drm_providers
+from freesky import backend, channel_prefs, users, app_settings, drm_providers, virtual_channels
 from freesky.free_sky import Channel
 from freesky.components import navbar
 from freesky.auth_state import AuthState, require_admin
@@ -28,6 +28,12 @@ SOURCE_OPTIONS = [AUTO_SOURCE] + list(StepDaddyHybrid.PLAYER_PATHS)
 KEY_SYSTEM_OPTIONS = list(drm_providers.KEY_SYSTEMS)
 MANIFEST_TYPE_OPTIONS = list(drm_providers.MANIFEST_TYPES)
 WRAP_OPTIONS = ["raw", "base64", "json:license", "json:payload"]
+
+# Dropdown options for the virtual-channel form. Taken from virtual_channels so
+# the UI can't offer a value the validator will then reject.
+RESOLUTION_OPTIONS = list(virtual_channels.RESOLUTIONS)
+FRAMERATE_OPTIONS = [str(f) for f in virtual_channels.FRAMERATES]
+PRESET_OPTIONS = list(virtual_channels.PRESETS)
 
 # The test endpoint lives in the same process, but it is a FastAPI route rather
 # than something importable from here, so the page dials it over loopback. Not
@@ -134,6 +140,293 @@ class SettingsState(rx.State):
     drm_test_ok: bool = False
     drm_test_message: str = ""
 
+    # --- virtual channels ---------------------------------------------------
+    # A virtual channel is a web page restreamed as live HLS by a headless
+    # browser session. Nothing secret lives in these records, so unlike the DRM
+    # form the whole record can be round-tripped to the browser.
+    vc_list: List[dict] = []
+    vc_error: str = ""
+    vc_confirm_delete: str = ""
+    # Running sessions, refreshed on demand rather than polled: each entry costs
+    # a browser and an encoder, so there are never many, and a poll would keep
+    # the Reflex socket busy for a panel nobody is looking at.
+    vc_sessions: List[dict] = []
+    # Missing binaries from the capture preflight. Turns "the stream won't
+    # start" into "ffmpeg is not installed" without an admin reading logs.
+    vc_missing: List[str] = []
+
+    # Form. vc_editing is "" when adding, otherwise the name being edited.
+    # Numeric fields are strings because rx.input hands back strings; they are
+    # coerced once, in save_vc, by virtual_channels.validate_channel.
+    vc_editing: str = ""
+    vc_name: str = ""
+    vc_title: str = ""
+    vc_url: str = ""
+    vc_resolution: str = virtual_channels.DEFAULT_RESOLUTION
+    vc_framerate: str = str(virtual_channels.DEFAULT_FRAMERATE)
+    vc_preset: str = virtual_channels.DEFAULT_PRESET
+    vc_video_bitrate: str = "2500"
+    vc_audio: bool = True
+    vc_audio_bitrate: str = "128"
+    vc_warmup: str = "6"
+    vc_idle_timeout: str = "120"
+    vc_click_selectors: str = ""
+    vc_hide_selectors: str = ""
+    vc_logo: str = ""
+    vc_tags: str = "Virtual"
+    vc_enabled: bool = True
+
+    # --- virtual channels ---------------------------------------------------
+
+    # Explicit setters: Reflex no longer generates implicit set_<var> events, so
+    # every field bound with on_change needs one by hand (same as the DRM form).
+    @rx.event
+    def set_vc_name(self, value: str):
+        self.vc_name = value
+
+    @rx.event
+    def set_vc_title(self, value: str):
+        self.vc_title = value
+
+    @rx.event
+    def set_vc_url(self, value: str):
+        self.vc_url = value
+
+    @rx.event
+    def set_vc_resolution(self, value: str):
+        self.vc_resolution = value
+
+    @rx.event
+    def set_vc_framerate(self, value: str):
+        self.vc_framerate = value
+
+    @rx.event
+    def set_vc_preset(self, value: str):
+        self.vc_preset = value
+
+    @rx.event
+    def set_vc_video_bitrate(self, value: str):
+        self.vc_video_bitrate = value
+
+    @rx.event
+    def set_vc_audio_bitrate(self, value: str):
+        self.vc_audio_bitrate = value
+
+    @rx.event
+    def set_vc_warmup(self, value: str):
+        self.vc_warmup = value
+
+    @rx.event
+    def set_vc_idle_timeout(self, value: str):
+        self.vc_idle_timeout = value
+
+    @rx.event
+    def set_vc_click_selectors(self, value: str):
+        self.vc_click_selectors = value
+
+    @rx.event
+    def set_vc_hide_selectors(self, value: str):
+        self.vc_hide_selectors = value
+
+    @rx.event
+    def set_vc_logo(self, value: str):
+        self.vc_logo = value
+
+    @rx.event
+    def set_vc_tags(self, value: str):
+        self.vc_tags = value
+
+    @rx.event
+    def set_vc_audio(self, value: bool):
+        self.vc_audio = value
+
+    @rx.event
+    def set_vc_enabled(self, value: bool):
+        self.vc_enabled = value
+
+    def _load_virtual(self):
+        """Re-read the store into the list the page renders."""
+        try:
+            self.vc_list = virtual_channels.list_channels()
+        except Exception as exc:  # a corrupt store must not blank the page
+            self.vc_list = []
+            self.vc_error = f"Could not read virtual channels: {exc}"
+
+    @rx.event
+    def reset_vc_form(self):
+        """Back to a blank 'add channel' form."""
+        self.vc_editing = ""
+        self.vc_name = ""
+        self.vc_title = ""
+        self.vc_url = ""
+        self.vc_resolution = virtual_channels.DEFAULT_RESOLUTION
+        self.vc_framerate = str(virtual_channels.DEFAULT_FRAMERATE)
+        self.vc_preset = virtual_channels.DEFAULT_PRESET
+        self.vc_video_bitrate = "2500"
+        self.vc_audio = True
+        self.vc_audio_bitrate = "128"
+        self.vc_warmup = "6"
+        self.vc_idle_timeout = "120"
+        self.vc_click_selectors = ""
+        self.vc_hide_selectors = ""
+        self.vc_logo = ""
+        self.vc_tags = "Virtual"
+        self.vc_enabled = True
+        self.vc_error = ""
+
+    @rx.event
+    def edit_vc(self, name: str):
+        """Load a stored channel into the form."""
+        record = virtual_channels.get_channel(name)
+        if record is None:
+            self.vc_error = f"No virtual channel named {name}."
+            return
+        self.vc_editing = record["name"]
+        self.vc_name = record["name"]
+        self.vc_title = record["title"]
+        self.vc_url = record["url"]
+        self.vc_resolution = record["resolution"]
+        self.vc_framerate = str(record["framerate"])
+        self.vc_preset = record["preset"]
+        self.vc_video_bitrate = str(record["video_bitrate"])
+        self.vc_audio = record["audio"]
+        self.vc_audio_bitrate = str(record["audio_bitrate"])
+        self.vc_warmup = str(record["warmup"])
+        self.vc_idle_timeout = str(record["idle_timeout"])
+        self.vc_click_selectors = "\n".join(record["click_selectors"])
+        self.vc_hide_selectors = "\n".join(record["hide_selectors"])
+        self.vc_logo = record["logo"]
+        self.vc_tags = ", ".join(record["tags"])
+        self.vc_enabled = record["enabled"]
+        self.vc_error = ""
+
+    @rx.event
+    def save_vc(self):
+        """Validate and persist the form.
+
+        A rename is a distinct operation, not an upsert: the name IS the channel
+        id, so upserting under a new name would leave the old record behind as a
+        duplicate channel in the playlist.
+        """
+        record = {
+            "name": self.vc_name,
+            "title": self.vc_title,
+            "url": self.vc_url,
+            "resolution": self.vc_resolution,
+            "framerate": self.vc_framerate,
+            "preset": self.vc_preset,
+            "video_bitrate": self.vc_video_bitrate,
+            "audio": self.vc_audio,
+            "audio_bitrate": self.vc_audio_bitrate,
+            "warmup": self.vc_warmup,
+            "idle_timeout": self.vc_idle_timeout,
+            "click_selectors": self.vc_click_selectors,
+            "hide_selectors": self.vc_hide_selectors,
+            "logo": self.vc_logo,
+            "tags": self.vc_tags,
+            "enabled": self.vc_enabled,
+        }
+        try:
+            if self.vc_editing and self.vc_editing != self.vc_name.strip().lower():
+                virtual_channels.upsert_channel({**record, "name": self.vc_editing})
+                saved = virtual_channels.rename_channel(self.vc_editing, self.vc_name)
+            else:
+                saved = virtual_channels.upsert_channel(record)
+        except virtual_channels.VirtualChannelError as exc:
+            self.vc_error = str(exc)
+            return
+        self._load_virtual()
+        self.reset_vc_form()
+        # Edits to geometry or URL only take effect on a fresh session, and an
+        # admin who just changed the bitrate expects the next play to use it.
+        yield SettingsState.stop_vc_session(saved["name"])
+        yield rx.toast(f"Saved virtual channel '{saved['name']}'")
+
+    @rx.event
+    def toggle_vc_enabled(self, name: str):
+        """Flip one channel on or off without opening the edit form."""
+        record = virtual_channels.get_channel(name)
+        if record is None:
+            return
+        record["enabled"] = not record["enabled"]
+        try:
+            virtual_channels.upsert_channel(record)
+        except virtual_channels.VirtualChannelError as exc:
+            self.vc_error = str(exc)
+            return
+        self._load_virtual()
+        if not record["enabled"]:
+            yield SettingsState.stop_vc_session(name)
+
+    @rx.event
+    def ask_delete_vc(self, name: str):
+        self.vc_confirm_delete = name
+
+    @rx.event
+    def cancel_delete_vc(self):
+        self.vc_confirm_delete = ""
+
+    @rx.event
+    def confirm_delete_vc(self, name: str):
+        virtual_channels.delete_channel(name)
+        self.vc_confirm_delete = ""
+        self._load_virtual()
+        yield SettingsState.stop_vc_session(name)
+        yield rx.toast(f"Deleted virtual channel '{name}'")
+
+    @rx.event
+    async def open_vc_control(self, name: str):
+        """Open the remote-control panel for this channel in a new tab.
+
+        The panel is a plain HTML page served by the backend, not a Reflex route:
+        faithful remote control needs raw pointer/keyboard events with exact
+        coordinates, which means real DOM listeners. It authenticates with the
+        admin's own token, so the link is only usable by whoever is signed in.
+        """
+        auth = await self.get_state(AuthState)
+        if not auth.is_admin:
+            self.vc_error = "Only an admin can control a browser session."
+            return
+        url = f"/api/virtual-control/{name}/panel?token={auth.stream_token}"
+        yield rx.call_script(f"window.open({url!r}, '_blank', 'noopener')")
+
+    @rx.event
+    async def refresh_vc_sessions(self):
+        """Read the live session table and the capture preflight.
+
+        The settings page runs in the same process as the backend, so this talks
+        to the session manager directly rather than going back out over HTTP.
+        The import is deferred because it pulls in Playwright, which an install
+        that never uses this feature should not pay for.
+        """
+        from freesky import virtual_session
+
+        self.vc_missing = virtual_session.preflight()
+        self.vc_sessions = virtual_session.manager.statuses()
+
+    @rx.event
+    async def stop_vc_session(self, name: str):
+        """Force a session down. The next request starts a fresh one."""
+        from freesky import virtual_session
+
+        await virtual_session.manager.stop(name)
+        self.vc_sessions = virtual_session.manager.statuses()
+
+    @rx.var
+    def vc_form_title(self) -> str:
+        return f"Edit '{self.vc_editing}'" if self.vc_editing else "Add a virtual channel"
+
+    @rx.var
+    def vc_preflight_message(self) -> str:
+        if not self.vc_missing:
+            return ""
+        return (
+            "Virtual channels cannot start: "
+            + ", ".join(self.vc_missing)
+            + " not installed in this container. Rebuild the image — these are "
+            "installed by the Dockerfile."
+        )
+
     @rx.var
     def matching(self) -> List[Channel]:
         """Channels matching the search box, before paging."""
@@ -194,6 +487,7 @@ class SettingsState(rx.State):
         self.trusted_networks = ", ".join(app_settings.trusted_networks())
         self.sources = channel_prefs.sources()
         self._load_drm()
+        self._load_virtual()
 
     @rx.event
     async def refresh(self):
@@ -1374,6 +1668,403 @@ def drm_section() -> rx.Component:
     )
 
 
+def virtual_channel_row(record: dict) -> rx.Component:
+    """One stored virtual channel: status, its page URL, and the row's actions."""
+    confirming = SettingsState.vc_confirm_delete == record["name"]
+    return rx.vstack(
+        rx.hstack(
+            rx.switch(
+                # Explicit cast: a value indexed out of a dict Var is untyped,
+                # and rx.switch needs a boolean Var.
+                checked=record["enabled"].to(bool),
+                on_change=lambda _: SettingsState.toggle_vc_enabled(record["name"]),
+            ),
+            rx.text(record["title"], size="3", weight="medium"),
+            rx.badge(record["resolution"], variant="soft"),
+            rx.badge(f"{record['framerate']}fps", variant="soft", color_scheme="gray"),
+            rx.cond(
+                record["audio"].to(bool),
+                rx.badge(rx.icon("volume-2", size=12), "audio", variant="soft", color_scheme="green"),
+                rx.badge(rx.icon("volume-x", size=12), "silent", variant="soft", color_scheme="gray"),
+            ),
+            rx.spacer(),
+            rx.button(
+                rx.icon("mouse-pointer-click", size=14),
+                "Control",
+                on_click=lambda: SettingsState.open_vc_control(record["name"]),
+                size="1",
+                variant="soft",
+                title="Open the browser session and drive it with mouse and keyboard",
+            ),
+            rx.button(
+                rx.icon("pencil", size=14),
+                on_click=lambda: SettingsState.edit_vc(record["name"]),
+                size="1",
+                variant="soft",
+                title="Edit this channel",
+            ),
+            rx.cond(
+                confirming,
+                rx.hstack(
+                    rx.button(
+                        "Delete",
+                        on_click=lambda: SettingsState.confirm_delete_vc(record["name"]),
+                        size="1",
+                        color_scheme="red",
+                    ),
+                    rx.button(
+                        "Cancel",
+                        on_click=SettingsState.cancel_delete_vc,
+                        size="1",
+                        variant="soft",
+                    ),
+                    spacing="1",
+                ),
+                rx.button(
+                    rx.icon("trash-2", size=14),
+                    on_click=lambda: SettingsState.ask_delete_vc(record["name"]),
+                    size="1",
+                    variant="soft",
+                    color_scheme="red",
+                    title="Delete this channel",
+                ),
+            ),
+            align="center",
+            spacing="2",
+            width="100%",
+        ),
+        rx.text(
+            record["url"],
+            size="1",
+            color="gray",
+            no_of_lines=1,
+            font_family="mono",
+            width="100%",
+        ),
+        spacing="1",
+        width="100%",
+        padding_y="0.4rem",
+        border_bottom="1px solid var(--gray-4)",
+    )
+
+
+def virtual_session_row(session: dict) -> rx.Component:
+    """One running capture: how long it has been up and whether it is healthy."""
+    return rx.hstack(
+        rx.cond(
+            session["alive"].to(bool),
+            rx.badge("live", color_scheme="green", variant="soft"),
+            rx.badge("stalled", color_scheme="red", variant="soft"),
+        ),
+        rx.text(session["name"], size="2", weight="medium"),
+        rx.text(session["resolution"], size="1", color="gray"),
+        rx.text(f"up {session['uptime']}s", size="1", color="gray"),
+        rx.text(f"idle {session['idle']}s", size="1", color="gray"),
+        rx.spacer(),
+        rx.button(
+            "Control",
+            on_click=lambda: SettingsState.open_vc_control(session["name"]),
+            size="1",
+            variant="soft",
+        ),
+        rx.button(
+            "Stop",
+            on_click=lambda: SettingsState.stop_vc_session(session["name"]),
+            size="1",
+            variant="soft",
+            color_scheme="red",
+        ),
+        align="center",
+        spacing="2",
+        width="100%",
+        padding_y="0.3rem",
+    )
+
+
+def virtual_form() -> rx.Component:
+    """Add/edit form for a virtual channel."""
+    return rx.vstack(
+        rx.heading(SettingsState.vc_form_title, size="3"),
+        rx.hstack(
+            rx.vstack(
+                rx.text("Name (id)", size="1", color="gray"),
+                rx.input(
+                    placeholder="bbc-news",
+                    value=SettingsState.vc_name,
+                    on_change=SettingsState.set_vc_name,
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text("Display name", size="1", color="gray"),
+                rx.input(
+                    placeholder="BBC News",
+                    value=SettingsState.vc_title,
+                    on_change=SettingsState.set_vc_title,
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            spacing="2",
+            width="100%",
+        ),
+        rx.vstack(
+            rx.text("Page URL", size="1", color="gray"),
+            rx.input(
+                placeholder="https://example.com/live",
+                value=SettingsState.vc_url,
+                on_change=SettingsState.set_vc_url,
+                width="100%",
+            ),
+            spacing="1",
+            width="100%",
+        ),
+        rx.hstack(
+            rx.vstack(
+                rx.text("Resolution", size="1", color="gray"),
+                rx.select(
+                    RESOLUTION_OPTIONS,
+                    value=SettingsState.vc_resolution,
+                    on_change=SettingsState.set_vc_resolution,
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text("Frame rate", size="1", color="gray"),
+                rx.select(
+                    FRAMERATE_OPTIONS,
+                    value=SettingsState.vc_framerate,
+                    on_change=SettingsState.set_vc_framerate,
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text("Encoder preset", size="1", color="gray"),
+                rx.select(
+                    PRESET_OPTIONS,
+                    value=SettingsState.vc_preset,
+                    on_change=SettingsState.set_vc_preset,
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text("Video kbps", size="1", color="gray"),
+                rx.input(
+                    value=SettingsState.vc_video_bitrate,
+                    on_change=SettingsState.set_vc_video_bitrate,
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            spacing="2",
+            width="100%",
+        ),
+        rx.hstack(
+            rx.vstack(
+                rx.text("Audio kbps", size="1", color="gray"),
+                rx.input(
+                    value=SettingsState.vc_audio_bitrate,
+                    on_change=SettingsState.set_vc_audio_bitrate,
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text("Warm-up seconds", size="1", color="gray"),
+                rx.input(
+                    value=SettingsState.vc_warmup,
+                    on_change=SettingsState.set_vc_warmup,
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text("Idle timeout (s)", size="1", color="gray"),
+                rx.input(
+                    value=SettingsState.vc_idle_timeout,
+                    on_change=SettingsState.set_vc_idle_timeout,
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            spacing="2",
+            width="100%",
+        ),
+        rx.hstack(
+            rx.vstack(
+                rx.text(
+                    "Hide these (CSS selectors, one per line)",
+                    size="1", color="gray",
+                ),
+                rx.text_area(
+                    placeholder=".cookie-banner\n#consent-overlay",
+                    value=SettingsState.vc_hide_selectors,
+                    on_change=SettingsState.set_vc_hide_selectors,
+                    rows="3",
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text(
+                    "Click these to start playback (one per line)",
+                    size="1", color="gray",
+                ),
+                rx.text_area(
+                    placeholder="button.play\n.vjs-big-play-button",
+                    value=SettingsState.vc_click_selectors,
+                    on_change=SettingsState.set_vc_click_selectors,
+                    rows="3",
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            spacing="2",
+            width="100%",
+        ),
+        rx.hstack(
+            rx.vstack(
+                rx.text("Logo URL (optional)", size="1", color="gray"),
+                rx.input(
+                    value=SettingsState.vc_logo,
+                    on_change=SettingsState.set_vc_logo,
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text("Tags (comma separated)", size="1", color="gray"),
+                rx.input(
+                    value=SettingsState.vc_tags,
+                    on_change=SettingsState.set_vc_tags,
+                    width="100%",
+                ),
+                spacing="1",
+                width="100%",
+            ),
+            spacing="2",
+            width="100%",
+        ),
+        rx.hstack(
+            rx.hstack(
+                rx.switch(
+                    checked=SettingsState.vc_audio,
+                    on_change=SettingsState.set_vc_audio,
+                ),
+                rx.text("Capture audio", size="2"),
+                align="center",
+                spacing="2",
+            ),
+            rx.hstack(
+                rx.switch(
+                    checked=SettingsState.vc_enabled,
+                    on_change=SettingsState.set_vc_enabled,
+                ),
+                rx.text("Enabled", size="2"),
+                align="center",
+                spacing="2",
+            ),
+            rx.spacer(),
+            rx.button("Cancel", on_click=SettingsState.reset_vc_form, variant="soft", size="2"),
+            rx.button("Save", on_click=SettingsState.save_vc, size="2"),
+            align="center",
+            spacing="3",
+            width="100%",
+        ),
+        spacing="3",
+        width="100%",
+    )
+
+
+def virtual_section() -> rx.Component:
+    """Virtual channel configuration.
+
+    A virtual channel is a web page shown in a headless browser and restreamed
+    as live HLS, so anything a browser can display becomes a channel — including
+    sites that have no stream URL to proxy.
+    """
+    return rx.card(
+        rx.vstack(
+            rx.hstack(
+                rx.heading("Virtual Channels", size="5"),
+                rx.spacer(),
+                rx.button(
+                    rx.icon("refresh-cw", size=14),
+                    "Sessions",
+                    on_click=SettingsState.refresh_vc_sessions,
+                    variant="soft",
+                    size="1",
+                ),
+                align="center",
+                width="100%",
+            ),
+            rx.text(
+                "Restream a web page as a live channel. FreeSky opens the page in "
+                "a browser on a private display, records the screen and the "
+                "browser's audio, and serves the result as HLS — so it appears in "
+                "playlist.m3u8 like any other channel. A session starts when "
+                "someone tunes in and stops after the idle timeout. Use Control "
+                "to open the live browser and drive it with mouse and keyboard - "
+                "to sign into a site, dismiss a consent dialog, or set up the "
+                "page before it goes out. Any number of channels can run at "
+                "once; each costs roughly 1.5-2 CPU cores and ~900MB at 720p.",
+                color="gray",
+                size="2",
+            ),
+            rx.cond(
+                SettingsState.vc_preflight_message != "",
+                rx.callout(SettingsState.vc_preflight_message, icon="triangle_alert",
+                           color_scheme="amber", size="1", width="100%"),
+            ),
+            rx.cond(
+                SettingsState.vc_error != "",
+                rx.callout(SettingsState.vc_error, icon="triangle_alert",
+                           color_scheme="red", size="1", width="100%"),
+            ),
+            rx.cond(
+                SettingsState.vc_list.length() > 0,
+                rx.vstack(
+                    rx.foreach(SettingsState.vc_list, virtual_channel_row),
+                    spacing="0",
+                    width="100%",
+                ),
+                rx.text("No virtual channels configured yet.", size="2", color="gray"),
+            ),
+            rx.cond(
+                SettingsState.vc_sessions.length() > 0,
+                rx.vstack(
+                    rx.divider(),
+                    rx.text("Running sessions", size="2", weight="bold"),
+                    rx.foreach(SettingsState.vc_sessions, virtual_session_row),
+                    spacing="1",
+                    width="100%",
+                ),
+            ),
+            rx.divider(),
+            virtual_form(),
+            spacing="3",
+            width="100%",
+        ),
+        width="100%",
+    )
+
+
 @rx.page("/settings", on_load=SettingsState.on_load)
 def settings() -> rx.Component:
     return rx.box(
@@ -1460,6 +2151,7 @@ def settings() -> rx.Component:
                 rx.divider(margin_y="1rem"),
                 access_section(),
                 users_section(),
+                virtual_section(),
                 drm_section(),
                 spacing="4",
                 width="100%",

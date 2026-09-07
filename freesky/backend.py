@@ -1,5 +1,6 @@
 import os
 import asyncio
+import sys
 import base64
 import glob
 import httpx
@@ -20,6 +21,7 @@ from .stream_monitor import stream_monitor
 from . import channel_prefs
 from . import users
 from . import app_settings
+from . import virtual_channels
 import json
 from urllib.parse import urljoin, urlparse, urlunparse
 from collections import OrderedDict
@@ -478,6 +480,9 @@ _TOKEN_PROTECTED = (
     "/api/content/", "/content/",
     "/api/key/", "/key/",
     "/epg.xml", "/api/epg.xml",
+    # Virtual-channel segments are fetched by the player as bare GETs with no
+    # cookie, exactly like /api/content, so they need the same token rule.
+    "/api/virtual/",
 )
 
 
@@ -557,6 +562,13 @@ async def stream(channel_id: str, request: Request = None):
     # so each pick re-resolves that specific upstream feed instead of returning
     # whatever feed happens to be cached for this channel.
     prefer = request.query_params.get("player") if request else None
+
+    # A virtual channel is produced locally by a browser session rather than
+    # fetched from upstream, so none of the resolve/cache/failover machinery
+    # below applies. Handled first, and matched on the id prefix so this costs a
+    # string compare for every ordinary channel.
+    if virtual_channels.is_virtual_id(channel_id):
+        return await _virtual_stream(channel_id, request, stream_token)
 
     # A DRM channel has no proxied M3U8 form: the manifest is DASH/CENC and the
     # media is encrypted to the browser's CDM, so there is nothing this route
@@ -995,8 +1007,43 @@ async def update_channels():
             logger.error(f"Unexpected error in channel update loop: {str(e)}")
             await asyncio.sleep(retry_interval)
 
+def virtual_channel_objects():
+    """The admin's virtual channels as Channel objects.
+
+    Built fresh on every call rather than cached: the store is a small JSON file
+    and an admin who just added a channel expects to see it without a restart.
+    `stream_type` is "virtual" so the watch page and the M3U8 route can tell
+    these apart from a proxied upstream feed without consulting the store.
+    """
+    try:
+        return [
+            Channel(
+                id=virtual_channels.channel_id(record["name"]),
+                name=record["title"],
+                tags=record["tags"],
+                logo=record["logo"],
+                stream_type="virtual",
+            )
+            for record in virtual_channels.list_channels()
+            if record["enabled"]
+        ]
+    except Exception as e:
+        logger.error(f"Error building virtual channels: {e}", exc_info=True)
+        return []
+
+
 def get_channels():
-    """Get current channels with fallback handling."""
+    """Get current channels with fallback handling.
+
+    Virtual channels are appended to whichever list wins below, including the
+    fallback one — they are stored locally, so they are exactly the channels that
+    should still work when the upstream scrape is down.
+    """
+    return _upstream_channels() + virtual_channel_objects()
+
+
+def _upstream_channels():
+    """Channels from the scraped upstream source, with fallback handling."""
     try:
         logger.debug("Attempting to get channels from free_sky instance")
         channels = free_sky.channels
@@ -1047,7 +1094,8 @@ def playlist(request: Request):
     return Response(
         content=free_sky.playlist(exclude=channel_prefs.disabled_ids(),
                                   token=request.query_params.get("token"),
-                                  base_url=_public_base(request)),
+                                  base_url=_public_base(request),
+                                  extra=virtual_channel_objects()),
         media_type="application/vnd.apple.mpegurl",
         headers={
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -1078,7 +1126,8 @@ def api_playlist(request: Request):
     return Response(
         content=free_sky.playlist(exclude=channel_prefs.disabled_ids(),
                                   token=request.query_params.get("token"),
-                                  base_url=_public_base(request)),
+                                  base_url=_public_base(request),
+                                  extra=virtual_channel_objects()),
         media_type="application/vnd.apple.mpegurl",
         headers={
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -2063,3 +2112,534 @@ async def drm_test(provider: str, request: Request):
         f"License server answered HTTP {upstream.status_code} and the response "
         f"unwrapped cleanly ({len(license_bytes)} bytes)."
     )}
+
+
+# --- virtual channels -------------------------------------------------------
+# A virtual channel is a web page restreamed as HLS. The heavy lifting (Xvfb,
+# Chromium, PulseAudio, ffmpeg) lives in virtual_session; these routes are the
+# thin HTTP surface over it.
+#
+# virtual_session is imported lazily inside each handler rather than at module
+# import. It pulls in Playwright, and an install that never uses this feature
+# should not pay for that on every backend start.
+
+
+async def _virtual_stream(channel_id: str, request: Request, stream_token: str):
+    """Serve the media playlist for a virtual channel, starting it on demand.
+
+    The first request blocks while the browser loads and the encoder produces
+    its first segments — up to ~45s for a slow page. That is deliberate:
+    returning a playlist with no segments makes every player conclude the
+    channel is dead and stop retrying, which is a much worse failure than a slow
+    first load.
+    """
+    from freesky import virtual_session
+
+    name = virtual_channels.name_from_id(channel_id)
+    try:
+        session = await virtual_session.manager.acquire(name)
+    except virtual_session.VirtualSessionError as exc:
+        logger.error(f"Virtual channel {name} failed to start: {exc}")
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"error": "virtual_session_failed", "channel_id": channel_id,
+                     "message": str(exc)},
+        )
+    except Exception as exc:
+        logger.error(f"Virtual channel {name} crashed on start: {exc}", exc_info=True)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": "virtual_session_error", "channel_id": channel_id,
+                     "message": str(exc)},
+        )
+
+    try:
+        with open(session.playlist_path, "r") as f:
+            body = f.read()
+    except OSError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"error": "virtual_playlist_missing", "message": str(exc)},
+        )
+
+    body = virtual_session.rewrite_playlist(
+        body, f"/api/virtual/{name}", stream_token or ""
+    )
+    return Response(
+        content=body,
+        media_type="application/vnd.apple.mpegurl",
+        headers={
+            # A live playlist that a player caches is a stalled player: it holds
+            # a window of segments that are deleted seconds later.
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Access-Control-Allow-Origin": "*",
+            "X-Stream-Source": "virtual",
+        },
+    )
+
+
+@fastapi_app.get("/api/virtual/{name}/{segment}")
+async def virtual_segment(name: str, segment: str):
+    """Serve one HLS segment from a running session's output directory."""
+    from freesky import virtual_session
+
+    # The segment name is joined onto a directory path, so this is the check
+    # that stops "../../etc/passwd". An allowlist of the exact shape ffmpeg
+    # generates, not a traversal blocklist.
+    if not virtual_session.segment_is_safe(segment):
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+
+    # Every segment request is a heartbeat: it is what keeps the session from
+    # being reaped while somebody is actually watching.
+    session = virtual_session.manager.touch(name)
+    if session is None:
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+
+    path = os.path.join(session.out_dir, segment)
+    if not os.path.isfile(path):
+        # Normal at the trailing edge of the window: the player asked for a
+        # segment that has just been rotated out.
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+
+    return FileResponse(
+        path,
+        media_type="video/mp2t",
+        headers={
+            # Segment filenames are never reused within a session (the counter
+            # only increases), so a long cache is safe and saves re-fetches on
+            # a seek back within the window.
+            "Cache-Control": "public, max-age=30",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+# Deliberately NOT under /api/virtual/: that prefix is token-protected (segments
+# are fetched by cookie-less players) and its {name}/{segment} route would
+# shadow any fixed path added beneath it. These are status/control endpoints for
+# the settings page, matching how /api/services/status is exposed.
+
+
+async def close_virtual_sessions():
+    """Lifespan task: idle until shutdown, then stop every virtual session.
+
+    Registered in freesky.py. It has nothing to do while the app runs — the work
+    is entirely in the cancellation path — because Reflex's lifespan is the only
+    hook that actually fires on shutdown here.
+    """
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        # Only import if the feature was ever touched; a fresh import here would
+        # pull in Playwright during shutdown for nothing.
+        module = sys.modules.get("freesky.virtual_session")
+        if module is not None:
+            logger.info("Shutting down virtual channel sessions")
+            await module.manager.stop_all()
+        raise
+
+
+@fastapi_app.get("/api/virtual-sessions/status")
+async def virtual_sessions_status():
+    """Running sessions plus a preflight check, for the settings page.
+
+    `missing_binaries` is what turns "the stream won't start" into "ffmpeg is
+    not installed" without an admin having to read container logs.
+    """
+    from freesky import virtual_session
+
+    return JSONResponse({
+        "missing_binaries": virtual_session.preflight(),
+        "max_sessions": virtual_session.MAX_SESSIONS,
+        "sessions": virtual_session.manager.statuses(),
+    })
+
+
+@fastapi_app.post("/api/virtual-sessions/{name}/stop")
+async def virtual_session_stop(name: str):
+    """Force one session down. The next request starts a fresh one."""
+    from freesky import virtual_session
+
+    stopped = await virtual_session.manager.stop(name)
+    return JSONResponse({"stopped": stopped, "name": name})
+
+
+# --- virtual channel remote control -----------------------------------------
+# Lets an admin drive a running session's browser from Settings: dismiss a
+# consent dialog, log into a site, pick a quality, scroll something into place.
+#
+# These are the most dangerous endpoints in the app — they are remote mouse and
+# keyboard on a browser running inside the container — so unlike the read-only
+# status route they require an ADMIN token, not merely a valid one. The trusted-
+# subnet bypass deliberately does not apply: being on the LAN lets you watch, it
+# does not let you drive the server's browser.
+
+# Boundary for the multipart JPEG stream the control panel renders in an <img>.
+_MJPEG_BOUNDARY = "freeskyframe"
+
+# Frames per second for the control preview. Deliberately low: this is for
+# aiming a mouse, not for watching, and each frame is a full Playwright
+# screenshot that competes with the encoder for CPU.
+_CONTROL_FPS = float(os.environ.get("VIRTUAL_CONTROL_FPS", "4"))
+
+
+def _admin_from_request(request: Request) -> Optional[dict]:
+    """The admin behind this request, or None.
+
+    Mirrors require_stream_token's "no users yet means unconfigured" rule so a
+    fresh install is usable before the admin is bootstrapped, but is otherwise
+    strictly role-checked.
+    """
+    if not users.list_users():
+        return {"username": "", "role": "admin"}
+    user = users.user_by_token(request.query_params.get("token", ""))
+    if user is None or user.get("role") != "admin":
+        return None
+    return user
+
+
+async def _control_session(name: str, request: Request):
+    """Resolve (session, error_response) for a control request."""
+    from freesky import virtual_session
+
+    if _admin_from_request(request) is None:
+        return None, Response(status_code=status.HTTP_401_UNAUTHORIZED)
+    session = virtual_session.manager.get(name)
+    if session is None:
+        return None, JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"error": "not_running",
+                     "message": f"No running session for '{name}'. Start it first."},
+        )
+    return session, None
+
+
+@fastapi_app.post("/api/virtual-control/{name}/start")
+async def virtual_control_start(name: str, request: Request):
+    """Bring a session up without anyone tuning in.
+
+    An admin needs the browser running before they can set it up — logging into
+    a site or dismissing a dialog is exactly the work that has to happen before
+    the channel is worth watching.
+    """
+    from freesky import virtual_session
+
+    if _admin_from_request(request) is None:
+        return Response(status_code=status.HTTP_401_UNAUTHORIZED)
+    try:
+        session = await virtual_session.manager.acquire(name)
+    except virtual_session.VirtualSessionError as exc:
+        return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            content={"error": "start_failed", "message": str(exc)})
+    return JSONResponse({"started": True, "name": name, "url": session.page_url})
+
+
+@fastapi_app.get("/api/virtual-control/{name}/stream.mjpeg")
+async def virtual_control_stream(name: str, request: Request):
+    """Live view of the session's page as multipart JPEG.
+
+    multipart/x-mixed-replace renders natively in an <img>, so the panel needs no
+    player, no WebSocket and no polling loop.
+    """
+    session, error = await _control_session(name, request)
+    if error is not None:
+        return error
+
+    interval = 1.0 / max(_CONTROL_FPS, 0.5)
+
+    async def frames():
+        try:
+            while True:
+                # The panel being open is itself a sign someone is using this
+                # channel, so keep the reaper off it.
+                session.last_access = time.monotonic()
+                try:
+                    jpeg = await session.screenshot()
+                except Exception as exc:
+                    logger.debug(f"Control frame for {name} failed: {exc}")
+                    return
+                yield (
+                    f"--{_MJPEG_BOUNDARY}\r\n"
+                    f"Content-Type: image/jpeg\r\n"
+                    f"Content-Length: {len(jpeg)}\r\n\r\n"
+                ).encode() + jpeg + b"\r\n"
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            # Normal: the admin closed the panel.
+            raise
+
+    return StreamingResponse(
+        frames(),
+        media_type=f"multipart/x-mixed-replace; boundary={_MJPEG_BOUNDARY}",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+@fastapi_app.post("/api/virtual-control/{name}/input")
+async def virtual_control_input(name: str, request: Request):
+    """Apply one mouse/keyboard event to the live page."""
+    from freesky import virtual_session
+
+    session, error = await _control_session(name, request)
+    if error is not None:
+        return error
+    try:
+        event = await request.json()
+    except Exception:
+        return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST,
+                            content={"error": "bad_json"})
+    if not isinstance(event, dict):
+        return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST,
+                            content={"error": "bad_event"})
+    try:
+        await session.dispatch_input(event)
+    except virtual_session.VirtualSessionError as exc:
+        return JSONResponse(status_code=status.HTTP_409_CONFLICT,
+                            content={"error": "input_failed", "message": str(exc)})
+    except Exception as exc:
+        # A click that lands on a navigating page throws; that is not worth a 500.
+        logger.debug(f"Control input for {name} failed: {exc}")
+        return JSONResponse({"ok": False, "message": str(exc)})
+    return JSONResponse({"ok": True})
+
+
+@fastapi_app.post("/api/virtual-control/{name}/navigate")
+async def virtual_control_navigate(name: str, request: Request):
+    """Point the live session at another URL, without changing the stored one."""
+    from freesky import virtual_session
+
+    session, error = await _control_session(name, request)
+    if error is not None:
+        return error
+    try:
+        body = await request.json()
+        url = str(body.get("url", ""))
+    except Exception:
+        return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST,
+                            content={"error": "bad_json"})
+    try:
+        await session.navigate(url)
+    except virtual_session.VirtualSessionError as exc:
+        return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST,
+                            content={"error": "navigate_failed", "message": str(exc)})
+    return JSONResponse({"ok": True, "url": session.page_url})
+
+
+@fastapi_app.get("/api/virtual-control/{name}/panel", response_class=Response)
+async def virtual_control_panel(name: str, request: Request):
+    """The control panel itself: a self-contained HTML page.
+
+    Served as plain HTML from the backend rather than built as a Reflex
+    component on purpose. Faithful remote control needs raw pointer and keyboard
+    events with exact coordinates and modifier state, which means addEventListener
+    on a real element — fighting Reflex's serialised event model to get that
+    would be far more code and much less accurate.
+    """
+    if _admin_from_request(request) is None:
+        return Response(status_code=status.HTTP_401_UNAUTHORIZED)
+    record = virtual_channels.get_channel(name)
+    if record is None:
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+
+    width, height = virtual_channels.geometry(record)
+    # json.dumps, not an f-string: these values end up inside a <script>, and the
+    # token in particular must not be able to break out of its string literal.
+    cfg = json.dumps({
+        "name": name,
+        "title": record["title"],
+        "token": request.query_params.get("token", ""),
+        "width": width,
+        "height": height,
+        "url": record["url"],
+    })
+    return Response(content=_CONTROL_PANEL_HTML.replace("__CONFIG__", cfg),
+                    media_type="text/html")
+
+
+# Kept at module level rather than in a template file so the backend stays
+# deployable as plain Python — there is no template engine or static-HTML
+# pipeline in this app, and /srv is the compiled Reflex frontend.
+_CONTROL_PANEL_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FreeSky - virtual channel control</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #16161a; color: #e6e6e6;
+         font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { display: flex; gap: .5rem; align-items: center; padding: .6rem .8rem;
+           background: #1f1f24; border-bottom: 1px solid #33333a; flex-wrap: wrap; }
+  h1 { font-size: 15px; margin: 0 .5rem 0 0; font-weight: 600; }
+  button { background: #2c2c33; color: #e6e6e6; border: 1px solid #44444d;
+           border-radius: 6px; padding: .35rem .7rem; cursor: pointer; font-size: 13px; }
+  button:hover { background: #383840; }
+  button.on { background: #d4342c; border-color: #d4342c; }
+  input[type=text] { flex: 1; min-width: 12rem; background: #121215; color: #e6e6e6;
+           border: 1px solid #44444d; border-radius: 6px; padding: .35rem .6rem;
+           font-family: ui-monospace, monospace; font-size: 12px; }
+  #stage { display: flex; justify-content: center; padding: 1rem; }
+  /* The frame is the coordinate reference for every pointer event, so it must
+     never be stretched: any non-uniform scale would misplace clicks. */
+  #frame { max-width: 100%; height: auto; background: #000; display: block;
+           border: 1px solid #33333a; border-radius: 6px; cursor: crosshair; }
+  #status { padding: 0 .8rem .8rem; color: #9a9aa5; font-size: 12px; }
+  .err { color: #ff8a80; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">virtual channel</h1>
+  <button id="toggle">Take control</button>
+  <button data-nav="back">&#8592;</button>
+  <button data-nav="forward">&#8594;</button>
+  <button data-nav="reload">&#8635;</button>
+  <input type="text" id="url" spellcheck="false">
+  <button id="go">Go</button>
+</header>
+<div id="stage"><img id="frame" alt="live view"></div>
+<div id="status">Starting session&hellip;</div>
+
+<script>
+const CFG = __CONFIG__;
+const qs = "?token=" + encodeURIComponent(CFG.token);
+const base = "/api/virtual-control/" + encodeURIComponent(CFG.name);
+const frame = document.getElementById("frame");
+const statusEl = document.getElementById("status");
+const urlEl = document.getElementById("url");
+const toggle = document.getElementById("toggle");
+let controlling = false;
+
+document.getElementById("title").textContent = CFG.title + "  (" + CFG.width + "x" + CFG.height + ")";
+urlEl.value = CFG.url;
+
+function say(msg, isErr) {
+  statusEl.textContent = msg;
+  statusEl.className = isErr ? "err" : "";
+}
+
+async function post(path, body) {
+  const res = await fetch(base + path + qs, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body || {}),
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+// The <img> is laid out responsively, so its rendered size rarely equals the
+// page's real viewport. Every pointer event is scaled back into page
+// coordinates here — without this, clicks land in the wrong place on any
+// display narrower than the capture width.
+function toPageCoords(ev) {
+  const r = frame.getBoundingClientRect();
+  return {
+    x: Math.round((ev.clientX - r.left) * (CFG.width / r.width)),
+    y: Math.round((ev.clientY - r.top) * (CFG.height / r.height)),
+  };
+}
+
+function send(event) {
+  if (!controlling) return;
+  post("/input", event).catch(e => say("input failed: " + e.message, true));
+}
+
+frame.addEventListener("click", ev => {
+  if (!controlling) return;
+  ev.preventDefault();
+  const p = toPageCoords(ev);
+  send({type: "click", x: p.x, y: p.y, button: "left"});
+});
+
+frame.addEventListener("contextmenu", ev => {
+  if (!controlling) return;
+  ev.preventDefault();
+  const p = toPageCoords(ev);
+  send({type: "click", x: p.x, y: p.y, button: "right"});
+});
+
+frame.addEventListener("dblclick", ev => {
+  if (!controlling) return;
+  const p = toPageCoords(ev);
+  send({type: "click", x: p.x, y: p.y, button: "left", clicks: 2});
+});
+
+// Pointer moves are throttled hard. Every event is a round-trip that contends
+// with the encoder, and hover state does not need 60fps to be useful.
+let lastMove = 0;
+frame.addEventListener("pointermove", ev => {
+  if (!controlling) return;
+  const now = performance.now();
+  if (now - lastMove < 120) return;
+  lastMove = now;
+  const p = toPageCoords(ev);
+  send({type: "move", x: p.x, y: p.y});
+});
+
+frame.addEventListener("wheel", ev => {
+  if (!controlling) return;
+  ev.preventDefault();
+  const p = toPageCoords(ev);
+  send({type: "wheel", x: p.x, y: p.y, dx: ev.deltaX, dy: ev.deltaY});
+}, {passive: false});
+
+// Keyboard goes to the remote page only while control is on, otherwise the
+// admin cannot type in the address bar above.
+window.addEventListener("keydown", ev => {
+  if (!controlling) return;
+  if (document.activeElement === urlEl) return;
+  ev.preventDefault();
+  if (ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+    send({type: "text", text: ev.key});
+  } else {
+    send({type: "key", key: ev.key});
+  }
+});
+
+toggle.addEventListener("click", () => {
+  controlling = !controlling;
+  toggle.classList.toggle("on", controlling);
+  toggle.textContent = controlling ? "Release control" : "Take control";
+  say(controlling
+    ? "Control is live - clicks, scrolling and typing go to the remote browser."
+    : "Viewing only.");
+});
+
+document.querySelectorAll("[data-nav]").forEach(b => {
+  b.addEventListener("click", () => {
+    post("/input", {type: b.dataset.nav}).catch(e => say(e.message, true));
+  });
+});
+
+document.getElementById("go").addEventListener("click", async () => {
+  try {
+    const r = await post("/navigate", {url: urlEl.value});
+    urlEl.value = r.url || urlEl.value;
+    say("Navigated. This is temporary - the channel returns to its configured URL on the next session.");
+  } catch (e) {
+    say("navigate failed: " + e.message, true);
+  }
+});
+
+// Start the session before wiring the frame up: the browser may not be running
+// yet, and pointing <img> at the stream first would just 409 and show nothing.
+(async () => {
+  try {
+    say("Starting session (this can take up to a minute on a slow page)...");
+    const r = await post("/start", {});
+    if (r.url) urlEl.value = r.url;
+    frame.src = base + "/stream.mjpeg" + qs + "&t=" + Date.now();
+    say("Viewing only. Press “Take control” to drive the browser.");
+  } catch (e) {
+    say("Could not start the session: " + e.message, true);
+  }
+})();
+
+frame.addEventListener("error", () => say("Live view disconnected - reload this page.", true));
+</script>
+</body>
+</html>
+"""

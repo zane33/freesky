@@ -2,6 +2,12 @@
 
 A modern web application for streaming live TV channels with a beautiful, responsive interface built with Reflex (React + Python).
 
+It also supports **virtual channels**: restream any web page as a live HLS
+channel by rendering it in a browser inside the container and capturing the
+screen and audio. Create them in Settings, run as many as your host can carry,
+and drive each browser session with mouse and keyboard from the admin control
+panel. See [documentation/VIRTUAL_CHANNELS.md](documentation/VIRTUAL_CHANNELS.md).
+
 ## 🚀 Quick Start
 
 1. **Clone the repository**

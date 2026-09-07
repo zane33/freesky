@@ -11,3 +11,7 @@ data/
 logo-cache/
 freesky/users.json
 freesky/app_settings.json
+freesky/virtual_channels.json
+# Holds license_headers in plaintext (bearer tokens / API keys) - see the
+# SECURITY note at the top of freesky/drm_providers.py. Must never be committed.
+freesky/drm_providers.json

@@ -738,7 +738,16 @@ class StepDaddyHybrid:
     def content_url(path: str):
         return decrypt(path)
 
-    def playlist(self, exclude: set = None, token: str = None, base_url: str = None):
+    def playlist(self, exclude: set = None, token: str = None, base_url: str = None,
+                 extra: list = None):
+        """Build the M3U handed to external players.
+
+        `extra` appends channels that do not come from the upstream scrape —
+        today that is the admin's virtual channels, which are stored locally and
+        so are never present in self.channels. They are deliberately a parameter
+        rather than something this class fetches, because this class knows how to
+        scrape one specific site and nothing else.
+        """
         exclude = exclude or set()
         # Point back at whatever host:port the caller actually used. Hardcoding
         # config.api_url handed out LAN addresses to anyone reaching the app
@@ -749,7 +758,7 @@ class StepDaddyHybrid:
         # caller's token has to be baked into every line for auth to hold.
         suffix = f"?token={token}" if token else ""
         data = "#EXTM3U\n"
-        for channel in self.channels:
+        for channel in list(self.channels) + list(extra or []):
             if channel.id in exclude:
                 continue
             logo = channel.logo

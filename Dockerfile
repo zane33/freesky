@@ -69,7 +69,21 @@ RUN echo "Building frontend with API_URL=$API_URL" && \
 # Final image with only necessary files
 FROM python:3.13-slim
 
-# Install Caddy, redis server, Node.js/npm, and Playwright system dependencies inside final image
+# Install Caddy, redis server, Node.js/npm, and Playwright system dependencies inside final image.
+#
+# The xvfb/pulseaudio/ffmpeg block serves virtual channels (a web page restreamed
+# as live HLS, see freesky/virtual_session.py):
+#   xvfb, x11-utils  - a private X display per session, which ffmpeg's x11grab captures
+#   pulseaudio(-utils) - the per-session null-sink Chromium plays into and whose
+#                        .monitor ffmpeg records. Chromium runs HEADFUL against the
+#                        X display precisely because headless Chrome has no reliable
+#                        audio output path in a container.
+#   ffmpeg           - capture and H.264/AAC encode to a rolling HLS playlist
+#   dbus, dbus-x11   - Chromium expects a session bus when running headful
+#   dumb-init        - PID 1, see ENTRYPOINT below
+#   fonts-*          - without these every captured page renders as tofu boxes
+#   libdrm2/libpango/libcairo2/libxss1 - headful Chromium needs these beyond the
+#                        headless set already listed above
 RUN apt-get update -y && apt-get install -y \
     caddy \
     redis-server \
@@ -90,6 +104,23 @@ RUN apt-get update -y && apt-get install -y \
     libxrandr2 \
     libgbm1 \
     libasound2 \
+    xvfb \
+    x11-utils \
+    pulseaudio \
+    pulseaudio-utils \
+    ffmpeg \
+    dbus \
+    dbus-x11 \
+    dumb-init \
+    fonts-liberation \
+    fonts-dejavu-core \
+    fonts-noto-core \
+    fonts-noto-color-emoji \
+    fontconfig \
+    libdrm2 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libxss1 \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -124,6 +155,12 @@ RUN dos2unix /app/start.sh && chmod +x /app/start.sh
 STOPSIGNAL SIGKILL
 
 EXPOSE $PORT $BACKEND_PORT 3443
+
+# dumb-init as PID 1. Chromium forks a tree of renderer/GPU/utility processes;
+# with a shell as PID 1 none of them are reaped and the container accumulates
+# zombies until it hits the PID limit. This is the documented answer to the
+# zombie-process problem that follows containerised Chrome everywhere.
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 
 # Starting the backend with multiple workers
 CMD ["/app/start.sh"]

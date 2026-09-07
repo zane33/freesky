@@ -12,7 +12,7 @@
 
 	# Optimized compression settings - exclude streaming endpoints
 	@compress {
-	    not path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /_event/* /logo/* /watch/*
+	    not path /api/stream/* /api/content/* /api/key/* /api/virtual/* /api/virtual-control/* /stream/* /content/* /key/* /_event/* /logo/* /watch/*
 	}
 	encode @compress {
 	    gzip 6          # Balanced compression level
@@ -43,12 +43,12 @@
 
 	# Streaming endpoints need permissive headers for external players
 	@streaming {
-	    path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /playlist.m3u8
+	    path /api/stream/* /api/content/* /api/key/* /api/virtual/* /stream/* /content/* /key/* /playlist.m3u8
 	}
 
 	# Restrictive headers for non-streaming content
 	@non_streaming {
-	    not path /api/stream/* /api/content/* /api/key/* /stream/* /content/* /key/* /playlist.m3u8
+	    not path /api/stream/* /api/content/* /api/key/* /api/virtual/* /api/virtual-control/* /stream/* /content/* /key/* /playlist.m3u8
 	}
 
 	# Security headers for non-streaming content only
@@ -135,6 +135,29 @@
 		reverse_proxy localhost:{$BACKEND_PORT} {
 			flush_interval -1
 			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# Virtual-channel HLS segments (/api/virtual/*) and the admin control panel
+	# (/api/virtual-control/*), both served from the backend. Needs its own block
+	# for the same reason @api_content does: the FIRST request for a channel
+	# starts a browser and an encoder and blocks until the first segments exist,
+	# which can take ~45s on a slow page. The generic /api/* handler's default
+	# timeout turned that cold start into a 502.
+	#
+	# flush_interval -1 is load-bearing for the control panel: its live view is a
+	# multipart/x-mixed-replace JPEG stream, and any response buffering makes the
+	# preview arrive in bursts or not at all.
+	@api_virtual path /api/virtual/* /api/virtual-control/*
+	handle @api_virtual {
+		reverse_proxy localhost:{$BACKEND_PORT} {
+			flush_interval -1
+			header_up X-Real-IP {remote_host}
+			header_down -Server
+			transport http {
+				dial_timeout 3s
+				response_header_timeout 60s
+			}
 		}
 	}
 

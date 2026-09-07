@@ -35,6 +35,22 @@ services:
       - CHANNEL_PREFS_FILE=/app/data/channel_prefs.json  # Persisted via the ./data volume below
       - USERS_FILE=/app/data/users.json
       - APP_SETTINGS_FILE=/app/data/app_settings.json
+      - VIRTUAL_CHANNELS_FILE=/app/data/virtual_channels.json
+      # Virtual channels: a web page restreamed as live HLS. HLS segments go to
+      # the tmpfs mounted below - they are write-heavy, live for seconds, and are
+      # never worth touching disk.
+      - VIRTUAL_HLS_ROOT=/streams
+      # 0 = no limit on concurrent browser sessions, which is the default:
+      # running several virtual channels side by side is the point of the
+      # feature. Each session costs roughly 1.5-2 CPU cores and ~900MB at
+      # 720p30 (about double at 1080p30), so the real ceiling is the host and
+      # the memory limit below - set a positive number here only if you want a
+      # hard cap that evicts the least recently watched session.
+      - MAX_VIRTUAL_SESSIONS=${MAX_VIRTUAL_SESSIONS:-0}
+      # Frames per second for the admin control panel's live preview. Low on
+      # purpose: it is for aiming a mouse, not for watching, and each frame
+      # competes with the encoders for CPU.
+      - VIRTUAL_CONTROL_FPS=${VIRTUAL_CONTROL_FPS:-4}
       # Seed for the trusted-subnet allowlist on a fresh install; once saved in
       # Settings the stored value wins. Clients here skip login entirely.
       - TRUSTED_NETWORKS=${TRUSTED_NETWORKS:-}
@@ -87,13 +103,33 @@ services:
       - ./data:/app/data
       - ./data/logo-cache:/app/logo-cache
 
+    # HLS output for virtual channels. About 12MB per session is live at any
+    # moment (~2s x 10 segments x 4.5Mbps), so 1G covers dozens of concurrent
+    # channels. It is a tmpfs cap, not an allocation - unused space costs
+    # nothing.
+    tmpfs:
+      - /streams:size=1g
+
+    # Chromium uses /dev/shm to share render surfaces between its processes.
+    # Docker's 64MB default makes it crash with blank pages and "page crash"
+    # errors. The --disable-dev-shm-usage flag is also set (virtual_session.py),
+    # but that only makes it fall back to /tmp - raising this is the real fix.
+    shm_size: "1gb"
+
     # Resource Limits
     deploy:
       resources:
         limits:
-          memory: 512M  # Reduced from 1G to 512M
+          # 512M was right when this was a pure HTTP proxy. A virtual channel
+          # adds a headful Chromium (~500-700M) plus an ffmpeg x264 encoder
+          # (~150M) per session. Concurrent sessions are uncapped by default, so
+          # THIS is the limit that actually decides how many you can run: budget
+          # ~1G base + ~900M per concurrent 720p30 session and raise it to suit.
+          # Too low and the container is OOM-killed mid-stream, taking every
+          # channel down, not just the newest one.
+          memory: ${MEMORY_LIMIT:-8G}
         reservations:
-          memory: 256M  # Reduced from 512M to 256M
+          memory: 512M
     
     # Restart Policy
     restart: unless-stopped

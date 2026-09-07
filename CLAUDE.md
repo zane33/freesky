@@ -66,6 +66,7 @@ freeskyNew/
 - **Main Architecture**: [documentation/README.md](documentation/README.md)
 - **Streaming Architecture**: [documentation/STREAMING_ARCHITECTURE.md](documentation/STREAMING_ARCHITECTURE.md)
 - **Multi-Service Integration**: [documentation/MULTI_SERVICE_INTEGRATION.md](documentation/MULTI_SERVICE_INTEGRATION.md)
+- **Virtual Channels (browser → HLS)**: [documentation/VIRTUAL_CHANNELS.md](documentation/VIRTUAL_CHANNELS.md)
 - **Deployment Guide**: [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md)
 - **Docker Deployment**: [documentation/DOCKER_DEPLOYMENT.md](documentation/DOCKER_DEPLOYMENT.md)
 - **Security Documentation**: [documentation/SECURITY.md](documentation/SECURITY.md)
@@ -137,6 +138,7 @@ The project maintains comprehensive documentation in the `documentation/` direct
 - **README.md**: Main project overview and quick start guide
 - **STREAMING_ARCHITECTURE.md**: Technical deep-dive into streaming implementation
 - **MULTI_SERVICE_INTEGRATION.md**: Guide for integrating multiple streaming services
+- **VIRTUAL_CHANNELS.md**: Restreaming a web page as a live HLS channel
 - **DEPLOYMENT.md**: Step-by-step deployment instructions
 - **DOCKER_DEPLOYMENT.md**: Docker-specific deployment guide
 - **SECURITY.md**: Security considerations and best practices

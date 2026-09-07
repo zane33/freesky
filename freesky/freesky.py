@@ -434,3 +434,7 @@ app = rx.App(
 
 # Register the background channel update task
 app.register_lifespan_task(backend.update_channels)
+# Tear down virtual-channel browser sessions on shutdown. Reflex owns the ASGI
+# lifespan, so @fastapi_app.on_event("shutdown") never fires; without this, a
+# reload leaves orphaned Chromium and ffmpeg processes holding X displays.
+app.register_lifespan_task(backend.close_virtual_sessions)
