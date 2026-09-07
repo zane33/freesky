@@ -274,6 +274,13 @@ class SettingsState(rx.State):
         old_name = self.vc_editing
         previous = virtual_channels.get_channel(old_name) if old_name else {}
 
+        # The crop is chosen on the control panel, by dragging a rectangle over
+        # the live view — it is not a field on this form. Carry it across, or
+        # saving any unrelated setting here would silently reset the streamed
+        # region back to the whole screen.
+        for field in ("crop_x", "crop_y", "crop_w", "crop_h"):
+            record[field] = (previous or {}).get(field, 0)
+
         try:
             # Validate the WHOLE record under its final name before writing
             # anything. The previous version wrote the edited fields under the

@@ -19,11 +19,12 @@ plays inside its own player, a dashboard, a webcam page, a scoreboard.
 3. [Controlling a live session](#controlling-a-live-session)
 4. [Running many channels at once](#running-many-channels-at-once)
 5. [One worker, always](#one-worker-always)
-6. [Configuration reference](#configuration-reference)
-7. [API reference](#api-reference)
-8. [Architecture and design decisions](#architecture-and-design-decisions)
-9. [Security model](#security-model)
-10. [Troubleshooting](#troubleshooting)
+6. [Cropping: streaming part of the screen](#cropping-streaming-part-of-the-screen)
+7. [Configuration reference](#configuration-reference)
+8. [API reference](#api-reference)
+9. [Architecture and design decisions](#architecture-and-design-decisions)
+10. [Security model](#security-model)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -215,6 +216,43 @@ As a backstop, `VirtualSession.start()` takes an exclusive `flock` on
 error instead of silently corrupting the browser profile. The lock is held by an
 open file descriptor, so it is released automatically if a process dies.
 
+## Cropping: streaming part of the screen
+
+By default a virtual channel streams the whole browser screen. Often only part
+of it is worth sending -- a video player inside a page full of navigation,
+headers and related-content rails.
+
+Open **Control** for the channel, click **Crop**, and drag a rectangle over the
+live view. The view is a capture of the same X display the encoder records, so
+the rectangle you draw is exactly what viewers get; there is no second preview
+geometry that can disagree with the stream. **Apply crop** saves it, and
+**Full screen** clears it again. An existing crop is outlined in green when you
+open the panel.
+
+Taking control and selecting a crop are mutually exclusive: arming the selector
+releases control, so a drag cannot click through and follow a link on the page.
+
+Three things worth knowing:
+
+- **The resolution setting sizes the browser window; the crop selects the part
+  of that window which is streamed.** A 720p channel cropped to 800x450 gives
+  viewers an 800x450 stream of a 1280x720 browser. The region is sent at its
+  native pixels rather than scaled back up, so it stays sharp and costs less to
+  encode.
+- **Width and height are rounded down to even numbers.** H.264 with `yuv420p`
+  subsamples chroma 2x2 and rejects an odd dimension outright.
+- **Changing the crop restarts the session.** It is part of ffmpeg's input
+  geometry, so a new encoder is required. Re-applying an identical crop does
+  nothing, and so does not interrupt anyone watching.
+
+The crop is applied to the **x11grab input** (`-video_size WxH -i :99.0+X,Y`),
+not with a `-vf crop` filter. x11grab then reads only those pixels off the X
+server each frame; a filter would pull the whole screen across and discard most
+of it.
+
+The settings form has no crop fields -- a crop is something you pick by looking
+at the page -- but saving that form preserves whatever the panel set.
+
 ## Configuration reference
 
 All optional. Defaults are in `docker-compose.yml`.
@@ -288,11 +326,19 @@ is what prevents path traversal out of the output directory.
 | `POST` | `/api/virtual-control/<name>/input` | One input event. |
 | `POST` | `/api/virtual-control/<name>/navigate` | Transient navigation. |
 | `GET` | `/api/virtual-control/<name>/panel` | The control panel HTML. |
+| `POST` | `/api/virtual-control/<name>/crop` | Set or clear the streamed region. |
 
 Input event shapes: `{"type":"click","x":100,"y":200,"button":"left","clicks":1}`,
 `{"type":"move"|"down"|"up",…}`, `{"type":"wheel","x":…,"y":…,"dx":0,"dy":120}`,
 `{"type":"key","key":"Enter"}`, `{"type":"text","text":"hello"}`,
 `{"type":"back"|"forward"|"reload"}`.
+
+Crop body: `{"x":40,"y":20,"w":800,"h":450}`, in screen pixels. All zeros clears
+the crop. The reply reports the resulting stream size, whether a crop is in
+effect, and whether the session was restarted:
+`{"saved":true,"cropped":true,"crop":{…},"output":{"width":800,"height":450},"restarted":true}`.
+An out-of-bounds or undersized region comes back as `400` with a readable
+message, and nothing is written.
 
 ---
 

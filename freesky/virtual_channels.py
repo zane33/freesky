@@ -98,6 +98,9 @@ DEFAULT_PRESET = "veryfast"
 CAPTURE_FIELDS = (
     "url", "resolution", "framerate", "preset", "video_bitrate",
     "audio", "audio_bitrate", "warmup", "click_selectors", "hide_selectors",
+    # The crop is baked into ffmpeg's x11grab input geometry, so changing it
+    # means a new encoder -- and therefore a session restart.
+    "crop_x", "crop_y", "crop_w", "crop_h",
 )
 
 
@@ -286,7 +289,79 @@ def validate_channel(record: dict) -> dict:
         # page. Costs a browser and an encoder around the clock, so it is off by
         # default and opted into per channel.
         "autostart": bool(record.get("autostart", False)),
+        # Stream only part of the browser screen. See _validate_crop.
+        **_validate_crop(record, RESOLUTIONS[resolution]),
     }
+
+
+# --- cropping ---------------------------------------------------------------
+
+# Smallest croppable region. Below roughly this size a crop is far more likely
+# to be a stray click on the panel's preview than an intended selection, and
+# x264 needs some room to work with.
+MIN_CROP = 32
+
+
+def _validate_crop(record: dict, screen: tuple) -> dict:
+    """Normalise crop_x/crop_y/crop_w/crop_h against the screen size.
+
+    All four zero means "no crop": stream the whole screen. That is the default,
+    and it is what an existing record read off disk gets, so this stays backward
+    compatible with channels created before cropping existed.
+
+    Width and height are forced EVEN. H.264 with yuv420p subsamples chroma 2x2
+    and simply refuses an odd dimension, and an admin dragging a rectangle on the
+    preview has no reason to care -- so round rather than reject.
+    """
+    screen_w, screen_h = screen
+    x = _validate_int(record.get("crop_x"), "Crop X", 0, screen_w, 0)
+    y = _validate_int(record.get("crop_y"), "Crop Y", 0, screen_h, 0)
+    w = _validate_int(record.get("crop_w"), "Crop width", 0, screen_w, 0)
+    h = _validate_int(record.get("crop_h"), "Crop height", 0, screen_h, 0)
+
+    if not w and not h:
+        # No crop. Offsets without a size are meaningless, so drop them too
+        # rather than storing a half-configured crop that does nothing.
+        return {"crop_x": 0, "crop_y": 0, "crop_w": 0, "crop_h": 0}
+
+    if not w or not h:
+        raise VirtualChannelError(
+            "Crop needs both a width and a height (or leave all four at 0 to "
+            "stream the whole screen)."
+        )
+
+    w -= w % 2
+    h -= h % 2
+    if w < MIN_CROP or h < MIN_CROP:
+        raise VirtualChannelError(
+            f"Crop must be at least {MIN_CROP}x{MIN_CROP} pixels."
+        )
+    if x + w > screen_w or y + h > screen_h:
+        raise VirtualChannelError(
+            f"Crop {w}x{h} at ({x}, {y}) falls outside the {screen_w}x{screen_h} "
+            "screen. Lower the offset, shrink the crop, or raise the resolution."
+        )
+    return {"crop_x": x, "crop_y": y, "crop_w": w, "crop_h": h}
+
+
+def crop_box(record: dict) -> tuple:
+    """(x, y, w, h) to capture, or None when the whole screen is streamed."""
+    w, h = record.get("crop_w") or 0, record.get("crop_h") or 0
+    if not w or not h:
+        return None
+    return (record.get("crop_x") or 0, record.get("crop_y") or 0, w, h)
+
+
+def output_size(record: dict) -> tuple:
+    """(width, height) of the encoded stream.
+
+    A crop makes the stream smaller than the browser screen: the resolution
+    setting sizes the BROWSER WINDOW, and the crop selects which part of that
+    window viewers actually get. The region is streamed at its native pixels
+    rather than scaled back up, which keeps it sharp and costs less to encode.
+    """
+    box = crop_box(record)
+    return (box[2], box[3]) if box else geometry(record)
 
 
 def _load() -> Dict[str, dict]:

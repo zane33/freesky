@@ -1784,12 +1784,23 @@ async def start_virtual_sessions():
     first minute of its life and can be restarted by the orchestrator.
     """
     from freesky import virtual_channels as _vc
+    from freesky import virtual_session
+
+    # ALWAYS, before the autostart check returns: clear processes orphaned by a
+    # previous backend that died mid-startup. Those keep running after the
+    # supervisor restarts the backend, and every failed attempt adds more, until
+    # the container has no room left and the feature looks permanently broken.
+    # The session manager is empty at this point, so anything matching is
+    # necessarily stale.
+    try:
+        await asyncio.to_thread(virtual_session.reap_orphans)
+    except Exception as exc:  # diagnostics must never block startup
+        logger.warning(f"Could not reap orphaned virtual-channel processes: {exc}")
 
     if not any(r.get("autostart") and r.get("enabled") for r in _vc.list_channels()):
         return
     try:
         await asyncio.sleep(5)
-        from freesky import virtual_session
 
         await virtual_session.manager.start_autostart_channels()
     except asyncio.CancelledError:
@@ -2042,6 +2053,94 @@ async def virtual_control_diagnostics(name: str, request: Request):
     })
 
 
+@fastapi_app.get("/api/virtual-sessions/trace")
+async def virtual_sessions_trace(request: Request):
+    """The last session-startup breadcrumb trail.
+
+    Session startup spawns an X server, an audio daemon, a browser and an
+    encoder, and when one of those takes the whole backend process down there is
+    no traceback and no response — just a dropped connection the proxy reports
+    as 502. Each stage records itself (fsync'd) before attempting the next, so
+    the LAST line here names the stage that killed it.
+
+    Exposed over HTTP because on a container without shell access this is the
+    only way to read it.
+    """
+    from freesky import virtual_session
+
+    if _admin_from_request(request) is None:
+        return Response(status_code=status.HTTP_401_UNAUTHORIZED)
+    lines = virtual_session.read_trace()
+    return JSONResponse({
+        "path": virtual_session.TRACE_PATH,
+        "lines": lines,
+        # The headline: what was in flight when the trail stopped.
+        "last_stage": lines[-1] if lines else None,
+        "complete": bool(lines) and (
+            "start:complete" in lines[-1] or "start:failed" in lines[-1]),
+    })
+
+
+@fastapi_app.post("/api/virtual-control/{name}/crop")
+async def virtual_control_crop(name: str, request: Request):
+    """Set (or clear) the streamed region of the screen.
+
+    Separate from the settings form because a crop is something you pick by
+    LOOKING at the page: the admin drags a rectangle on the panel's live view,
+    which is the same X display the encoder captures, so what they outline is
+    exactly what viewers get.
+
+    Changing the crop changes ffmpeg's input geometry, so the session has to be
+    rebuilt. That is done here rather than left to the caller, otherwise the
+    panel would keep showing the old framing and look broken.
+    """
+    from freesky import virtual_session
+
+    if _admin_from_request(request) is None:
+        return Response(status_code=status.HTTP_401_UNAUTHORIZED)
+    record = virtual_channels.get_channel(name)
+    if record is None:
+        return JSONResponse(status_code=status.HTTP_404_NOT_FOUND,
+                            content={"error": "not_found",
+                                     "message": f"No virtual channel named '{name}'."})
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    updated = dict(record)
+    for key, field in (("x", "crop_x"), ("y", "crop_y"), ("w", "crop_w"), ("h", "crop_h")):
+        updated[field] = body.get(key, 0) or 0
+    try:
+        cleaned = virtual_channels.validate_channel(updated)
+    except virtual_channels.VirtualChannelError as exc:
+        # A crop the admin dragged slightly off the edge is a normal mistake,
+        # not a server fault, so it comes back as a readable 400.
+        return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST,
+                            content={"error": "invalid_crop", "message": str(exc)})
+
+    virtual_channels.upsert_channel(cleaned)
+
+    # Rebuild only if the framing actually moved. Re-applying an identical crop
+    # should not interrupt a stream anyone is watching.
+    restarted = False
+    if virtual_channels.needs_restart(record, cleaned):
+        with contextlib.suppress(Exception):
+            await virtual_session.manager.stop(name)
+        restarted = True
+
+    box = virtual_channels.crop_box(cleaned)
+    out_w, out_h = virtual_channels.output_size(cleaned)
+    return JSONResponse({
+        "saved": True,
+        "cropped": box is not None,
+        "crop": {"x": cleaned["crop_x"], "y": cleaned["crop_y"],
+                 "w": cleaned["crop_w"], "h": cleaned["crop_h"]},
+        "output": {"width": out_w, "height": out_h},
+        "restarted": restarted,
+    })
+
+
 @fastapi_app.get("/api/virtual-control/{name}/panel", response_class=Response)
 async def virtual_control_panel(name: str, request: Request):
     """The control panel itself: a self-contained HTML page.
@@ -2068,6 +2167,10 @@ async def virtual_control_panel(name: str, request: Request):
         "width": width,
         "height": height,
         "url": record["url"],
+        # The current crop, so the panel can draw the existing region on load
+        # instead of making the admin re-find it. Zeros mean "whole screen".
+        "crop": {"x": record["crop_x"], "y": record["crop_y"],
+                 "w": record["crop_w"], "h": record["crop_h"]},
     })
     return Response(content=_CONTROL_PANEL_HTML.replace("__CONFIG__", cfg),
                     media_type="text/html")
@@ -2097,10 +2200,28 @@ _CONTROL_PANEL_HTML = r"""<!doctype html>
            border: 1px solid #44444d; border-radius: 6px; padding: .35rem .6rem;
            font-family: ui-monospace, monospace; font-size: 12px; }
   #stage { display: flex; justify-content: center; padding: 1rem; }
+  /* Wraps the image so the crop overlay can be positioned against exactly the
+     rendered picture, not the padded stage around it. */
+  #shell { position: relative; display: inline-block; line-height: 0; }
   /* The frame is the coordinate reference for every pointer event, so it must
      never be stretched: any non-uniform scale would misplace clicks. */
   #frame { max-width: 100%; height: auto; background: #000; display: block;
            border: 1px solid #33333a; border-radius: 6px; cursor: crosshair; }
+  /* Overlay pieces are pointer-events:none so they never swallow a drag or a
+     click meant for the page underneath. */
+  #shade { position: absolute; inset: 0; pointer-events: none;
+           background: rgba(0,0,0,.55); display: none; }
+  #cropbox { position: absolute; pointer-events: none; display: none;
+             border: 1px solid #ffd54f; outline: 1px solid rgba(0,0,0,.6);
+             box-shadow: 0 0 0 9999px rgba(0,0,0,.55); }
+  /* When a crop is saved but the selector is idle, outline it without dimming
+     the rest -- the admin still needs to see and drive the whole page. */
+  #cropbox.saved { border-color: #7ee787; box-shadow: none; }
+  #croplabel { position: absolute; top: -1.35rem; left: 0; white-space: nowrap;
+               background: #1f1f24; border: 1px solid #44444d; border-radius: 4px;
+               padding: 0 .3rem; font: 11px/1.5 ui-monospace, monospace;
+               color: #e6e6e6; line-height: 1.5; }
+  body.cropping #frame { cursor: crosshair; }
   #status { padding: 0 .8rem .8rem; color: #9a9aa5; font-size: 12px; }
   .err { color: #ff8a80; }
 </style>
@@ -2114,8 +2235,11 @@ _CONTROL_PANEL_HTML = r"""<!doctype html>
   <button data-nav="reload">&#8635;</button>
   <input type="text" id="url" spellcheck="false">
   <button id="go">Go</button>
+  <button id="cropmode" title="Drag a rectangle on the live view to choose the region that gets streamed">Crop</button>
+  <button id="cropapply" hidden>Apply crop</button>
+  <button id="cropclear" hidden>Full screen</button>
 </header>
-<div id="stage"><img id="frame" alt="live view"></div>
+<div id="stage"><div id="shell"><img id="frame" alt="live view"><div id="cropbox"><span id="croplabel"></span></div></div></div>
 <div id="status">Starting session&hellip;</div>
 
 <script>
@@ -2188,7 +2312,128 @@ function send(event) {
     .finally(() => { if (droppable) movePending = false; });
 }
 
+// --- crop selection -------------------------------------------------------
+// The admin drags a rectangle on the live view. That view is a capture of the
+// same X display the encoder records, so the rectangle they draw is literally
+// the region viewers will get -- no separate preview geometry to get wrong.
+// Coordinates go through toPageCoords, the same mapping clicks use, so the
+// selection stays correct at any window size.
+const cropBoxEl = document.getElementById("cropbox");
+const cropLabel = document.getElementById("croplabel");
+const cropModeBtn = document.getElementById("cropmode");
+const cropApplyBtn = document.getElementById("cropapply");
+const cropClearBtn = document.getElementById("cropclear");
+let cropping = false;      // selector armed
+let dragging = null;       // {x, y} anchor in PAGE coords while dragging
+let selection = null;      // {x, y, w, h} in PAGE coords, pending Apply
+let savedCrop = (CFG.crop && CFG.crop.w && CFG.crop.h) ? Object.assign({}, CFG.crop) : null;
+
+// PAGE coords -> CSS pixels within the rendered image.
+function drawBox(box, isSaved) {
+  if (!box) { cropBoxEl.style.display = "none"; return; }
+  const r = frame.getBoundingClientRect();
+  const sx = r.width / PAGE.w, sy = r.height / PAGE.h;
+  cropBoxEl.style.display = "block";
+  cropBoxEl.classList.toggle("saved", !!isSaved);
+  cropBoxEl.style.left = (box.x * sx) + "px";
+  cropBoxEl.style.top = (box.y * sy) + "px";
+  cropBoxEl.style.width = (box.w * sx) + "px";
+  cropBoxEl.style.height = (box.h * sy) + "px";
+  cropLabel.textContent = box.w + "x" + box.h + " @ " + box.x + "," + box.y;
+}
+
+function redrawCrop() {
+  if (selection) drawBox(selection, false);
+  else if (savedCrop) drawBox(savedCrop, true);
+  else drawBox(null);
+}
+
+// The overlay is positioned in CSS pixels, so it has to be recomputed whenever
+// the image is laid out at a different size.
+window.addEventListener("resize", redrawCrop);
+frame.addEventListener("load", redrawCrop);
+
+function setCropMode(on) {
+  cropping = on;
+  document.body.classList.toggle("cropping", on);
+  cropModeBtn.classList.toggle("on", on);
+  cropModeBtn.textContent = on ? "Cancel crop" : "Crop";
+  cropApplyBtn.hidden = !on;
+  cropClearBtn.hidden = !(on || savedCrop);
+  if (!on) { selection = null; dragging = null; }
+  if (on && controlling) setControl(false);   // dragging must not click the page
+  redrawCrop();
+  say(on
+    ? "Drag a rectangle on the view to choose what gets streamed, then Apply crop."
+    : (savedCrop ? "Streaming a " + savedCrop.w + "x" + savedCrop.h + " region."
+                 : "Streaming the whole screen."));
+}
+
+cropModeBtn.addEventListener("click", () => setCropMode(!cropping));
+
+frame.addEventListener("pointerdown", ev => {
+  if (!cropping) return;
+  ev.preventDefault();
+  dragging = toPageCoords(ev);
+  selection = null;
+  frame.setPointerCapture(ev.pointerId);
+});
+
+frame.addEventListener("pointermove", ev => {
+  if (!cropping || !dragging) return;
+  const p = toPageCoords(ev);
+  // Normalised so dragging up or left works as naturally as down or right,
+  // and clamped to the screen so a drag off the edge cannot save an invalid box.
+  const x = Math.max(0, Math.min(dragging.x, p.x));
+  const y = Math.max(0, Math.min(dragging.y, p.y));
+  const w = Math.min(PAGE.w, Math.max(dragging.x, p.x)) - x;
+  const h = Math.min(PAGE.h, Math.max(dragging.y, p.y)) - y;
+  selection = {x: x, y: y, w: w - (w % 2), h: h - (h % 2)};
+  redrawCrop();
+});
+
+frame.addEventListener("pointerup", ev => {
+  if (!cropping || !dragging) return;
+  dragging = null;
+  if (selection && (selection.w < 32 || selection.h < 32)) {
+    selection = null;
+    say("That region is too small - drag at least 32x32 pixels.", true);
+  }
+  redrawCrop();
+});
+
+cropApplyBtn.addEventListener("click", async () => {
+  if (!selection) { say("Drag a rectangle first.", true); return; }
+  try {
+    const res = await post("/crop", selection);
+    savedCrop = res.cropped ? res.crop : null;
+    selection = null;
+    setCropMode(false);
+    say("Now streaming " + res.output.width + "x" + res.output.height
+        + (res.restarted ? " - restarting the session to apply it." : "."));
+  } catch (e) { say("Could not save the crop: " + e.message, true); }
+});
+
+cropClearBtn.addEventListener("click", async () => {
+  try {
+    const res = await post("/crop", {x: 0, y: 0, w: 0, h: 0});
+    savedCrop = null;
+    selection = null;
+    setCropMode(false);
+    say("Streaming the whole " + res.output.width + "x" + res.output.height + " screen"
+        + (res.restarted ? " - restarting the session to apply it." : "."));
+  } catch (e) { say("Could not clear the crop: " + e.message, true); }
+});
+
+// Show an existing crop straight away, and offer "Full screen" without having
+// to arm the selector first.
+cropClearBtn.hidden = !savedCrop;
+redrawCrop();
+
 frame.addEventListener("click", ev => {
+  // While the selector is armed the view is a canvas to draw on, not a page to
+  // drive, so a click must not also reach the browser underneath.
+  if (cropping) { ev.preventDefault(); return; }
   if (!controlling) return;
   ev.preventDefault();
   const p = toPageCoords(ev);
@@ -2240,13 +2485,20 @@ window.addEventListener("keydown", ev => {
   }
 });
 
-toggle.addEventListener("click", () => {
-  controlling = !controlling;
+// A function rather than inline, so the crop selector can drop control when it
+// arms itself: a drag that also clicked through to the page would follow links.
+function setControl(on) {
+  controlling = on;
   toggle.classList.toggle("on", controlling);
   toggle.textContent = controlling ? "Release control" : "Take control";
   say(controlling
     ? "Control is live - clicks, scrolling and typing go to the remote browser."
     : "Viewing only. This is exactly what viewers see.");
+}
+
+toggle.addEventListener("click", () => {
+  if (cropping) setCropMode(false);   // the two modes are mutually exclusive
+  setControl(!controlling);
 });
 
 document.querySelectorAll("[data-nav]").forEach(b => {

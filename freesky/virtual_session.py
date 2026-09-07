@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from typing import Dict, Optional
@@ -57,6 +58,135 @@ HLS_ROOT = os.environ.get("VIRTUAL_HLS_ROOT", "/tmp/freesky-hls")
 # file an flock is held on drops the exclusion silently. /tmp is container-local
 # and cleared on restart, which is exactly the lifetime a runtime lock wants.
 LOCK_ROOT = os.environ.get("VIRTUAL_LOCK_ROOT", "/tmp/freesky-locks")
+
+# Crash-proof breadcrumb trail for session startup.
+#
+# Session start spawns an X server, an audio daemon, a browser and an encoder.
+# When one of those takes the whole backend process down with it -- an OOM kill,
+# a signal, a segfault -- Python never gets to run an `except`, log a traceback,
+# or return a response. The reverse proxy just reports 502 and the log holds
+# nothing, which is exactly the dead end this was written for.
+#
+# So each stage records where it got to BEFORE attempting the next one, and the
+# line is fsync'd so it survives a SIGKILL. Whatever the last line says is the
+# stage that killed the process. Served back by GET /api/virtual-sessions/trace,
+# because on a container you cannot get a shell into, an HTTP endpoint is the
+# only way to read it.
+TRACE_PATH = os.environ.get("VIRTUAL_TRACE_PATH", "/tmp/freesky-virtual-trace.log")
+_TRACE_LIMIT = 400
+
+
+def trace(stage: str, detail: str = "") -> None:
+    """Append one fsync'd breadcrumb. Never raises: diagnostics must not break
+    the thing they are diagnosing."""
+    try:
+        os.makedirs(os.path.dirname(TRACE_PATH) or "/tmp", exist_ok=True)
+        line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {stage}"
+        if detail:
+            line += f" | {detail}"
+        with open(TRACE_PATH, "a") as f:
+            f.write(line + "\n")
+            f.flush()
+            # The whole point: without this the last line before a SIGKILL is
+            # still sitting in the page cache and is lost.
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+
+
+def read_trace(limit: int = _TRACE_LIMIT) -> list:
+    """The most recent breadcrumbs, oldest first."""
+    try:
+        with open(TRACE_PATH, "r") as f:
+            return [ln.rstrip("\n") for ln in f.readlines()[-limit:]]
+    except OSError:
+        return []
+
+
+def _own_orphan(cmdline: str) -> bool:
+    """True if this command line is a virtual-channel process we spawned.
+
+    Deliberately narrow. Each pattern names something only this feature creates,
+    so nothing else in the container can match: the X displays we allocate, an
+    x11grab encoder, our per-channel PulseAudio sink, and a browser opened on one
+    of our profiles.
+    """
+    if not cmdline:
+        return False
+    if cmdline.startswith("Xvfb"):
+        # Only displays from our allocation range.
+        match = re.search(r"Xvfb\s+:(\d+)", cmdline)
+        return bool(match) and int(match.group(1)) >= _DISPLAY_BASE
+    if "x11grab" in cmdline and cmdline.startswith("ffmpeg"):
+        return True
+    if PROFILE_ROOT and f"--user-data-dir={PROFILE_ROOT}" in cmdline:
+        return True
+    if "freesky-" in cmdline and "pulse" in cmdline.lower():
+        return True
+    return False
+
+
+def reap_orphans() -> list:
+    """Kill virtual-channel processes left over from a previous backend.
+
+    This exists because the backend can die *during* session startup -- an OOM
+    kill or a signal gives Python no chance to run `stop()`. The Xvfb, browser
+    and encoder it had already spawned are then orphaned but still RUNNING, and
+    the supervisor restarts only the backend, not the container.
+
+    Without this they accumulate: every failed attempt adds another X server and
+    another browser, memory pressure rises, and the next attempt dies sooner.
+    The feature appears to "stop working permanently" when in fact the container
+    is full of processes nobody owns any more. Only a container restart cleared
+    it, which is not something a stream should ever need.
+
+    Safe to run at startup precisely because the session manager is empty then:
+    any matching process necessarily belongs to a previous life of this backend.
+    Scans /proc rather than shelling out to pkill, so it needs no extra binary
+    and cannot match on a truncated pattern.
+    """
+    killed = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return killed
+    me = os.getpid()
+    for pid in pids:
+        if int(pid) == me:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            continue  # process exited, or not ours to read
+        if not _own_orphan(cmdline):
+            continue
+        try:
+            os.kill(int(pid), signal.SIGKILL)
+            killed.append(f"{pid}: {cmdline[:100]}")
+        except OSError:
+            continue
+    if killed:
+        logger.warning(
+            "virtual: reaped %d orphaned process(es) from a previous backend; "
+            "these accumulate when the backend dies mid-startup", len(killed))
+        trace("reaped", f"{len(killed)} orphan(s)")
+    # Stale X locks belong to the servers we just killed; leaving them behind
+    # makes the next Xvfb refuse its display number.
+    for entry in list(killed):
+        match = re.search(r"Xvfb\s+:(\d+)", entry)
+        if match:
+            with contextlib.suppress(OSError):
+                os.unlink(f"/tmp/.X{match.group(1)}-lock")
+    return killed
+
+
+def reset_trace(name: str) -> None:
+    """Start a fresh trail for one attempt, so the last line is unambiguous."""
+    with contextlib.suppress(OSError):
+        with open(TRACE_PATH, "w") as f:
+            f.write("")
+    trace("attempt", f"channel={name} pid={os.getpid()}")
 
 # X display numbers are allocated from here upward. 99 by convention, and well
 # clear of anything a desktop session would claim.
@@ -368,19 +498,48 @@ class VirtualSession:
         cold start past a minute, which the reverse proxy answered with a 502
         long before the session was ready.
         """
+        # Every stage is recorded before the next is attempted, so a crash that
+        # kills the interpreter still names the stage that did it. See trace().
+        reset_trace(self.name)
+        trace("config", f"display=:{self.display} {self.width}x{self.height} "
+                        f"audio={self.record['audio']} url={self.record['url'][:120]}")
         try:
             # Before anything is spawned: a second process must not get as far
             # as unlinking the X lock or opening the shared Chrome profile.
+            trace("lock:begin")
             self._acquire_channel_lock()
+            trace("lock:ok")
+
+            trace("xvfb:begin")
             await self._start_display()
+            trace("xvfb:ok")
+
             if self.record["audio"]:
+                trace("pulse:begin")
                 await _ensure_pulse()
+                trace("pulse:ok")
+                trace("sink:begin")
                 await self._start_sink()
+                trace("sink:ok")
+
+            trace("browser:begin")
             await self._start_browser()
+            trace("browser:ok")
+
+            trace("ffmpeg:begin")
             await self._start_ffmpeg()
+            trace("ffmpeg:ok")
+
             if wait_for_stream:
+                trace("segments:begin")
                 await self._await_first_segments()
-        except Exception as exc:
+                trace("segments:ok")
+            trace("start:complete")
+        except BaseException as exc:
+            # BaseException, not Exception: asyncio.CancelledError inherits from
+            # BaseException, so a cancelled start would otherwise skip both the
+            # trace line and the teardown, leaking a browser and an X server.
+            trace("start:failed", f"{type(exc).__name__}: {exc}")
             self.error = str(exc)
             logger.error("virtual[%s]: start failed: %s", self.name, exc)
             await self.stop()
@@ -401,7 +560,9 @@ class VirtualSession:
             "-screen", "0", f"{self.width}x{self.height}x24",
             "-ac", "-nolisten", "tcp", "-dpi", "96", "+extension", "RANDR",
         ]
+        trace("xvfb:spawn", " ".join(argv))
         self._xvfb = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        trace("xvfb:spawned", f"pid={self._xvfb.pid}")
 
         # Poll rather than sleep: racing Chromium against a not-yet-listening
         # Xvfb is the single most common cause of flaky startup.
@@ -608,8 +769,10 @@ class VirtualSession:
         # cookies and stored logins that let this channel resume after a restart
         # without an admin signing in again. Only one session per channel ever
         # runs, so there is no contention over it.
+        trace("browser:profile", self.profile_dir)
         os.makedirs(self.profile_dir, exist_ok=True)
         self._seed_profile()
+        trace("browser:profile-ok")
 
         args = self._browser_args()
 
@@ -619,8 +782,11 @@ class VirtualSession:
         # raised before the browser starts. A persistent profile is what we want
         # anyway — it is how a login an admin performs through the control panel
         # survives for the life of the session.
+        trace("browser:playwright-start")
         self._playwright = await async_playwright().start()
+        trace("browser:playwright-ok")
         try:
+            trace("browser:launch", " ".join(args[:6]) + f" ... ({len(args)} args)")
             self._context = await self._playwright.chromium.launch_persistent_context(
                 self.profile_dir,
                 headless=False,
@@ -702,9 +868,25 @@ class VirtualSession:
             "-thread_queue_size", "1024",
             "-f", "x11grab", "-draw_mouse", "0",
             "-framerate", str(fps),
-            "-video_size", f"{self.width}x{self.height}",
-            "-i", f":{self.display}.0",
         ]
+
+        # A crop is applied at the INPUT, via x11grab's own geometry, not with a
+        # -vf crop filter. x11grab then reads only those pixels off the X server
+        # each frame, so a small region is cheaper to capture and cheaper to
+        # encode; a filter would pull the whole screen across and throw most of
+        # it away. The offset is the `+X,Y` suffix on the display specifier.
+        box = virtual_channels.crop_box(record)
+        if box:
+            crop_x, crop_y, crop_w, crop_h = box
+            argv += [
+                "-video_size", f"{crop_w}x{crop_h}",
+                "-i", f":{self.display}.0+{crop_x},{crop_y}",
+            ]
+        else:
+            argv += [
+                "-video_size", f"{self.width}x{self.height}",
+                "-i", f":{self.display}.0",
+            ]
         if record["audio"]:
             argv += [
                 "-thread_queue_size", "1024",

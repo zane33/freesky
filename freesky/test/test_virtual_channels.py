@@ -957,3 +957,257 @@ def test_start_sh_clamps_multiple_workers():
     clamp = body.split('if [ "$WORKERS" != "1" ]; then', 1)[1].split(
         'export GRANIAN_WORKERS', 1)[0]
     assert "WORKERS=1" in clamp
+
+
+# --- cropping ---------------------------------------------------------------
+
+
+def _rec(**kw):
+    base = {"name": "c", "url": "https://e.com", "resolution": "720p"}
+    base.update(kw)
+    return virtual_channels.validate_channel(base)
+
+
+def test_no_crop_by_default_streams_the_whole_screen():
+    record = _rec()
+    assert virtual_channels.crop_box(record) is None
+    assert virtual_channels.output_size(record) == virtual_channels.geometry(record)
+    assert (record["crop_x"], record["crop_y"], record["crop_w"], record["crop_h"]) == (0, 0, 0, 0)
+
+
+def test_crop_dimensions_are_forced_even():
+    """H.264 with yuv420p rejects odd dimensions outright."""
+    record = _rec(crop_x=100, crop_y=50, crop_w=641, crop_h=361)
+    assert (record["crop_w"], record["crop_h"]) == (640, 360)
+    assert virtual_channels.output_size(record) == (640, 360)
+
+
+def test_crop_outside_the_screen_is_rejected():
+    with pytest.raises(virtual_channels.VirtualChannelError) as exc:
+        _rec(crop_x=1000, crop_y=0, crop_w=400, crop_h=400)
+    assert "outside" in str(exc.value)
+
+
+def test_crop_needs_both_width_and_height():
+    with pytest.raises(virtual_channels.VirtualChannelError):
+        _rec(crop_w=400)
+    with pytest.raises(virtual_channels.VirtualChannelError):
+        _rec(crop_h=400)
+
+
+def test_crop_below_minimum_is_rejected():
+    with pytest.raises(virtual_channels.VirtualChannelError) as exc:
+        _rec(crop_x=0, crop_y=0, crop_w=10, crop_h=10)
+    assert str(virtual_channels.MIN_CROP) in str(exc.value)
+
+
+def test_crop_exactly_filling_the_screen_is_allowed():
+    record = _rec(crop_x=0, crop_y=0, crop_w=1280, crop_h=720)
+    assert virtual_channels.output_size(record) == (1280, 720)
+
+
+def test_crop_is_applied_to_the_x11grab_input_not_a_filter():
+    """Grabbing the region directly is cheaper than grabbing all and cropping."""
+    record = _rec(crop_x=100, crop_y=50, crop_w=640, crop_h=360)
+    argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
+    i = argv.index("-video_size")
+    assert argv[i + 1] == "640x360"
+    assert argv[i + 2] == "-i"
+    assert argv[i + 3] == ":99.0+100,50"
+    # A -vf crop would mean the whole screen was read and thrown away.
+    assert "crop=" not in " ".join(argv)
+
+
+def test_uncropped_session_grabs_the_whole_display():
+    record = _rec()
+    argv = virtual_session.VirtualSession(record, 99)._ffmpeg_argv()
+    i = argv.index("-video_size")
+    assert argv[i + 1] == "1280x720"
+    assert argv[i + 3] == ":99.0"
+
+
+def test_changing_the_crop_requires_a_restart():
+    """The crop is baked into ffmpeg's input geometry."""
+    old = _rec()
+    new = _rec(crop_x=0, crop_y=0, crop_w=640, crop_h=360)
+    assert virtual_channels.needs_restart(old, new)
+    assert not virtual_channels.needs_restart(new, dict(new))
+
+
+def test_crop_survives_a_round_trip_through_validate():
+    """Records are re-validated on every read from disk."""
+    once = _rec(crop_x=12, crop_y=34, crop_w=200, crop_h=100)
+    twice = virtual_channels.validate_channel(once)
+    assert virtual_channels.crop_box(twice) == (12, 34, 200, 100)
+
+
+def test_crop_is_validated_against_the_channels_own_resolution():
+    """A crop that fits 1080p must not be accepted on a 720p channel."""
+    big = virtual_channels.validate_channel(
+        {"name": "c", "url": "https://e.com", "resolution": "1080p",
+         "crop_x": 0, "crop_y": 0, "crop_w": 1600, "crop_h": 900})
+    assert virtual_channels.output_size(big) == (1600, 900)
+    with pytest.raises(virtual_channels.VirtualChannelError):
+        virtual_channels.validate_channel(
+            {"name": "c", "url": "https://e.com", "resolution": "720p",
+             "crop_x": 0, "crop_y": 0, "crop_w": 1600, "crop_h": 900})
+
+
+def test_crop_endpoint_saves_and_reports_output_size(client):
+    virtual_channels.upsert_channel({"name": "cam", "url": "https://e.com"})
+    res = client.post("/api/virtual-control/cam/crop",
+                      json={"x": 40, "y": 20, "w": 800, "h": 450})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["cropped"] is True
+    assert body["crop"] == {"x": 40, "y": 20, "w": 800, "h": 450}
+    assert body["output"] == {"width": 800, "height": 450}
+    assert virtual_channels.crop_box(virtual_channels.get_channel("cam")) == (40, 20, 800, 450)
+
+
+def test_crop_endpoint_clears_with_zeros(client):
+    virtual_channels.upsert_channel(
+        {"name": "cam", "url": "https://e.com", "crop_x": 0, "crop_y": 0,
+         "crop_w": 800, "crop_h": 450})
+    res = client.post("/api/virtual-control/cam/crop", json={"x": 0, "y": 0, "w": 0, "h": 0})
+    assert res.status_code == 200, res.text
+    assert res.json()["cropped"] is False
+    assert res.json()["output"] == {"width": 1280, "height": 720}
+    assert virtual_channels.crop_box(virtual_channels.get_channel("cam")) is None
+
+
+def test_crop_endpoint_rejects_an_out_of_bounds_region(client):
+    """A bad drag is the admin's mistake, so it must read as 400, not 500."""
+    virtual_channels.upsert_channel({"name": "cam", "url": "https://e.com"})
+    res = client.post("/api/virtual-control/cam/crop",
+                      json={"x": 1200, "y": 0, "w": 400, "h": 400})
+    assert res.status_code == 400
+    assert "outside" in res.json()["message"]
+    # Nothing may be committed when validation fails.
+    assert virtual_channels.crop_box(virtual_channels.get_channel("cam")) is None
+
+
+def test_crop_endpoint_404s_for_an_unknown_channel(client):
+    res = client.post("/api/virtual-control/nope/crop", json={"x": 0, "y": 0, "w": 0, "h": 0})
+    assert res.status_code == 404
+
+
+def test_settings_save_preserves_a_crop_set_from_the_panel():
+    """The settings form has no crop fields, so it must carry them across.
+
+    Without this, saving any unrelated field in Settings reset the streamed
+    region to the whole screen.
+    """
+    source = _repo_file(os.path.join("freesky", "pages", "settings.py"))
+    body = source.split("def save_vc", 1)[1].split("\n    def ", 1)[0]
+    assert 'for field in ("crop_x", "crop_y", "crop_w", "crop_h")' in body, (
+        "save_vc must copy the crop from the previous record"
+    )
+    assert "previous" in body
+
+
+def test_control_panel_exposes_crop_controls(client):
+    """The panel is the only place a crop can be drawn, so it must ship the UI."""
+    virtual_channels.upsert_channel({"name": "cam", "url": "https://e.com"})
+    res = client.get("/api/virtual-control/cam/panel")
+    assert res.status_code == 200
+    html = res.text
+    for marker in ('id="cropmode"', 'id="cropapply"', 'id="cropclear"',
+                   'id="cropbox"', '"/crop"'):
+        assert marker in html, f"panel is missing {marker}"
+    # The current crop must reach the page so it can be drawn on load.
+    assert '"crop"' in html
+
+
+def test_control_panel_javascript_parses():
+    """The panel is one big inline script; a syntax error blanks the whole page.
+
+    Skipped when node is unavailable rather than silently passing.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    node = _shutil.which("node")
+    if node is None:
+        pytest.skip("node not available to parse the panel script")
+
+    from freesky import backend
+
+    html = backend._CONTROL_PANEL_HTML.replace("__CONFIG__", json.dumps({
+        "name": "c", "title": "t", "token": "", "width": 1280, "height": 720,
+        "url": "https://e.com", "crop": {"x": 0, "y": 0, "w": 0, "h": 0},
+    }))
+    scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
+    assert scripts, "panel has no inline script"
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+        f.write("\n".join(scripts))
+        path = f.name
+    try:
+        proc = _subprocess.run([node, "--check", path], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+    finally:
+        os.unlink(path)
+
+
+# --- crash-proof startup trace and orphan reaping ---------------------------
+
+
+def test_trace_survives_and_reports_the_last_stage(tmp_path, monkeypatch):
+    monkeypatch.setattr(virtual_session, "TRACE_PATH", str(tmp_path / "t.log"))
+    virtual_session.reset_trace("cam")
+    virtual_session.trace("xvfb:begin")
+    virtual_session.trace("xvfb:ok", "pid=123")
+    lines = virtual_session.read_trace()
+    assert "attempt" in lines[0] and "channel=cam" in lines[0]
+    assert lines[-1].endswith("pid=123")
+    # A fresh attempt must not leave the previous trail behind, or the last
+    # line would name a stage from an older run.
+    virtual_session.reset_trace("cam")
+    assert len(virtual_session.read_trace()) == 1
+
+
+def test_trace_never_raises_on_a_bad_path(monkeypatch):
+    """Diagnostics must not break the thing they diagnose."""
+    monkeypatch.setattr(virtual_session, "TRACE_PATH", "/proc/cannot/write/here.log")
+    virtual_session.trace("x")          # must not raise
+    assert virtual_session.read_trace() == []
+
+
+def test_trace_endpoint_reports_the_last_stage(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(virtual_session, "TRACE_PATH", str(tmp_path / "t.log"))
+    virtual_session.reset_trace("cam")
+    virtual_session.trace("browser:begin")
+    res = client.get("/api/virtual-sessions/trace")
+    assert res.status_code == 200
+    body = res.json()
+    assert "browser:begin" in body["last_stage"]
+    assert body["complete"] is False
+
+
+@pytest.mark.parametrize("cmdline,expected", [
+    ("Xvfb :99 -screen 0 1280x720x24", True),
+    ("Xvfb :0 -screen 0 1280x720x24", False),          # a real desktop, not ours
+    ("ffmpeg -f x11grab -i :99.0 out.ts", True),
+    ("ffmpeg -i movie.mp4 out.ts", False),             # unrelated ffmpeg
+    ("/usr/bin/python3 manage.py", False),
+    ("", False),
+])
+def test_orphan_matcher_is_narrow(cmdline, expected):
+    """It sends SIGKILL, so it must only ever match what this feature creates."""
+    assert virtual_session._own_orphan(cmdline) is expected
+
+
+def test_orphan_matcher_matches_our_browser_profiles(monkeypatch):
+    monkeypatch.setattr(virtual_session, "PROFILE_ROOT", "/app/data/virtual-profiles")
+    assert virtual_session._own_orphan(
+        "chrome --user-data-dir=/app/data/virtual-profiles/cam --no-sandbox")
+    assert not virtual_session._own_orphan(
+        "chrome --user-data-dir=/home/someone/.config/google-chrome")
+
+
+def test_reap_orphans_does_not_kill_this_process():
+    """A matcher bug here would take the backend down on every boot."""
+    killed = virtual_session.reap_orphans()
+    assert isinstance(killed, list)
+    # Still running, which is the assertion that matters.
+    assert os.getpid() > 0
