@@ -50,6 +50,17 @@ ENV PORT=${PORT:-3000} \
 # Initialize Reflex and build frontend
 # ponytail: no `|| minimal frontend` fallback. It swallowed the real rolldown
 # error and shipped a "successful" image serving a 152-byte stub. Fail loudly.
+# Build the frontend with npm, not bun.
+#
+# REFLEX_USE_NPM makes `reflex init`/`reflex export` skip downloading bun at
+# build time. That download (and Reflex's default npmmirror.com registry probe)
+# are network calls made before any of our own npm config applies, so on a
+# restricted or proxied network they fail and take the whole image build with
+# them. Node 22 and npm are already installed above, so bun buys nothing here
+# and only adds a failure mode.
+ENV REFLEX_USE_NPM=1 \
+    NPM_CONFIG_REGISTRY=https://registry.npmjs.org/
+
 # Each stage announces itself before it runs, so a failure names the step that
 # broke instead of reporting one exit code for the whole chain. `set -e` keeps
 # the original fail-loudly behaviour -- there is deliberately no fallback that
@@ -61,13 +72,14 @@ RUN set -e; \
     echo "node:   $(node --version)"; \
     echo "npm:    $(npm --version)"; \
     mkdir -p /srv; \
-    cd /app; \
-    echo "=== [2/5] reflex init ==="; \
-    reflex init; \
-    echo "=== [3/5] npm install ==="; \
-    cd .web; \
+    echo "=== [2/5] npm config (BEFORE reflex init, which resolves packages) ==="; \
     npm config set strict-ssl false; \
     npm config set registry https://registry.npmjs.org/; \
+    npm config get registry; \
+    cd /app; \
+    echo "=== [3/5] reflex init + npm install ==="; \
+    reflex init; \
+    cd .web; \
     npm install --legacy-peer-deps; \
     cd ..; \
     echo "=== [4/5] reflex export (bundling) ==="; \
