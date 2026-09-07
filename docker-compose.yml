@@ -96,11 +96,18 @@ services:
       - XDG_DATA_HOME=/app/data
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
       - SOCKS5=${SOCKS5:-}
-      # One async worker. Multiple granian workers each hold a DIFFERENT in-memory
+      # One async worker. start.sh exports this as GRANIAN_WORKERS, which is the
+      # only name reflex actually reads -- setting WORKERS alone did nothing, and
+      # reflex then defaulted to `(cpu_count * 2) + 1` workers because it could
+      # ping the Redis that start.sh launches.
+      #
+      # Keep this at 1. Multiple granian workers each hold a DIFFERENT in-memory
       # encryption key (utils.py key_bytes = os.urandom at import), so a content
-      # URL minted by one worker fails to decrypt on another; granian was also
-      # cycling worker-1 every ~15s, dropping in-flight streams. A single worker is
-      # I/O-bound and fine for this load, and sidesteps both.
+      # URL minted by one worker fails to decrypt on another. Worse, each worker
+      # gets its own virtual_session.manager and its own autostart task, so every
+      # worker raced to start the same virtual channel on the same X display and
+      # the same Chrome profile -- which killed workers and surfaced as
+      # intermittent 502s from the control panel.
       - WORKERS=${WORKERS:-1}
       - MAX_CONCURRENT_STREAMS=${MAX_CONCURRENT_STREAMS:-5}  # Reduced from 10 to 5
       

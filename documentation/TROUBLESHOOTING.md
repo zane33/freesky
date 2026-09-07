@@ -108,7 +108,7 @@ DADDYLIVE_URI=https://thedaddy.click
 SOCKS5=
 PROXY_CONTENT=TRUE
 PORT=3000
-WORKERS=4
+WORKERS=1
 BACKEND_PORT=8005
 WEBSOCKET_URL=ws://localhost:8005
 REFLEX_ENV=prod
@@ -231,4 +231,38 @@ first segments, which can take ~45s.
 
 **Solutions**: request the channel once in a browser to warm it, lower
 **Warm-up seconds**, or raise the player's own timeout. Caddy's `@api_virtual`
-block already allows 60s.
+block already allows 180s.
+
+### Control panel returns 502 and the backend looks like it never starts
+
+**Symptom**: `POST /api/virtual-control/<name>/start` returns HTTP 502 with an
+empty body after ~2s, while `/health`, `/api/virtual-sessions/status` and the
+panel HTML itself all return 200. Polling `/health` every 100ms during the
+request shows it flipping 200 -> 502 -> 200, sometimes twice, and occasionally
+hanging instead of refusing.
+
+**Cause**: more than one backend worker process. `reflex run` does not read
+`WORKERS`; it reads `GRANIAN_WORKERS`, and
+`reflex.utils.processes.get_num_workers()` returns `(os.cpu_count() * 2) + 1`
+as soon as it can ping Redis -- which `start.sh` starts. An 8-core host
+therefore ran 17 backends instead of 1.
+
+That is merely wasteful for a stateless proxy, but fatal for virtual channels.
+Each worker imports the app separately, so each has its **own**
+`virtual_session.manager`, its own display counter starting at `:99`, and its
+own copy of the autostart lifespan task. Every worker raced to start the same
+channel: unlinking each other's `/tmp/.X99-lock`, launching competing Xvfb
+servers on one display, opening the single persistent Chrome profile N times,
+and pointing several encoders at one playlist. Workers died; granian's shared
+listener then answered some connections with a reset, which Caddy reported as
+502 while other requests were still served normally by surviving workers.
+
+**Fix**: run exactly one worker. `start.sh` now does
+`export GRANIAN_WORKERS="$WORKERS"` with `WORKERS` defaulting to 1, and
+`VirtualSession` takes an exclusive `flock` per channel under
+`VIRTUAL_LOCK_ROOT` so a second process fails fast with a clear message
+instead of corrupting the profile.
+
+**Do not raise `WORKERS`** while virtual channels are in use. A single async
+worker is I/O-bound and ample for this load. It is also required for
+`/api/content` URLs, which are encrypted with a per-process key.

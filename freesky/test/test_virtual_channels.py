@@ -11,6 +11,7 @@ and whether its output is served safely.
 """
 import json
 import os
+import re
 import tempfile
 import time
 
@@ -828,3 +829,131 @@ def test_playlist_freshness_still_governs_a_warm_session(tmp_path):
     os.utime(session.playlist_path, (stale, stale))
     assert not session.is_alive()
 
+
+
+# --- single-worker enforcement ---------------------------------------------
+#
+# These cover the bug that made the control panel return 502 and the backend
+# look like it would not start: reflex ran granian with `(cpu_count * 2) + 1`
+# worker processes, because start.sh brings up Redis and
+# reflex.utils.processes.get_num_workers() scales with cpu_count as soon as it
+# can ping it. WORKERS was never read by anything. Every worker then ran the
+# autostart lifespan task against the same display, profile and playlist.
+
+
+def _start_sh() -> str:
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    with open(os.path.join(here, "start.sh")) as f:
+        return f.read()
+
+
+def test_start_sh_exports_granian_workers():
+    """GRANIAN_WORKERS is the only worker knob reflex actually reads."""
+    body = _start_sh()
+    assert 'export GRANIAN_WORKERS="$WORKERS"' in body, (
+        "start.sh must export GRANIAN_WORKERS; setting WORKERS alone is ignored "
+        "by reflex and it falls back to (cpu_count * 2) + 1 workers."
+    )
+
+
+def test_start_sh_defaults_to_one_worker():
+    """A default above 1 reintroduces the multi-process race."""
+    body = _start_sh()
+    assert "WORKERS=${WORKERS:-1}" in body, (
+        "start.sh must default to a single worker: virtual channels keep "
+        "per-process state (manager, display counter, autostart task)."
+    )
+
+
+def test_channel_lock_is_exclusive_across_processes(tmp_path, monkeypatch):
+    """A second holder of the same channel is refused, not silently allowed."""
+    monkeypatch.setattr(virtual_session, "LOCK_ROOT", str(tmp_path / "locks"))
+    record = virtual_channels.validate_channel({"name": "dup", "url": "https://e.com"})
+
+    first = virtual_session.VirtualSession(record, 99)
+    first._acquire_channel_lock()
+    try:
+        second = virtual_session.VirtualSession(record, 100)
+        with pytest.raises(virtual_session.VirtualSessionError) as exc:
+            second._acquire_channel_lock()
+        assert "already running" in str(exc.value)
+        # The loser must not hold an fd it will later unlock out from under the
+        # winner -- that would make the guard worse than none at all.
+        assert second._lock_fd is None
+    finally:
+        first._release_channel_lock()
+
+    # Once released, the channel can be claimed again.
+    third = virtual_session.VirtualSession(record, 101)
+    third._acquire_channel_lock()
+    third._release_channel_lock()
+
+
+def test_channel_lock_is_per_channel(tmp_path, monkeypatch):
+    """Different channels must not block each other."""
+    monkeypatch.setattr(virtual_session, "LOCK_ROOT", str(tmp_path / "locks"))
+    a = virtual_session.VirtualSession(
+        virtual_channels.validate_channel({"name": "a", "url": "https://e.com"}), 99)
+    b = virtual_session.VirtualSession(
+        virtual_channels.validate_channel({"name": "b", "url": "https://e.com"}), 100)
+    a._acquire_channel_lock()
+    b._acquire_channel_lock()
+    a._release_channel_lock()
+    b._release_channel_lock()
+
+
+def test_release_channel_lock_is_safe_without_one(tmp_path, monkeypatch):
+    """stop() runs on half-built sessions, including ones that never locked."""
+    monkeypatch.setattr(virtual_session, "LOCK_ROOT", str(tmp_path / "locks"))
+    session = virtual_session.VirtualSession(
+        virtual_channels.validate_channel({"name": "n", "url": "https://e.com"}), 99)
+    session._release_channel_lock()
+    session._release_channel_lock()
+
+
+def test_lock_root_is_not_inside_hls_root():
+    """stop() rmtree's the HLS dir; a lock file under it would vanish."""
+    assert not virtual_session.LOCK_ROOT.startswith(
+        virtual_session.HLS_ROOT.rstrip("/") + "/")
+
+
+def _repo_file(name: str) -> str:
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    with open(os.path.join(here, name)) as f:
+        return f.read()
+
+
+def test_env_file_does_not_request_multiple_workers():
+    """.env feeds compose's ${WORKERS:-1}, so a value here overrides the default.
+
+    This is not hypothetical: .env carried WORKERS=4, which silently beat the
+    single-worker default in docker-compose.yml and start.sh.
+    """
+    body = _repo_file(".env")
+    values = re.findall(r"^WORKERS=(\S+)", body, re.MULTILINE)
+    assert values == ["1"], f"expected .env to pin WORKERS=1, found {values}"
+
+
+def test_compose_defaults_to_one_worker():
+    body = _repo_file("docker-compose.yml")
+    assert "WORKERS=${WORKERS:-1}" in body
+
+
+def test_start_sh_clamps_multiple_workers():
+    """A stray WORKERS value must not silently restore the broken config.
+
+    Defaulting was not enough: docker-compose.yml and start.sh both already
+    defaulted to 1, and `WORKERS=4` in .env still won, because compose's
+    ${WORKERS:-1} only applies when the variable is unset.
+    """
+    body = _start_sh()
+    assert 'if [ "$WORKERS" != "1" ]; then' in body
+    assert "ALLOW_MULTIPLE_WORKERS" in body, (
+        "an explicit override must exist so the clamp is documented, not magic"
+    )
+    # The clamp has to assign, not merely warn.
+    # Bounded by the export, not by "fi" -- "fi" also occurs inside the word
+    # "configuration" in the warning text.
+    clamp = body.split('if [ "$WORKERS" != "1" ]; then', 1)[1].split(
+        'export GRANIAN_WORKERS', 1)[0]
+    assert "WORKERS=1" in clamp

@@ -139,7 +139,7 @@ services:
       - DADDYLIVE_URI=${DADDYLIVE_URI:-https://thedaddy.click}
       - PROXY_CONTENT=${PROXY_CONTENT:-TRUE}
       - SOCKS5=${SOCKS5:-}
-      - WORKERS=${WORKERS:-3}  # Backend worker processes
+      - WORKERS=${WORKERS:-1}  # Backend worker processes (see note below: keep at 1)
       - MAX_CONCURRENT_STREAMS=${MAX_CONCURRENT_STREAMS:-10}  # Concurrent streaming limit
       - REFLEX_ENV=prod
       - REFLEX_SKIP_COMPILE=1
@@ -175,7 +175,7 @@ freesky provides comprehensive configuration through environment variables, allo
 
 | Variable | Default | Description | Recommendations |
 |----------|---------|-------------|-----------------|
-| `WORKERS` | `3` | Number of backend worker processes | `1-2` for small deployments<br>`3-6` for medium traffic<br>`6-12` for high traffic |
+| `WORKERS` | `1` | Backend worker processes (exported by start.sh as `GRANIAN_WORKERS`, the only name reflex reads) | **Leave at 1.** The backend is async and I/O-bound. Extra workers each get their own encryption key (breaking `/api/content` URLs) and their own virtual-channel manager, display counter and autostart task, which makes several processes fight over one X display and one Chrome profile |
 | `MAX_CONCURRENT_STREAMS` | `10` | Maximum concurrent streaming connections | `5-10` for basic use<br>`15-25` for medium traffic<br>`50+` for high-capacity servers |
 
 ### 📺 Content Configuration
@@ -200,7 +200,7 @@ freesky provides comprehensive configuration through environment variables, allo
 # Simple home deployment
 PORT=3000
 BACKEND_PORT=8005
-WORKERS=2
+WORKERS=1
 MAX_CONCURRENT_STREAMS=5
 PROXY_CONTENT=TRUE
 ```
@@ -210,7 +210,7 @@ PROXY_CONTENT=TRUE
 # Office or small business
 PORT=3000
 BACKEND_PORT=8005
-WORKERS=4
+WORKERS=1
 MAX_CONCURRENT_STREAMS=20
 PROXY_CONTENT=TRUE
 API_URL=https://tv.yourdomain.com
@@ -221,7 +221,7 @@ API_URL=https://tv.yourdomain.com
 # Large-scale deployment
 PORT=3000
 BACKEND_PORT=8005
-WORKERS=8
+WORKERS=1
 MAX_CONCURRENT_STREAMS=50
 PROXY_CONTENT=FALSE  # Direct streaming for lower server load
 API_URL=https://iptv.yourdomain.com
@@ -249,7 +249,7 @@ Create a `.env` file in your project root:
 cat > .env << EOF
 PORT=3000
 BACKEND_PORT=8005
-WORKERS=4
+WORKERS=1
 MAX_CONCURRENT_STREAMS=15
 PROXY_CONTENT=TRUE
 DADDYLIVE_URI=https://thedaddy.click

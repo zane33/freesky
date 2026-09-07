@@ -25,7 +25,7 @@ PORT=3000
 BACKEND_PORT=8005
 DADDYLIVE_URI=https://thedaddy.click
 PROXY_CONTENT=TRUE
-WORKERS=3
+WORKERS=1
 ```
 
 ### 2. For Docker Compose (Manual Deployment)
@@ -118,7 +118,7 @@ services:
       - BACKEND_PORT=8005
       - DADDYLIVE_URI=https://thedaddy.click
       - PROXY_CONTENT=TRUE
-      - WORKERS=3
+      - WORKERS=1
       - REFLEX_ENV=prod
       - REFLEX_SKIP_COMPILE=1
     restart: unless-stopped
@@ -146,7 +146,10 @@ networks:
 
 ## Performance Optimization
 
-- Set `WORKERS=3` or higher for better concurrent performance
+- Leave `WORKERS=1`. The backend is async, so extra worker processes add no
+  throughput here and break both `/api/content` URLs (per-process encryption
+  key) and virtual channels (per-process session manager). See
+  [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - "Control panel returns 502".
 - Use `PROXY_CONTENT=TRUE` for better stream reliability
-- Monitor resource usage and adjust worker count accordingly
+- Monitor resource usage; scale CPU and memory rather than worker count
 - Consider using a CDN for static assets in high-traffic scenarios 

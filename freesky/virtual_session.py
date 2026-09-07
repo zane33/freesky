@@ -34,6 +34,7 @@ an install that never uses the feature is one import.
 """
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -50,6 +51,12 @@ logger = logging.getLogger(__name__)
 # Where HLS segments are written. Should be a tmpfs: segments are write-heavy,
 # live for seconds, and are never worth touching disk.
 HLS_ROOT = os.environ.get("VIRTUAL_HLS_ROOT", "/tmp/freesky-hls")
+
+# Per-channel flock files (see VirtualSession._acquire_channel_lock). Kept out of
+# HLS_ROOT because stop() rmtree's a channel's HLS directory, and deleting the
+# file an flock is held on drops the exclusion silently. /tmp is container-local
+# and cleared on restart, which is exactly the lifetime a runtime lock wants.
+LOCK_ROOT = os.environ.get("VIRTUAL_LOCK_ROOT", "/tmp/freesky-locks")
 
 # X display numbers are allocated from here upward. 99 by convention, and well
 # clear of anything a desktop session would claim.
@@ -302,6 +309,53 @@ class VirtualSession:
         # Serialises page operations. Playwright's API is not safe against two
         # coroutines driving the same page at once.
         self._page_lock = asyncio.Lock()
+        # Cross-PROCESS guard; see _acquire_channel_lock().
+        self._lock_fd: Optional[int] = None
+
+    # -- cross-process exclusion ---------------------------------------------
+
+    def _acquire_channel_lock(self) -> None:
+        """Claim this channel for this process, or refuse to start.
+
+        _page_lock only orders coroutines inside one interpreter, and `manager`
+        is a per-process singleton, so nothing above this stops two BACKEND
+        PROCESSES from starting the same channel. That is not a theoretical
+        race: reflex runs granian with `(cpu_count * 2) + 1` workers whenever it
+        can reach Redis, and every one of them ran the autostart lifespan task.
+        The result was competing Xvfb servers on the same display, N Chromiums
+        sharing one persistent profile, and two encoders writing one playlist.
+
+        An flock on a file keyed by channel name makes that impossible to do
+        silently: the second process fails fast with a message naming the cause
+        instead of corrupting the profile. The lock is advisory and held by an
+        open fd, so it is released automatically if the process dies -- a stale
+        lock cannot outlive a crash the way a lock *file* would.
+        """
+        os.makedirs(LOCK_ROOT, exist_ok=True)
+        path = os.path.join(LOCK_ROOT, f"{self.name}.lock")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise VirtualSessionError(
+                f"Another process is already running virtual channel '{self.name}'. "
+                "Run the backend with a single worker (GRANIAN_WORKERS=1)."
+            ) from None
+        with contextlib.suppress(OSError):
+            os.truncate(fd, 0)
+            os.write(fd, str(os.getpid()).encode())
+        self._lock_fd = fd
+
+    def _release_channel_lock(self) -> None:
+        """Drop the channel lock. Safe on a session that never took one."""
+        if self._lock_fd is None:
+            return
+        with contextlib.suppress(OSError):
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(self._lock_fd)
+        self._lock_fd = None
 
     # -- lifecycle --
 
@@ -315,6 +369,9 @@ class VirtualSession:
         long before the session was ready.
         """
         try:
+            # Before anything is spawned: a second process must not get as far
+            # as unlinking the X lock or opening the shared Chrome profile.
+            self._acquire_channel_lock()
             await self._start_display()
             if self.record["audio"]:
                 await _ensure_pulse()
@@ -717,6 +774,13 @@ class VirtualSession:
         return argv
 
     async def _start_ffmpeg(self) -> None:
+        # Warm the ffmpeg version probe OFF the event loop. It shells out with a
+        # 10s timeout and _ffmpeg_argv() calls it synchronously, so on the first
+        # session after a restart it would otherwise stall the whole server --
+        # every other request, /health included, just hangs. It caches on the
+        # function, so this costs nothing on later starts.
+        await asyncio.to_thread(_ffmpeg_supports_fps_mode)
+
         # Wipe first, not just on teardown: append_list will happily resume onto
         # a playlist left behind by a crashed run and reference segments that no
         # longer exist.
@@ -843,8 +907,11 @@ class VirtualSession:
 
         if self._xvfb is not None and self._xvfb.poll() is None:
             self._xvfb.terminate()
+            # In a thread: Popen.wait() is synchronous, and blocking the loop for
+            # up to 5s here stalls every other request in this process while a
+            # session is torn down.
             with contextlib.suppress(subprocess.TimeoutExpired):
-                self._xvfb.wait(timeout=5)
+                await asyncio.to_thread(self._xvfb.wait, 5)
             if self._xvfb.poll() is None:
                 self._xvfb.kill()
         self._xvfb = None
@@ -852,6 +919,11 @@ class VirtualSession:
         # The profile deliberately survives: it is what makes the channel come
         # back signed in. Only the HLS output is transient.
         shutil.rmtree(self.out_dir, ignore_errors=True)
+
+        # Released last, so the channel stays claimed until every process it
+        # owned is gone. Releasing earlier would let another starter race this
+        # teardown for the same display and profile.
+        self._release_channel_lock()
 
     # -- interactive control --------------------------------------------
     # The admin panel drives the live page: a stream of screenshots out, mouse

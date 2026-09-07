@@ -170,11 +170,54 @@ until redis-cli ping &>/dev/null; do
 done
 echo "Redis started successfully"
 
-# Get number of workers from environment or use default
-WORKERS=${WORKERS:-6}
+# Number of granian worker PROCESSES.
+#
+# This MUST be exported as GRANIAN_WORKERS. Setting only WORKERS did nothing:
+# `reflex run` never reads it, and reflex.utils.processes.get_num_workers()
+# returns `(os.cpu_count() or 1) * 2 + 1` as soon as it can ping Redis -- which
+# it always can, because this script starts Redis a few lines above. On an
+# 8-core host that silently produced 17 backend processes instead of the one
+# configured here.
+#
+# For virtual channels that was fatal, not merely wasteful. Each worker imports
+# the app afresh, so each gets its OWN virtual_session.manager, its own display
+# counter starting at :99, and its own copy of the autostart lifespan task. Every
+# worker therefore tried to start the SAME channel: unlinking each other's
+# /tmp/.X99-lock, launching competing Xvfb servers on :99, and opening the one
+# persistent Chrome profile N times over. Workers died, granian's shared listener
+# then answered some connections with RST, and Caddy turned those into the
+# intermittent 502s that made the backend look like it would not start.
+#
+# One worker is also still the right answer for the original reason recorded in
+# docker-compose.yml: utils.py mints an in-memory encryption key per process, so
+# a content URL issued by one worker cannot be decrypted by another.
+WORKERS=${WORKERS:-1}
+
+# Clamped, not merely defaulted. The default was already 1 in docker-compose.yml
+# and this file, and a stray `WORKERS=4` left in .env still beat both of them --
+# compose interpolates ${WORKERS:-1} from .env, and `:-` only applies when the
+# variable is UNSET. That one line silently restored the multi-process failure.
+#
+# More than one worker is not a supported tuning knob here, it is a broken
+# configuration: /api/content URLs are encrypted with a per-process key, and each
+# worker gets its own virtual-channel session manager, display counter and
+# autostart task. Refuse it loudly rather than starting something that half works.
+if [ "$WORKERS" != "1" ]; then
+    echo "[$(date -Is)] WARNING: WORKERS=$WORKERS is not a supported configuration."
+    echo "  The backend is async and I/O-bound; extra worker PROCESSES break"
+    echo "  /api/content URLs (per-process encryption key) and virtual channels"
+    echo "  (per-process session manager, display counter and autostart task)."
+    if [ "${ALLOW_MULTIPLE_WORKERS:-false}" = "true" ]; then
+        echo "  ALLOW_MULTIPLE_WORKERS=true is set -- honouring $WORKERS anyway."
+    else
+        echo "  Clamping to 1. Set ALLOW_MULTIPLE_WORKERS=true to override."
+        WORKERS=1
+    fi
+fi
+export GRANIAN_WORKERS="$WORKERS"
 # Get backend port from environment or use default
 BACKEND_PORT=${BACKEND_PORT:-8005}
-echo "Starting Reflex backend with $WORKERS workers on port $BACKEND_PORT..."
+echo "Starting Reflex backend with $WORKERS granian worker(s) on port $BACKEND_PORT..."
 
 # Start the Reflex backend (which includes the FastAPI backend via api_transformer)
 #
@@ -199,6 +242,16 @@ backend_supervisor() {
             echo "  Exit ${code} means the process was killed (137 = SIGKILL, usually the"
             echo "  OOM-killer). Check the container memory limit and how many virtual"
             echo "  channels are running -- a 1080p session costs roughly 1.6GB."
+        elif [ "$code" -eq 0 ]; then
+            # Do not read this as a clean shutdown. Granian is configured with
+            # respawn_failed_workers=False (its default; reflex never overrides
+            # it), so when ANY worker dies -- including by SIGKILL -- the master
+            # tears down the remaining workers and exits 0. The kill is therefore
+            # invisible in this exit code; granian logs the real cause just above
+            # as "[ERROR] Unexpected exit from worker-N".
+            echo "  Exit 0 here is not necessarily a clean stop: granian also exits 0"
+            echo "  after a worker dies unexpectedly. Look for \"Unexpected exit from"
+            echo "  worker-N\" above this line before assuming a normal shutdown."
         fi
         echo "[$(date -Is)] Restarting backend in 3s..."
         sleep 3

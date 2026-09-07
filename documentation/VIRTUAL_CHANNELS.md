@@ -18,11 +18,12 @@ plays inside its own player, a dashboard, a webcam page, a scoreboard.
 2. [Creating a channel](#creating-a-channel)
 3. [Controlling a live session](#controlling-a-live-session)
 4. [Running many channels at once](#running-many-channels-at-once)
-5. [Configuration reference](#configuration-reference)
-6. [API reference](#api-reference)
-7. [Architecture and design decisions](#architecture-and-design-decisions)
-8. [Security model](#security-model)
-9. [Troubleshooting](#troubleshooting)
+5. [One worker, always](#one-worker-always)
+6. [Configuration reference](#configuration-reference)
+7. [API reference](#api-reference)
+8. [Architecture and design decisions](#architecture-and-design-decisions)
+9. [Security model](#security-model)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -184,6 +185,36 @@ that mode the least recently watched session is evicted to make room.
 
 ---
 
+## One worker, always
+
+The backend must run as a **single** granian worker process. `start.sh` enforces
+this with `export GRANIAN_WORKERS="$WORKERS"`, where `WORKERS` defaults to 1.
+
+This is not a tuning preference. Each worker imports the app separately, so each
+gets its own `virtual_session.manager`, its own X display counter starting at
+`:99`, and its own copy of the autostart lifespan task. Several workers then race
+to start the *same* channel: unlinking each other's `/tmp/.X99-lock`, launching
+competing Xvfb servers on one display, opening the single persistent Chrome
+profile N times over, and pointing several encoders at one playlist. Workers die,
+and granian's shared listener resets some connections, which the reverse proxy
+reports as intermittent 502s from the control panel.
+
+`start.sh` also *clamps* the value rather than merely defaulting it: both
+`docker-compose.yml` and `start.sh` already defaulted to 1, and a leftover
+`WORKERS=4` in `.env` still won, because compose's `${WORKERS:-1}` applies only
+when the variable is **unset**. A non-1 value is now warned about and forced to
+1 unless `ALLOW_MULTIPLE_WORKERS=true` is set.
+
+Setting `WORKERS` alone does not achieve this. `reflex run` never reads it, and
+`reflex.utils.processes.get_num_workers()` returns `(os.cpu_count() * 2) + 1`
+whenever it can ping Redis -- which `start.sh` always starts. Only
+`GRANIAN_WORKERS` has any effect.
+
+As a backstop, `VirtualSession.start()` takes an exclusive `flock` on
+`$VIRTUAL_LOCK_ROOT/<channel>.lock`. A second process is refused with a readable
+error instead of silently corrupting the browser profile. The lock is held by an
+open file descriptor, so it is released automatically if a process dies.
+
 ## Configuration reference
 
 All optional. Defaults are in `docker-compose.yml`.
@@ -192,6 +223,7 @@ All optional. Defaults are in `docker-compose.yml`.
 |---|---|---|
 | `VIRTUAL_CHANNELS_FILE` | `/app/data/virtual_channels.json` | Where channel records are stored. On the `./data` volume so they survive a rebuild. |
 | `VIRTUAL_HLS_ROOT` | `/streams` | Where HLS output is written. Should be a tmpfs. |
+| `VIRTUAL_LOCK_ROOT` | `/tmp/freesky-locks` | Per-channel `flock` files that stop two processes running one channel. Must not live under `VIRTUAL_HLS_ROOT`, which is deleted on stop. |
 | `MAX_VIRTUAL_SESSIONS` | `0` | `0` = unlimited. A positive number caps concurrency with LRU eviction. |
 | `VIRTUAL_SEGMENT_SECONDS` | `2` | Segment length, and therefore the GOP length. |
 | `VIRTUAL_PLAYLIST_SIZE` | `6` | Segments kept in the playlist window. |
