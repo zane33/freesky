@@ -6,6 +6,9 @@ Runs in the same process as the FastAPI backend, so it reads and writes
 import reflex as rx
 from urllib.parse import urlparse
 from typing import List, TypedDict
+from datetime import timedelta
+from zoneinfo import ZoneInfo, available_timezones
+from dateutil import parser as dtparser
 
 from rxconfig import api_url
 
@@ -19,6 +22,7 @@ from freesky.free_sky_hybrid import StepDaddyHybrid
 # options come from the resolver so the two can't drift apart.
 AUTO_SOURCE = "Auto (failover)"
 SCHED_ALL = "All categories"
+TIMEZONES = sorted(available_timezones())
 SOURCE_OPTIONS = [AUTO_SOURCE] + list(StepDaddyHybrid.PLAYER_PATHS)
 
 RESOLUTION_OPTIONS = list(virtual_channels.RESOLUTIONS)
@@ -56,6 +60,9 @@ class SettingsState(rx.State):
     # Subnets that may browse and stream without signing in
     trusted_networks: str = ""
     network_error: str = ""
+
+    # Instance-wide display timezone for schedule times and the EPG
+    timezone: str = ""
 
     # Playlist URL revealed for one user at a time (see copy_playlist_url)
     revealed_user: str = ""
@@ -518,6 +525,7 @@ class SettingsState(rx.State):
         self.disabled = sorted(channel_prefs.disabled_ids())
         self.users = users.list_users()
         self.trusted_networks = ", ".join(app_settings.trusted_networks())
+        self.timezone = app_settings.timezone()
         self.sources = channel_prefs.sources()
         # The admin's own token, so each virtual-channel row can carry a working
         # link to its control panel. require_admin() above only returns a
@@ -650,6 +658,14 @@ class SettingsState(rx.State):
         self.revealed_url = ""
 
     @rx.event
+    def set_timezone(self, value: str):
+        try:
+            self.timezone = app_settings.set_timezone(value)
+        except Exception as e:
+            return rx.toast(f"Unknown timezone: {e}")
+        return rx.toast(f"Times now shown in {self.timezone}")
+
+    @rx.event
     def set_trusted_networks(self, value: str):
         self.trusted_networks = value
 
@@ -679,9 +695,14 @@ class SettingsState(rx.State):
             print(f"Schedule load failed: {e}")
             days = {}
         known = {c.id for c in (backend.get_channels() or [])}
+        zone = ZoneInfo(app_settings.timezone())
         events = []
         for day, categories in days.items():
             day_name = day.split(" - ")[0]
+            try:
+                day_dt = dtparser.parse(day_name, dayfirst=True)
+            except (ValueError, OverflowError):
+                day_dt = None
             for category, items in (categories or {}).items():
                 for ev in items or []:
                     seen = set()
@@ -692,9 +713,17 @@ class SettingsState(rx.State):
                             continue
                         seen.add(cid)
                         chans.append(SchedChan(id=cid, name=c.get("channel_name", cid), known=cid in known))
+                    when = f"{ev.get('time', '')} UK {day_name}"
+                    try:
+                        h, m = map(int, ev.get("time", "").split(":"))
+                        local = (day_dt.replace(hour=h, minute=m, tzinfo=ZoneInfo("Europe/London"))
+                                 + timedelta(days=int(ev.get("day_offset", 0)))).astimezone(zone)
+                        when = local.strftime("%H:%M %a %-d %b")
+                    except (ValueError, AttributeError):
+                        pass
                     events.append(SchedEvent(
                         name=ev.get("event", ""),
-                        when=f"{ev.get('time', '')} {day_name}",
+                        when=when,
                         category=category,
                         channels=chans,
                         ids=[c["id"] for c in chans if c["known"]],
@@ -829,6 +858,30 @@ def user_row(user: dict) -> rx.Component:
         width="100%",
         padding_y="0.4rem",
         border_bottom="1px solid var(--gray-4)",
+    )
+
+
+def timezone_section() -> rx.Component:
+    return rx.card(
+        rx.vstack(
+            rx.heading("Display timezone", size="5"),
+            rx.text(
+                "Schedule times (here, on the Schedule page and in the EPG) are "
+                "shown in this zone for every client. Upstream publishes UK time; "
+                "this converts it.",
+                color="gray",
+                size="2",
+            ),
+            rx.select(
+                TIMEZONES,
+                value=SettingsState.timezone,
+                on_change=SettingsState.set_timezone,
+                width="320px",
+            ),
+            spacing="3",
+            width="100%",
+        ),
+        width="100%",
     )
 
 
@@ -1634,6 +1687,8 @@ def settings() -> rx.Component:
                 ),
                 rx.divider(margin_y="1rem"),
                 schedule_section(),
+                rx.divider(margin_y="1rem"),
+                timezone_section(),
                 rx.divider(margin_y="1rem"),
                 access_section(),
                 users_section(),

@@ -63,6 +63,28 @@ def set_trusted_networks(networks: List[str]) -> List[str]:
     return cleaned
 
 
+# --- display timezone --------------------------------------------------------
+# Schedule times are shown in ONE instance-wide zone, not the browser's: the
+# admin sets it once and every client (and the EPG) agrees. Seeded from
+# DISPLAY_TIMEZONE for a fresh install.
+_TZ_DEFAULT = os.environ.get("DISPLAY_TIMEZONE", "Pacific/Auckland")
+
+
+def timezone() -> str:
+    """IANA zone name used for every displayed time."""
+    return str(_load().get("timezone") or _TZ_DEFAULT)
+
+
+def set_timezone(name: str) -> str:
+    from zoneinfo import ZoneInfo
+    name = str(name).strip()
+    ZoneInfo(name)  # raises on an unknown zone
+    data = _load()
+    data["timezone"] = name
+    _save(data)
+    return name
+
+
 def is_trusted_ip(ip: str) -> bool:
     """True when this client may skip login.
 
@@ -126,4 +148,10 @@ if __name__ == "__main__":
         assert client_ip_from_headers({"x-forwarded-for": "1.2.3.4, 5.6.7.8"}) == "1.2.3.4"
         assert client_ip_from_headers({"x-real-ip": "9.9.9.9"}) == "9.9.9.9"
         assert client_ip_from_headers({}, "7.7.7.7") == "7.7.7.7"
+        assert set_timezone("Pacific/Auckland") == "Pacific/Auckland" and timezone() == "Pacific/Auckland"
+        try:
+            set_timezone("Mars/Olympus")
+            raise AssertionError("should have rejected")
+        except Exception as e:
+            assert not isinstance(e, AssertionError)
         print("app_settings ok")

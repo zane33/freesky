@@ -39,7 +39,7 @@ class TokenValidator:
             request_time = query_params.get('t', [None])[0]
             
             if not all([md5_hash, expires, request_time]):
-                logger.warning(f"Missing token parameters in URL: {stream_url}")
+                logger.debug(f"Missing token parameters in URL: {stream_url}")  # path/AWS-signed CDNs never have them
                 return None
             
             return {

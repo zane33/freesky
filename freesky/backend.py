@@ -796,6 +796,11 @@ class _UpstreamTransient(Exception):
 _RETRYABLE_EXC = (httpx.TransportError, asyncio.TimeoutError, _UpstreamTransient)
 _RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 _UPSTREAM_ATTEMPTS = 3
+# Per-attempt wait for upstream HEADERS. Caddy gives /api/content 35s to answer
+# (Caddyfile response_header_timeout); 3 x 30s here blew straight through it,
+# so a slow CDN became a Caddy 504 and the player dropped the channel. 3 x 8s
+# + backoff stays under the budget with room to spare.
+_UPSTREAM_TIMEOUT = 8.0
 
 
 def _describe(exc: Exception) -> str:
@@ -808,7 +813,7 @@ async def _get_upstream_with_retry(url: str, headers: dict) -> httpx.Response:
     """GET an upstream playlist, retrying transient failures."""
     for attempt in range(_UPSTREAM_ATTEMPTS):
         try:
-            resp = await streaming_client.get(url, headers=headers, timeout=30.0)
+            resp = await streaming_client.get(url, headers=headers, timeout=_UPSTREAM_TIMEOUT)
             if resp.status_code != 200:
                 if resp.status_code in _RETRYABLE_STATUS and attempt < _UPSTREAM_ATTEMPTS - 1:
                     logger.warning(f"Upstream playlist HTTP {resp.status_code}, retrying ({attempt + 1}/{_UPSTREAM_ATTEMPTS})")
@@ -920,7 +925,7 @@ async def content(path: str, request: Request, ref: str = None):
             for attempt in range(_UPSTREAM_ATTEMPTS):
                 cm = streaming_client.stream("GET", upstream_url, headers=upstream_headers, timeout=30.0)
                 try:
-                    response = await asyncio.wait_for(cm.__aenter__(), 30.0)
+                    response = await asyncio.wait_for(cm.__aenter__(), _UPSTREAM_TIMEOUT)
                     if response.status_code in _RETRYABLE_STATUS:
                         raise _UpstreamTransient(f"Upstream returned HTTP {response.status_code}")
                     break
@@ -1558,11 +1563,12 @@ def generate_epg_xml(schedule_data):
     
     # Add programme data
     for day_name, categories in schedule_data.items():
-        # Parse day from format "DD/MM/YYYY - DayName"
+        # Day header is e.g. "Saturday 12th Sep 2026 - Schedule Time UK GMT";
+        # times are London wall-clock (the "GMT" is a lie in summer).
         try:
-            date_part = day_name.split(" - ")[0]
-            day_date = datetime.strptime(date_part, "%d/%m/%Y").replace(tzinfo=ZoneInfo("UTC"))
-        except:
+            from dateutil import parser as _dtparser
+            day_date = _dtparser.parse(day_name.split(" - ")[0], dayfirst=True).replace(tzinfo=ZoneInfo("Europe/London"))
+        except Exception:
             continue
             
         for category, events in categories.items():
@@ -1571,7 +1577,7 @@ def generate_epg_xml(schedule_data):
                     # Parse time
                     time_str = event.get("time", "00:00")
                     hour, minute = map(int, time_str.split(":"))
-                    start_dt = day_date.replace(hour=hour, minute=minute)
+                    start_dt = day_date.replace(hour=hour, minute=minute) + timedelta(days=int(event.get("day_offset", 0)))
                     
                     # Assume 30 minute programs if no end time specified
                     end_dt = start_dt + timedelta(minutes=30)

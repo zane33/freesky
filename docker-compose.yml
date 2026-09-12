@@ -35,6 +35,7 @@ services:
       - CHANNEL_PREFS_FILE=/app/data/channel_prefs.json  # Persisted via the ./data volume below
       - USERS_FILE=/app/data/users.json
       - APP_SETTINGS_FILE=/app/data/app_settings.json
+      - DISPLAY_TIMEZONE=${DISPLAY_TIMEZONE:-Pacific/Auckland}  # seed only; change it in Settings
       - VIRTUAL_CHANNELS_FILE=/app/data/virtual_channels.json
       # Virtual channels: a web page restreamed as live HLS. HLS segments go to
       # the tmpfs mounted below - they are write-heavy, live for seconds, and are

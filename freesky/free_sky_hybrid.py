@@ -832,7 +832,32 @@ class StepDaddyHybrid:
                     "event": self._sched_text(title.group(1)),
                     "channels": channels,
                 })
-        return {d: c for d, c in out.items() if c}
+        out = {d: c for d, c in out.items() if c}
+        for cats in out.values():
+            for events in cats.values():
+                self._mark_day_offsets(events)
+        return out
+
+    @staticmethod
+    def _mark_day_offsets(events: list) -> None:
+        """Set event["day_offset"] (0/1) for a category's chronological list.
+
+        Upstream files US Saturday-night games under "Saturday" with times like
+        00:00-03:00 - that is Sunday in the UK. Within a category the list is
+        chronological, so a small-hours time that follows an afternoon/evening
+        one is the next day. ponytail: heuristic (<06:00 after >=12:00); a stray
+        out-of-order row is the only thing it gets wrong.
+        """
+        seen_pm = False
+        for e in events:
+            try:
+                hour = int(e["time"].split(":")[0])
+            except (ValueError, KeyError, IndexError):
+                e["day_offset"] = 0
+                continue
+            if hour >= 12:
+                seen_pm = True
+            e["day_offset"] = 1 if hour < 6 and seen_pm else 0
 
     async def schedule(self):
         try:

@@ -3,7 +3,7 @@ from typing import Dict, List, TypedDict
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 from dateutil import parser
-from freesky import backend
+from freesky import backend, app_settings
 from freesky.components import navbar
 from freesky.auth_state import require_login
 
@@ -16,6 +16,7 @@ class ChannelItem(TypedDict):
 class EventItem(TypedDict):
     name: str
     time: str
+    when: str  # "HH:mm ddd D MMM" in the instance timezone
     dt: datetime
     category: str
     channels: List[ChannelItem]
@@ -32,6 +33,7 @@ class ScheduleState(rx.State):
     # Distinguishes "still fetching" from "fetched, nothing there". Without it an
     # empty schedule rendered the loading spinner forever, which looked broken.
     loaded: bool = False
+    tz: str = ""
 
     @staticmethod
     def get_channels(channels: dict) -> List[ChannelItem]:
@@ -51,7 +53,11 @@ class ScheduleState(rx.State):
         return channel_list
 
     def toggle_category(self, category):
-        self.categories[category] = not self.categories.get(category, False)
+        """Click = show ONLY this tag. Clicking the sole shown tag brings all back.
+        (Plain toggling meant one click on "Boxing" hid boxing and left the
+        other 24 tags up, the opposite of what anyone clicking it wanted.)"""
+        only_this = self.categories.get(category) and sum(self.categories.values()) == 1
+        self.categories = {c: (only_this or c == category) for c in self.categories}
 
     @rx.event
     def set_all_categories(self, on: bool):
@@ -70,6 +76,8 @@ class ScheduleState(rx.State):
             return redirect
         self.events = []
         categories = {}
+        self.tz = app_settings.timezone()
+        zone = ZoneInfo(self.tz)
         try:
             # Same process as the backend, so call it directly. The old code
             # httpx-GET'd the relative path "/schedule", which can't resolve
@@ -87,10 +95,16 @@ class ScheduleState(rx.State):
                         # Upstream labels the day "Schedule Time UK GMT" but the
                         # times are wall-clock London (BST in summer), not UTC.
                         event_dt = dt.replace(hour=hour, minute=minute, tzinfo=ZoneInfo("Europe/London"))
+                        # post-midnight rows under a day header are the NEXT day (see _mark_day_offsets)
+                        event_dt += timedelta(days=int(event.get("day_offset", 0)))
                         channels = self.get_channels(event.get("channels"))
                         channels.extend(self.get_channels(event.get("channels2")))
                         channels.sort(key=lambda channel: channel["name"])
-                        self.events.append(EventItem(name=event["event"], time=time, dt=event_dt, category=category, channels=channels))
+                        local = event_dt.astimezone(zone)
+                        self.events.append(EventItem(
+                            name=event["event"], time=time, dt=event_dt, category=category, channels=channels,
+                            when=local.strftime("%H:%M %a %-d %b"),
+                        ))
         except Exception as e:
             # ponytail: no invented events. This used to fabricate 24 hours of
             # "Sports Event N"/"News Hour N" on ESPN/CNN/HBO, which rendered as a
@@ -124,11 +138,10 @@ class ScheduleState(rx.State):
         now = datetime.now(ZoneInfo("UTC")) - timedelta(minutes=30)
         query = self.search_query.strip().lower()
 
+        zone = ZoneInfo(self.tz or app_settings.timezone())
+
         def in_range(dt: datetime) -> bool:
-            # ponytail: compared on the London calendar day the listing uses,
-            # not the viewer's local day; an event near midnight can land a day
-            # off for far-away zones. Ship the browser tz if that bites.
-            day = dt.astimezone(ZoneInfo("Europe/London")).date().isoformat()
+            day = dt.astimezone(zone).date().isoformat()
             return (not self.date_from or day >= self.date_from) and (not self.date_to or day <= self.date_to)
 
         return [
@@ -154,8 +167,7 @@ def event_card(event: EventItem) -> rx.Component:
     return rx.card(
         rx.heading(event["name"]),
         rx.hstack(
-            rx.moment(event["dt"], format="HH:mm", local=True),
-            rx.moment(event["dt"], format="ddd MMM DD YYYY", local=True),
+            rx.text(event["when"], size="2"),
             rx.badge(event["category"], margin_top="0.2rem"),
         ),
         rx.hstack(
@@ -223,7 +235,7 @@ def schedule() -> rx.Component:
                                 rx.input(type="date", value=ScheduleState.date_from, on_change=ScheduleState.set_date_from, size="1"),
                                 rx.text("To"),
                                 rx.input(type="date", value=ScheduleState.date_to, on_change=ScheduleState.set_date_to, size="1"),
-                                rx.text(ScheduleState.shown_count, color="gray", size="2", margin_left="auto"),
+                                rx.text(ScheduleState.shown_count, " · times in ", ScheduleState.tz, color="gray", size="2", margin_left="auto"),
                                 margin_top="0.5rem",
                                 wrap="wrap",
                                 align="center",

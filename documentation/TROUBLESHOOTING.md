@@ -423,3 +423,12 @@ channels, disabled ones included (the public /schedule page hides those). Grey
 chip = off, click to enable; green = already on, click to disable; *Enable all*
 switches on every listed channel for that event. "(not in list)" means upstream
 cites an id that is not in the channel list, so it cannot be played or enabled.
+
+## Schedule times in the wrong zone
+
+Times are shown in one instance-wide zone, set under Settings → **Display
+timezone** (any IANA name; default `Pacific/Auckland`, seeded by the
+`DISPLAY_TIMEZONE` env var on first run). Upstream publishes London wall-clock
+and files US Saturday-night games (00:00–03:00) under "Saturday"; both are
+corrected before conversion. The EPG carries explicit offsets so players
+convert it themselves.
