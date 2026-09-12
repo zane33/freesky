@@ -432,3 +432,14 @@ timezone** (any IANA name; default `Pacific/Auckland`, seeded by the
 and files US Saturday-night games (00:00–03:00) under "Saturday"; both are
 corrected before conversion. The EPG carries explicit offsets so players
 convert it themselves.
+
+## Consumers run ffmpeg without `-reconnect` (Dispatcharr, TiviMate)
+
+Their ffmpeg quits on the first non-200 media-playlist reload, so the proxy
+never lets one through. A nested `/api/content/...m3u8` request answers, in
+order: fresh CDN copy; last good copy if under 20s old; a transparent
+failover (channel re-resolved, the new feed's media playlist served on the old
+URL, later reloads aliased to it); a stale copy up to 120s; only then an
+error. Playlist fetches use 2 x 6s so the whole chain fits under Caddy's 35s
+`response_header_timeout`. Look for "serving Ns-old copy" and "failed over to
+a new feed" in the log.

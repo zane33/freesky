@@ -681,6 +681,7 @@ async def stream(channel_id: str, request: Request = None):
                 # override, so it doesn't become the channel's default for everyone.
                 if not prefer:
                     stream_cache[cache_key] = (stream_data, current_time)
+                _remember_playlist_paths(stream_data, channel_id)
                 logger.info(f"Successfully generated stream for channel {channel_id}")
                 
                 # Schedule prefetch for this channel to keep it warm
@@ -809,23 +810,130 @@ def _describe(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
-async def _get_upstream_with_retry(url: str, headers: dict) -> httpx.Response:
+async def _get_upstream_with_retry(url: str, headers: dict, attempts: int = _UPSTREAM_ATTEMPTS,
+                                   timeout: float = _UPSTREAM_TIMEOUT) -> httpx.Response:
     """GET an upstream playlist, retrying transient failures."""
-    for attempt in range(_UPSTREAM_ATTEMPTS):
+    for attempt in range(attempts):
         try:
-            resp = await streaming_client.get(url, headers=headers, timeout=_UPSTREAM_TIMEOUT)
+            resp = await streaming_client.get(url, headers=headers, timeout=timeout)
             if resp.status_code != 200:
-                if resp.status_code in _RETRYABLE_STATUS and attempt < _UPSTREAM_ATTEMPTS - 1:
-                    logger.warning(f"Upstream playlist HTTP {resp.status_code}, retrying ({attempt + 1}/{_UPSTREAM_ATTEMPTS})")
+                if resp.status_code in _RETRYABLE_STATUS and attempt < attempts - 1:
+                    logger.warning(f"Upstream playlist HTTP {resp.status_code}, retrying ({attempt + 1}/{attempts})")
                     await asyncio.sleep(0.3 * (attempt + 1))
                     continue
                 raise ValueError(f"Upstream returned HTTP {resp.status_code}")
             return resp
         except _RETRYABLE_EXC as e:
-            if attempt == _UPSTREAM_ATTEMPTS - 1:
+            if attempt == attempts - 1:
                 raise
-            logger.warning(f"Upstream playlist fetch failed ({_describe(e)}), retrying ({attempt + 1}/{_UPSTREAM_ATTEMPTS})")
+            logger.warning(f"Upstream playlist fetch failed ({_describe(e)}), retrying ({attempt + 1}/{attempts})")
             await asyncio.sleep(0.3 * (attempt + 1))
+
+
+# --- nested (media) playlist resilience ---------------------------------------
+# Every consumer here is ffmpeg with NO -reconnect flags: the first non-200 it
+# sees on a media-playlist reload ends the stream. So a nested playlist request
+# must always come back 200, in this order of preference:
+#   1. fresh copy from the CDN,
+#   2. the last good copy if it is only seconds old (CDN hiccup),
+#   3. a transparent failover: re-resolve the channel, fetch the NEW feed's media
+#      playlist and serve it on the OLD URL (ffmpeg keeps reloading the old URL),
+#   4. a stale copy up to _NESTED_STALE_OK old,
+#   5. only then an error.
+_nested_cache = LRUCache(maxsize=512)      # proxied path -> (rewritten playlist w/o token, ts)
+_nested_alias = {}                          # old proxied path -> (new path, new ref) after failover
+_content_channel = LRUCache(maxsize=4096)   # proxied playlist path -> channel id
+_NESTED_FRESH_OK = 20.0    # serve stale without trying anything else
+_NESTED_STALE_OK = 120.0   # absolute ceiling for a stale copy
+_NESTED_ATTEMPTS, _NESTED_TIMEOUT = 2, 6.0   # 2x6s + failover must fit Caddy's 35s
+_CONTENT_M3U8_RE = re.compile(r"^/api/content/([^/\s]+)(?:/([^/\s]+))?\.m3u8", re.M)
+
+
+def _remember_playlist_paths(playlist: str, channel_id: str) -> None:
+    """Map every proxied .m3u8 URL in `playlist` back to its channel, so a
+    failing nested playlist can be re-resolved without the client telling us."""
+    if not channel_id:
+        return
+    for m in _CONTENT_M3U8_RE.finditer(playlist):
+        _content_channel[m.group(1)] = channel_id
+
+
+async def _fetch_nested(path: str, ref: str):
+    """Fetch + rewrite one nested playlist. Returns ("m3u8", text) or ("raw", httpx.Response).
+    Raises on upstream failure."""
+    upstream_url = free_sky.content_url(path)
+    nested = await _get_upstream_with_retry(
+        upstream_url, _upstream_headers(ref), attempts=_NESTED_ATTEMPTS, timeout=_NESTED_TIMEOUT
+    )
+    # The URL is only a hint: this CDN also serves binary segments from paths
+    # containing ".m3u8"; decoding those as text raised UnicodeDecodeError -> 500.
+    if not nested.content.startswith(b"#EXTM3U"):
+        return "raw", nested
+    referer = free_sky.content_url(ref) if ref else upstream_url
+    rewritten = free_sky._process_stream_content(
+        "\n".join(
+            urljoin(upstream_url, line) if line and not line.startswith("#") else line
+            for line in nested.text.split("\n")
+        ),
+        referer,
+    )
+    _nested_cache[path] = (rewritten, time.time())
+    _remember_playlist_paths(rewritten, _content_channel.get(path))  # variant -> media inherit
+    return "m3u8", rewritten
+
+
+async def _failover_nested(path: str):
+    """Re-resolve the channel behind `path` and return the new feed's media
+    playlist, or None. Later reloads of `path` are aliased to the new feed."""
+    channel_id = _content_channel.get(path)
+    if not channel_id:
+        return None
+    logger.warning(f"Nested playlist for channel {channel_id} unreachable; re-resolving feed")
+    stream_cache.pop(f"stream_{channel_id}", None)
+    try:
+        data = await asyncio.wait_for(_get_stream_parallel(channel_id), 12.0)
+    except Exception as e:
+        logger.error(f"Failover resolve for channel {channel_id} failed: {_describe(e)}")
+        return None
+    if not data or not data.startswith("#EXTM3U"):
+        return None
+    master = _process_stream_content(data, api_url)
+    stream_cache[f"stream_{channel_id}"] = (master, time.time())
+    _remember_playlist_paths(master, channel_id)
+    m = _CONTENT_M3U8_RE.search(master)
+    if not m or m.group(1) == path:
+        return None
+    new_path, new_ref = m.group(1), m.group(2)
+    try:
+        kind, payload = await _fetch_nested(new_path, new_ref)
+    except Exception as e:
+        logger.error(f"Failover feed for channel {channel_id} also unreachable: {_describe(e)}")
+        return None
+    if kind != "m3u8":
+        return None
+    _nested_alias[path] = (new_path, new_ref)
+    logger.info(f"Channel {channel_id}: media playlist failed over to a new feed")
+    return payload
+
+
+async def _nested_playlist(path: str, ref: str):
+    """The always-200 policy described above. Returns ("m3u8", text) or ("raw", resp)."""
+    path, ref = _nested_alias.get(path, (path, ref))
+    try:
+        return await _fetch_nested(path, ref)
+    except Exception as e:
+        stale = _nested_cache.get(path)
+        age = time.time() - stale[1] if stale else None
+        if stale and age < _NESTED_FRESH_OK:
+            logger.warning(f"Nested playlist fetch failed ({_describe(e)}); serving {age:.0f}s-old copy")
+            return "m3u8", stale[0]
+        payload = await _failover_nested(path)
+        if payload is not None:
+            return "m3u8", payload
+        if stale and age < _NESTED_STALE_OK:
+            logger.warning(f"Nested playlist fetch failed ({_describe(e)}), no failover; serving {age:.0f}s-old copy")
+            return "m3u8", stale[0]
+        raise
 
 
 def _release_session(session_id: str, channel_id: str) -> None:
@@ -883,32 +991,18 @@ async def content(path: str, request: Request, ref: str = None):
             # URLs are on a CDN that 403s any cross-origin browser fetch, so the player
             # can only reach them via this proxy.
             if ".m3u8" in upstream_url.split("?")[0]:
-                nested = await _get_upstream_with_retry(upstream_url, upstream_headers)
-                # The URL is only a hint: this CDN also serves binary segments from
-                # paths containing ".m3u8", and decoding those as text raised
-                # UnicodeDecodeError -> 500. Trust the body, not the name.
                 _release_session(session_id, channel_id)
-                if not nested.content.startswith(b"#EXTM3U"):
+                kind, payload = await _nested_playlist(path, ref)
+                if kind == "raw":
                     return Response(
-                        content=nested.content,
-                        media_type=nested.headers.get("content-type", "application/octet-stream"),
+                        content=payload.content,
+                        media_type=payload.headers.get("content-type", "application/octet-stream"),
                         headers={"Access-Control-Allow-Origin": "*"},
                     )
-                referer = free_sky.content_url(ref) if ref else upstream_url
-                rewritten = free_sky._process_stream_content(
-                    "\n".join(
-                        urljoin(upstream_url, line) if line and not line.startswith("#") else line
-                        for line in nested.text.split("\n")
-                    ),
-                    referer,
-                )
                 # Carry the caller's token onto this playlist's segment URLs too,
                 # or the auth middleware 401s every segment the player then asks for.
-                rewritten = _authorize_proxied_urls(
-                    rewritten, request.query_params.get("token")
-                )
                 return Response(
-                    content=rewritten,
+                    content=_authorize_proxied_urls(payload, request.query_params.get("token")),
                     media_type="application/vnd.apple.mpegurl",
                     headers={
                         "Access-Control-Allow-Origin": "*",

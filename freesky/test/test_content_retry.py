@@ -124,3 +124,55 @@ def test_segment_transient_then_ok_streams_body():
     asyncio.run(drain())
     assert body == b"seg" and len(closed) == 2
     assert not backend.active_content_sessions
+
+
+def _nested_request(path, ref=None):
+    req = types.SimpleNamespace(query_params={"token": "t"})
+    return asyncio.run(backend.content(path, req, ref))
+
+
+def _fail_client(outcomes):
+    client, calls = _fake_client(outcomes)
+    backend.streaming_client = client
+    return calls
+
+
+def test_nested_playlist_serves_recent_stale_copy_on_cdn_failure():
+    """ffmpeg (no -reconnect) dies on the first non-200 playlist reload, so a
+    CDN hiccup must be papered over with the last good copy."""
+    path = backend.encrypt("http://cdn/live/mono.m3u8")
+    backend._nested_cache.clear(); backend._nested_alias.clear()
+    _fail_client([httpx.Response(200, content=b"#EXTM3U\nhttp://cdn/live/1.ts\n")])
+    assert _nested_request(path).status_code == 200 and path in backend._nested_cache
+    _fail_client([httpx.ConnectTimeout("")] * backend._NESTED_ATTEMPTS)
+    resp = _nested_request(path)
+    assert resp.status_code == 200
+    assert b"/api/content/" in resp.body and b"token=t" in resp.body
+
+
+def test_nested_playlist_fails_over_to_new_feed():
+    """No usable stale copy -> re-resolve the channel and serve the NEW feed's
+    media playlist on the OLD url; later reloads are aliased to the new feed."""
+    old = backend.encrypt("http://cdn-a/old.m3u8")
+    backend._nested_cache.clear(); backend._nested_alias.clear()
+    backend._content_channel[old] = "42"
+    new_master = "#EXTM3U\nhttp://cdn-b/new.m3u8\n"
+
+    async def fake_resolve(channel_id, prefer=None):
+        assert channel_id == "42"
+        return new_master
+    orig = backend._get_stream_parallel
+    backend._get_stream_parallel = fake_resolve
+    try:
+        # old feed dead, new feed answers
+        _fail_client([httpx.ConnectTimeout("")] * backend._NESTED_ATTEMPTS
+                     + [httpx.Response(200, content=b"#EXTM3U\nhttp://cdn-b/9.ts\n")])
+        resp = _nested_request(old)
+        assert resp.status_code == 200 and b"9.ts" not in resp.body and b"/api/content/" in resp.body
+        assert old in backend._nested_alias, "old url must now alias the new feed"
+        # a reload of the OLD url goes straight to the new feed (one upstream call)
+        calls = _fail_client([httpx.Response(200, content=b"#EXTM3U\nhttp://cdn-b/10.ts\n")])
+        assert _nested_request(old).status_code == 200 and len(calls) == 1
+        assert "cdn-b" in calls[0]
+    finally:
+        backend._get_stream_parallel = orig
