@@ -18,6 +18,7 @@ from freesky.free_sky_hybrid import StepDaddyHybrid
 # "Auto" is a sentinel in the dropdown, stored as "" (no pin) on disk. The real
 # options come from the resolver so the two can't drift apart.
 AUTO_SOURCE = "Auto (failover)"
+SCHED_ALL = "All categories"
 SOURCE_OPTIONS = [AUTO_SOURCE] + list(StepDaddyHybrid.PLAYER_PATHS)
 
 RESOLUTION_OPTIONS = list(virtual_channels.RESOLUTIONS)
@@ -72,6 +73,7 @@ class SettingsState(rx.State):
     # Each event: {name, when, category, channels: [{id, name, known}]}.
     sched: List[SchedEvent] = []
     sched_search: str = ""
+    sched_category: str = ""  # "" = every category
     sched_loading: bool = False
     sched_loaded: bool = False
 
@@ -696,13 +698,26 @@ class SettingsState(rx.State):
     def set_sched_search(self, value: str):
         self.sched_search = value
 
+    @rx.event
+    def set_sched_category(self, value: str):
+        self.sched_category = "" if value == SCHED_ALL else value
+
+    @rx.var
+    def sched_categories(self) -> List[str]:
+        return [SCHED_ALL] + sorted({e["category"] for e in self.sched})
+
+    @rx.var
+    def sched_category_value(self) -> str:
+        return self.sched_category or SCHED_ALL
+
     @rx.var
     def sched_matching(self) -> List[SchedEvent]:
         q = self.sched_search.strip().lower()
         out = [
             e for e in self.sched
-            if not q or q in e["name"].lower() or q in e["category"].lower()
-            or any(q in c["name"].lower() for c in e["channels"])
+            if (not self.sched_category or e["category"] == self.sched_category)
+            and (not q or q in e["name"].lower() or q in e["category"].lower()
+                 or any(q in c["name"].lower() for c in e["channels"]))
         ]
         # ponytail: cap the render; type to narrow. Paging if 100 feels tight.
         return out[:100]
@@ -1490,12 +1505,22 @@ def schedule_section() -> rx.Component:
         rx.cond(
             SettingsState.sched_loaded,
             rx.vstack(
-                rx.input(
-                    rx.input.slot(rx.icon("search")),
-                    placeholder="Filter events, tags or channels...",
-                    value=SettingsState.sched_search,
-                    on_change=SettingsState.set_sched_search,
+                rx.hstack(
+                    rx.select(
+                        SettingsState.sched_categories,
+                        value=SettingsState.sched_category_value,
+                        on_change=SettingsState.set_sched_category,
+                        width="260px",
+                    ),
+                    rx.input(
+                        rx.input.slot(rx.icon("search")),
+                        placeholder="Filter events, tags or channels...",
+                        value=SettingsState.sched_search,
+                        on_change=SettingsState.set_sched_search,
+                        flex="1",
+                    ),
                     width="100%",
+                    spacing="2",
                 ),
                 rx.text(SettingsState.sched_label, size="1", color="gray"),
                 rx.card(

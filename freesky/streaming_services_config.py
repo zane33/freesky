@@ -3,11 +3,13 @@ Streaming Services Configuration
 Inspired by Kodi addons from https://github.com/LoopAddon/repository.the-loop
 """
 
+from rxconfig import config
+
 # Configuration for different streaming services
 STREAMING_SERVICES = {
     "DLHD": {
         "name": "DaddyLive HD",
-        "base_url": "https://dlhd.st",
+        "base_url": config.daddylive_uri,  # DADDYLIVE_URI, never a static host
         "enabled": True,
         "priority": 1,
         "description": "Your existing DLHD streaming service",

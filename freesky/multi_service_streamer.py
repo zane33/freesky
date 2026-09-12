@@ -11,6 +11,7 @@ from typing import Optional, Dict, List, Any
 from abc import ABC, abstractmethod
 from urllib.parse import urljoin, urlparse
 from curl_cffi import AsyncSession
+from rxconfig import config
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ class DLHDStreamer(BaseStreamer):
     
     def __init__(self):
         super().__init__("DLHD")
-        self.base_url = "https://dlhd.st"
+        self.base_url = config.daddylive_uri  # DADDYLIVE_URI, never a static host
     
     async def get_stream_url(self, channel_id: str) -> Optional[str]:
         """Get stream URL using your existing hybrid approach"""
