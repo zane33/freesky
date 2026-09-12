@@ -17,6 +17,7 @@ from typing import List
 from .free_sky import Channel
 from .utils import encrypt, decrypt, urlsafe_base64, extract_and_decode_var, hls_ext
 from .token_validator import TokenValidator, extract_viable_streams
+from . import channel_prefs
 from rxconfig import config
 
 # Set up logging
@@ -143,6 +144,10 @@ class StepDaddyHybrid:
                 if channels:
                     logger.debug(f"Updating channels list with {len(channels)} channels")
                     self.channels = sorted(channels, key=lambda channel: (channel.name.startswith("18"), channel.name))
+                    # ids never scraped before start disabled (see channel_prefs)
+                    new_ids = channel_prefs.register_channels(c.id for c in self.channels)
+                    if new_ids:
+                        logger.info(f"{len(new_ids)} new upstream channel(s) added as disabled: {sorted(new_ids)[:20]}")
                 else:
                     logger.warning("No channels were loaded, keeping existing channels list")
 

@@ -5,7 +5,7 @@ Runs in the same process as the FastAPI backend, so it reads and writes
 """
 import reflex as rx
 from urllib.parse import urlparse
-from typing import List
+from typing import List, TypedDict
 
 from rxconfig import api_url
 
@@ -24,6 +24,20 @@ RESOLUTION_OPTIONS = list(virtual_channels.RESOLUTIONS)
 FRAMERATE_OPTIONS = [str(f) for f in virtual_channels.FRAMERATES]
 PRESET_OPTIONS = list(virtual_channels.PRESETS)
 CAPTURE_OPTIONS = list(virtual_channels.CAPTURE_MODES)
+
+class SchedChan(TypedDict):
+    id: str
+    name: str
+    known: bool  # present in the channel list, so it can actually be enabled
+
+
+class SchedEvent(TypedDict):
+    name: str
+    when: str
+    category: str
+    channels: List[SchedChan]
+    ids: List[str]  # known channel ids, for "Enable all"
+
 
 class SettingsState(rx.State):
     """Channel visibility settings, persisted server-side for every client."""
@@ -52,6 +66,14 @@ class SettingsState(rx.State):
     # every state change, which is what made rows flicker and vanish.
     page: int = 0
     PAGE_SIZE: int = 50
+
+    # --- upstream schedule --------------------------------------------------
+    # Loaded on demand (900 events) so the page itself stays quick to open.
+    # Each event: {name, when, category, channels: [{id, name, known}]}.
+    sched: List[SchedEvent] = []
+    sched_search: str = ""
+    sched_loading: bool = False
+    sched_loaded: bool = False
 
     # --- virtual channels ---------------------------------------------------
     # A virtual channel is a web page restreamed as live HLS by a headless
@@ -633,6 +655,72 @@ class SettingsState(rx.State):
             f"{len(saved)} trusted network(s) saved" if saved
             else "Whitelist cleared — everyone must now sign in"
         )
+
+    @rx.event
+    async def load_schedule(self):
+        """Fetch the UNFILTERED upstream schedule so disabled channels show too —
+        that is the whole point: find a channel via the event and switch it on."""
+        self.sched_loading = True
+        yield
+        try:
+            days = await backend.get_schedule() or {}
+        except Exception as e:
+            print(f"Schedule load failed: {e}")
+            days = {}
+        known = {c.id for c in (backend.get_channels() or [])}
+        events = []
+        for day, categories in days.items():
+            day_name = day.split(" - ")[0]
+            for category, items in (categories or {}).items():
+                for ev in items or []:
+                    seen = set()
+                    chans = []
+                    for c in ev.get("channels") or []:
+                        cid = str(c.get("channel_id", ""))
+                        if not cid or cid in seen:
+                            continue
+                        seen.add(cid)
+                        chans.append(SchedChan(id=cid, name=c.get("channel_name", cid), known=cid in known))
+                    events.append(SchedEvent(
+                        name=ev.get("event", ""),
+                        when=f"{ev.get('time', '')} {day_name}",
+                        category=category,
+                        channels=chans,
+                        ids=[c["id"] for c in chans if c["known"]],
+                    ))
+        self.sched = events
+        self.sched_loading = False
+        self.sched_loaded = True
+
+    @rx.event
+    def set_sched_search(self, value: str):
+        self.sched_search = value
+
+    @rx.var
+    def sched_matching(self) -> List[SchedEvent]:
+        q = self.sched_search.strip().lower()
+        out = [
+            e for e in self.sched
+            if not q or q in e["name"].lower() or q in e["category"].lower()
+            or any(q in c["name"].lower() for c in e["channels"])
+        ]
+        # ponytail: cap the render; type to narrow. Paging if 100 feels tight.
+        return out[:100]
+
+    @rx.var
+    def sched_label(self) -> str:
+        if not self.sched_loaded:
+            return ""
+        n = len(self.sched_matching)
+        return f"showing {n} of {len(self.sched)} events" + (" (first 100 — narrow the search)" if n == 100 else "")
+
+    @rx.event
+    def enable_channels(self, ids: List[str]):
+        """Switch on every id given (only ones in the channel list can matter)."""
+        known = {c.id for c in self.channels}
+        wanted = {str(i) for i in ids} & known
+        self.disabled = sorted(channel_prefs.set_disabled(channel_prefs.disabled_ids() - wanted))
+        return rx.toast(f"Enabled {len(wanted)} channel(s)")
 
     @rx.event
     def set_all(self, enabled: bool):
@@ -1333,6 +1421,94 @@ def virtual_section() -> rx.Component:
     )
 
 
+def schedule_channel_chip(ch: SchedChan) -> rx.Component:
+    enabled = ~SettingsState.disabled.contains(ch["id"])
+    return rx.cond(
+        ch["known"],
+        rx.button(
+            rx.cond(enabled, rx.icon("check", size=12), rx.icon("plus", size=12)),
+            ch["name"],
+            size="1",
+            variant=rx.cond(enabled, "solid", "soft"),
+            color_scheme=rx.cond(enabled, "green", "gray"),
+            on_click=rx.cond(enabled, SettingsState.toggle(ch["id"]), SettingsState.enable_channels([ch["id"]])),
+            title=ch["id"],
+        ),
+        rx.badge(ch["name"], " (not in list)", color_scheme="gray", variant="outline", size="1", title=ch["id"]),
+    )
+
+
+def schedule_event_row(ev: SchedEvent) -> rx.Component:
+    return rx.vstack(
+        rx.hstack(
+            rx.text(ev["name"], weight="medium", size="2", flex="1"),
+            rx.badge(ev["category"], variant="soft", size="1"),
+            rx.text(ev["when"], size="1", color="gray"),
+            rx.button(
+                "Enable all",
+                size="1",
+                variant="outline",
+                color_scheme="green",
+                on_click=SettingsState.enable_channels(ev["ids"]),
+            ),
+            width="100%",
+            align="center",
+            spacing="2",
+        ),
+        rx.hstack(rx.foreach(ev["channels"], schedule_channel_chip), wrap="wrap", spacing="1"),
+        width="100%",
+        spacing="1",
+        padding_y="0.4rem",
+        border_bottom="1px solid var(--gray-4)",
+    )
+
+
+def schedule_section() -> rx.Component:
+    """Upstream schedule with one-click enable, so a channel can be switched on
+    from the event you actually want to watch instead of hunted by name."""
+    return rx.vstack(
+        rx.hstack(
+            rx.heading("Schedule", size="5"),
+            rx.spacer(),
+            rx.button(
+                rx.icon("calendar", size=16),
+                rx.cond(SettingsState.sched_loaded, "Reload schedule", "Load schedule"),
+                on_click=SettingsState.load_schedule,
+                loading=SettingsState.sched_loading,
+                variant="soft",
+                size="2",
+            ),
+            width="100%",
+            align="center",
+        ),
+        rx.text(
+            "Every upstream event, including channels currently switched off. "
+            "Click a grey channel to enable it; green ones are already in the playlist.",
+            color="gray",
+            size="2",
+        ),
+        rx.cond(
+            SettingsState.sched_loaded,
+            rx.vstack(
+                rx.input(
+                    rx.input.slot(rx.icon("search")),
+                    placeholder="Filter events, tags or channels...",
+                    value=SettingsState.sched_search,
+                    on_change=SettingsState.set_sched_search,
+                    width="100%",
+                ),
+                rx.text(SettingsState.sched_label, size="1", color="gray"),
+                rx.card(
+                    rx.vstack(rx.foreach(SettingsState.sched_matching, schedule_event_row), spacing="0", width="100%"),
+                    width="100%",
+                ),
+                width="100%",
+            ),
+        ),
+        width="100%",
+    )
+
+
 @rx.page("/settings", on_load=SettingsState.on_load)
 def settings() -> rx.Component:
     return rx.box(
@@ -1416,6 +1592,8 @@ def settings() -> rx.Component:
                     width="100%",
                     align="center",
                 ),
+                rx.divider(margin_y="1rem"),
+                schedule_section(),
                 rx.divider(margin_y="1rem"),
                 access_section(),
                 users_section(),

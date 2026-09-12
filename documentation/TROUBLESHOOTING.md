@@ -400,3 +400,26 @@ Toggling used to write the browser tab's snapshot of the disabled list over the
 file. A second tab or a socket reconnect racing `on_load` could push a stale
 list and re-enable channels turned off elsewhere. Toggles now read-modify-write
 the prefs file, so the file is the only source of truth.
+
+## New upstream channels appear enabled in Settings
+
+Refresh replaces the channel list with a fresh scrape (channels gone upstream
+drop off, new ones appear). Ids never scraped before are now recorded in
+`channel_seen.json` (next to `channel_prefs.json`) and added to the disabled
+set on first sight, so additions start OFF. The first run after upgrading only
+seeds the seen-file; nothing already listed is touched.
+
+## Schedule page: dates / filters
+
+Times are parsed as Europe/London wall-clock (upstream says "UK GMT" but means
+local UK time, so summer listings were an hour off). The filter card has
+From/To date inputs, All/None tag buttons and a shown/total count. Upstream
+only publishes the current day's schedule, so the range is usually one day.
+
+## Enabling a channel from a schedule event
+
+Settings → **Schedule** → *Load schedule* lists every upstream event with its
+channels, disabled ones included (the public /schedule page hides those). Grey
+chip = off, click to enable; green = already on, click to disable; *Enable all*
+switches on every listed channel for that event. "(not in list)" means upstream
+cites an id that is not in the channel list, so it cannot be played or enabled.

@@ -86,6 +86,42 @@ def set_source(channel_id: str, player: str) -> None:
         os.replace(tmp, SOURCES_FILE)
 
 
+# --- newly discovered channels ---------------------------------------------
+# Upstream's list grows on its own; the admin wants additions to start OFF, not
+# silently join the playlist. Every id ever scraped is remembered here; an id
+# seen for the first time goes straight into the disabled set.
+
+SEEN_FILE = os.environ.get(
+    "CHANNEL_SEEN_FILE",
+    os.path.join(os.path.dirname(PREFS_FILE) or ".", "channel_seen.json"),
+)
+
+
+def register_channels(ids: Iterable[str]) -> Set[str]:
+    """Record a fresh scrape. Returns the ids that were new (now disabled).
+
+    First ever run (no seen file) just seeds the file — disabling the whole
+    existing list on upgrade would be the wrong surprise.
+    """
+    ids = {str(i) for i in ids}
+    try:
+        with open(SEEN_FILE, "r") as f:
+            seen = {str(i) for i in json.load(f)}
+    except (FileNotFoundError, ValueError, TypeError):
+        seen = None
+    new = set() if seen is None else ids - seen
+    if new:
+        set_disabled(disabled_ids() | new)
+    if seen is None or new:
+        with _write_lock:
+            os.makedirs(os.path.dirname(SEEN_FILE) or ".", exist_ok=True)
+            tmp = f"{SEEN_FILE}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(sorted((seen or set()) | ids), f)
+            os.replace(tmp, SEEN_FILE)
+    return new
+
+
 if __name__ == "__main__":
     import tempfile
 
@@ -106,4 +142,12 @@ if __name__ == "__main__":
         assert source_for("1") == "cast" and source_for("2") == ""
         set_source("1", "")  # back to automatic
         assert source_for("1") == "" and sources() == {}
+        SEEN_FILE = os.path.join(d, "seen.json")
+        set_disabled([])
+        assert register_channels(["1", "2"]) == set(), "first run seeds, disables nothing"
+        assert disabled_ids() == set()
+        assert register_channels(["1", "2", "3"]) == {"3"}, "new id is disabled"
+        assert disabled_ids() == {"3"}
+        set_disabled([])  # admin enables 3
+        assert register_channels(["1", "3"]) == set() and disabled_ids() == set(), "seen ids never re-disabled"
         print("channel_prefs ok")

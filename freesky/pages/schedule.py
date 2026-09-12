@@ -26,6 +26,9 @@ class ScheduleState(rx.State):
     categories: Dict[str, bool] = {}
     switch: bool = True
     search_query: str = ""
+    # ISO dates (YYYY-MM-DD) from the native date inputs; "" = unbounded.
+    date_from: str = ""
+    date_to: str = ""
     # Distinguishes "still fetching" from "fetched, nothing there". Without it an
     # empty schedule rendered the loading spinner forever, which looked broken.
     loaded: bool = False
@@ -49,6 +52,10 @@ class ScheduleState(rx.State):
 
     def toggle_category(self, category):
         self.categories[category] = not self.categories.get(category, False)
+
+    @rx.event
+    def set_all_categories(self, on: bool):
+        self.categories = {c: on for c in self.categories}
 
     def double_category(self, category):
         for cat in self.categories:
@@ -77,7 +84,9 @@ class ScheduleState(rx.State):
                     for event in days[day][category]:
                         time = event["time"]
                         hour, minute = map(int, time.split(":"))
-                        event_dt = dt.replace(hour=hour, minute=minute).replace(tzinfo=ZoneInfo("UTC"))
+                        # Upstream labels the day "Schedule Time UK GMT" but the
+                        # times are wall-clock London (BST in summer), not UTC.
+                        event_dt = dt.replace(hour=hour, minute=minute, tzinfo=ZoneInfo("Europe/London"))
                         channels = self.get_channels(event.get("channels"))
                         channels.extend(self.get_channels(event.get("channels2")))
                         channels.sort(key=lambda channel: channel["name"])
@@ -102,17 +111,37 @@ class ScheduleState(rx.State):
     def set_search_query(self, value: str):
         self.search_query = value
 
+    @rx.event
+    def set_date_from(self, value: str):
+        self.date_from = value
+
+    @rx.event
+    def set_date_to(self, value: str):
+        self.date_to = value
+
     @rx.var
     def filtered_events(self) -> List[EventItem]:
         now = datetime.now(ZoneInfo("UTC")) - timedelta(minutes=30)
         query = self.search_query.strip().lower()
 
+        def in_range(dt: datetime) -> bool:
+            # ponytail: compared on the London calendar day the listing uses,
+            # not the viewer's local day; an event near midnight can land a day
+            # off for far-away zones. Ship the browser tz if that bites.
+            day = dt.astimezone(ZoneInfo("Europe/London")).date().isoformat()
+            return (not self.date_from or day >= self.date_from) and (not self.date_to or day <= self.date_to)
+
         return [
             event for event in self.events
             if self.categories.get(event["category"], False)
                and (not self.switch or event["dt"] > now)
+               and in_range(event["dt"])
                and (query == "" or query in event["name"].lower())
         ]
+
+    @rx.var
+    def shown_count(self) -> str:
+        return f"{len(self.filtered_events)} of {len(self.events)} events"
 
 
 def event_card(event: EventItem) -> rx.Component:
@@ -170,6 +199,8 @@ def schedule() -> rx.Component:
                             ),
                             rx.hstack(
                                 rx.text("Filter by tag:"),
+                                rx.button("All", size="1", variant="soft", on_click=ScheduleState.set_all_categories(True)),
+                                rx.button("None", size="1", variant="soft", on_click=ScheduleState.set_all_categories(False)),
                                 rx.foreach(ScheduleState.categories, category_badge),
                                 spacing="2",
                                 wrap="wrap",
@@ -182,7 +213,15 @@ def schedule() -> rx.Component:
                                     checked=ScheduleState.switch,
                                     margin_top="0.2rem"
                                 ),
+                                rx.text("From", margin_left="1rem"),
+                                rx.input(type="date", value=ScheduleState.date_from, on_change=ScheduleState.set_date_from, size="1"),
+                                rx.text("To"),
+                                rx.input(type="date", value=ScheduleState.date_to, on_change=ScheduleState.set_date_to, size="1"),
+                                rx.text(ScheduleState.shown_count, color="gray", size="2", margin_left="auto"),
                                 margin_top="0.5rem",
+                                wrap="wrap",
+                                align="center",
+                                width="100%",
                             ),
                         ),
                         rx.cond(
