@@ -196,54 +196,15 @@ async def _get_stream_parallel(channel_id: str, prefer: str = None):
         # room to try more than one player.
         deadline = time.time() + 13.0
 
-        while pending:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
+        try:
+            return await _race_stream_tasks(channel_id, pending, deadline, start_time)
+        finally:
+            # Callers wrap us in wait_for; on that cancel the racers leaked and
+            # logged "Task exception was never retrieved" minutes later.
+            for task in pending:
+                if not task.done():
+                    task.cancel()
 
-            done, pending = await asyncio.wait(
-                pending,
-                return_when=asyncio.FIRST_COMPLETED,
-                timeout=remaining
-            )
-            if not done:
-                break  # timed out
-
-            for task in done:
-                try:
-                    result = await task
-                except Exception as e:
-                    logger.debug(f"Parallel task {task.get_name()} failed: {str(e)}")
-                    continue
-                if result:
-                    for other in pending:
-                        other.cancel()
-                    response_time = time.time() - start_time
-                    stream_monitor.record_stream_attempt(channel_id, True, response_time)
-                    logger.info(f"Parallel stream success from {task.get_name()} in {response_time:.2f}s")
-                    return result
-
-        # Nothing succeeded within the deadline — drop whatever is still running.
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-
-        # If all parallel attempts failed, try sequential fallback
-        logger.warning("All parallel attempts failed, trying sequential fallback")
-        fallback_result = await multi_streamer.get_stream(channel_id)
-        
-        if fallback_result:
-            response_time = time.time() - start_time
-            stream_monitor.record_stream_attempt(channel_id, True, response_time)
-            return fallback_result
-        else:
-            stream_monitor.record_stream_attempt(channel_id, False, 0.0)
-            return None
-        
     except Exception as e:
         logger.error(f"Error in parallel stream fetch: {str(e)}")
         stream_monitor.record_stream_attempt(channel_id, False, 0.0)
@@ -256,6 +217,59 @@ async def _get_stream_parallel(channel_id: str, prefer: str = None):
             return fallback_result
         except:
             return None
+
+
+async def _race_stream_tasks(channel_id: str, pending: set, deadline: float, start_time: float):
+    """First task that SUCCEEDS wins; then the sequential fallback. Split out so
+    _get_stream_parallel can cancel `pending` in a finally on outer cancellation."""
+    while pending:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+
+        done, pending = await asyncio.wait(
+            pending,
+            return_when=asyncio.FIRST_COMPLETED,
+            timeout=remaining
+        )
+        if not done:
+            break  # timed out
+
+        for task in done:
+            try:
+                result = await task
+            except Exception as e:
+                logger.debug(f"Parallel task {task.get_name()} failed: {str(e)}")
+                continue
+            if result:
+                for other in pending:
+                    other.cancel()
+                response_time = time.time() - start_time
+                stream_monitor.record_stream_attempt(channel_id, True, response_time)
+                logger.info(f"Parallel stream success from {task.get_name()} in {response_time:.2f}s")
+                return result
+
+    # Nothing succeeded within the deadline — drop whatever is still running.
+    for task in pending:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+    # If all parallel attempts failed, try sequential fallback
+    logger.warning("All parallel attempts failed, trying sequential fallback")
+    fallback_result = await multi_streamer.get_stream(channel_id)
+    
+    if fallback_result:
+        response_time = time.time() - start_time
+        stream_monitor.record_stream_attempt(channel_id, True, response_time)
+        return fallback_result
+    else:
+        stream_monitor.record_stream_attempt(channel_id, False, 0.0)
+        return None
+
 
 async def prefetch_segments(m3u8_content: str, channel_id: str):
     """Prefetch the first few segments of a stream for faster playback"""
@@ -796,12 +810,12 @@ class _UpstreamTransient(Exception):
 
 _RETRYABLE_EXC = (httpx.TransportError, asyncio.TimeoutError, _UpstreamTransient)
 _RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
-_UPSTREAM_ATTEMPTS = 3
+_UPSTREAM_ATTEMPTS = 2
 # Per-attempt wait for upstream HEADERS. Caddy gives /api/content 35s to answer
-# (Caddyfile response_header_timeout); 3 x 30s here blew straight through it,
-# so a slow CDN became a Caddy 504 and the player dropped the channel. 3 x 8s
-# + backoff stays under the budget with room to spare.
-_UPSTREAM_TIMEOUT = 8.0
+# (Caddyfile response_header_timeout); 3 x 30s here blew straight through it.
+# The tighter ceiling is Dispatcharr, which kills ffmpeg after ~10s with no
+# bytes, so a segment must answer (or fail so ffmpeg skips it) inside that.
+_UPSTREAM_TIMEOUT = 5.0
 
 
 def _describe(exc: Exception) -> str:
@@ -845,7 +859,12 @@ _nested_alias = {}                          # old proxied path -> (new path, new
 _content_channel = LRUCache(maxsize=4096)   # proxied playlist path -> channel id
 _NESTED_FRESH_OK = 20.0    # serve stale without trying anything else
 _NESTED_STALE_OK = 120.0   # absolute ceiling for a stale copy
-_NESTED_ATTEMPTS, _NESTED_TIMEOUT = 2, 6.0   # 2x6s + failover must fit Caddy's 35s
+_NESTED_ATTEMPTS, _NESTED_TIMEOUT = 2, 6.0   # no stale copy: 2x6s + failover must fit Caddy's 35s
+# With a stale copy in hand a reload must answer FAST: Dispatcharr kills ffmpeg
+# after ~10s without bytes, so one short attempt then serve stale. Re-resolving
+# the feed happens in the background and lands as an alias for the next reload.
+_NESTED_FAST_ATTEMPTS, _NESTED_FAST_TIMEOUT = 1, 4.0
+_failover_tasks: Dict[str, asyncio.Task] = {}  # proxied path -> in-flight background failover
 _CONTENT_M3U8_RE = re.compile(r"^/api/content/([^/\s]+)(?:/([^/\s]+))?\.m3u8", re.M)
 
 
@@ -858,12 +877,14 @@ def _remember_playlist_paths(playlist: str, channel_id: str) -> None:
         _content_channel[m.group(1)] = channel_id
 
 
-async def _fetch_nested(path: str, ref: str):
+async def _fetch_nested(path: str, ref: str, fast: bool = False):
     """Fetch + rewrite one nested playlist. Returns ("m3u8", text) or ("raw", httpx.Response).
-    Raises on upstream failure."""
+    Raises on upstream failure. `fast` = one short attempt (caller has a stale copy)."""
     upstream_url = free_sky.content_url(path)
+    attempts, timeout = ((_NESTED_FAST_ATTEMPTS, _NESTED_FAST_TIMEOUT) if fast
+                         else (_NESTED_ATTEMPTS, _NESTED_TIMEOUT))
     nested = await _get_upstream_with_retry(
-        upstream_url, _upstream_headers(ref), attempts=_NESTED_ATTEMPTS, timeout=_NESTED_TIMEOUT
+        upstream_url, _upstream_headers(ref), attempts=attempts, timeout=timeout
     )
     # The URL is only a hint: this CDN also serves binary segments from paths
     # containing ".m3u8"; decoding those as text raised UnicodeDecodeError -> 500.
@@ -916,23 +937,43 @@ async def _failover_nested(path: str):
     return payload
 
 
+def _failover_in_background(path: str) -> None:
+    """Start (at most one) background re-resolve for `path`; result lands in _nested_alias."""
+    task = _failover_tasks.get(path)
+    if task and not task.done():
+        return
+
+    def _done(t: asyncio.Task) -> None:
+        _failover_tasks.pop(path, None)
+        if not t.cancelled() and t.exception():
+            logger.error(f"Background failover for {path[:24]}... crashed: {_describe(t.exception())}")
+
+    task = asyncio.create_task(_failover_nested(path))
+    task.add_done_callback(_done)
+    _failover_tasks[path] = task
+
+
 async def _nested_playlist(path: str, ref: str):
-    """The always-200 policy described above. Returns ("m3u8", text) or ("raw", resp)."""
+    """The always-200 policy described above. Returns ("m3u8", text) or ("raw", resp).
+
+    Wall-clock matters more than freshness here: the client is ffmpeg with no
+    reconnect behind Dispatcharr's stall timer, so a reload never blocks on
+    retries/failover when a stale copy can answer instead."""
     path, ref = _nested_alias.get(path, (path, ref))
+    stale = _nested_cache.get(path)
+    age = time.time() - stale[1] if stale else None
+    have_stale = stale is not None and age < _NESTED_STALE_OK
     try:
-        return await _fetch_nested(path, ref)
+        return await _fetch_nested(path, ref, fast=have_stale)
     except Exception as e:
-        stale = _nested_cache.get(path)
-        age = time.time() - stale[1] if stale else None
-        if stale and age < _NESTED_FRESH_OK:
+        if have_stale:
+            if age >= _NESTED_FRESH_OK:
+                _failover_in_background(path)  # feed looks dead, not hiccuping
             logger.warning(f"Nested playlist fetch failed ({_describe(e)}); serving {age:.0f}s-old copy")
             return "m3u8", stale[0]
         payload = await _failover_nested(path)
         if payload is not None:
             return "m3u8", payload
-        if stale and age < _NESTED_STALE_OK:
-            logger.warning(f"Nested playlist fetch failed ({_describe(e)}), no failover; serving {age:.0f}s-old copy")
-            return "m3u8", stale[0]
         raise
 
 
@@ -944,7 +985,7 @@ def _release_session(session_id: str, channel_id: str) -> None:
     if sessions and session_id in sessions:
         del sessions[session_id]
         session_to_channel.pop(session_id, None)
-        logger.info(f"Cleaned up content stream session {session_id} for channel {channel_id}. Remaining sessions for this channel: {len(sessions)}")
+        logger.info(f"Cleaned up content stream session {session_id} for channel {channel_id}. Remaining segment fetches for this channel: {len(sessions)}")
         if not sessions:
             del active_content_sessions[channel_id]
 
@@ -978,7 +1019,7 @@ async def content(path: str, request: Request, ref: str = None):
         active_content_sessions[channel_id][session_id] = current_time
         session_to_channel[session_id] = channel_id
         
-        logger.info(f"Starting content stream session {session_id} for channel {channel_id}. Total active content sessions for this channel: {len(active_content_sessions[channel_id])}")
+        logger.info(f"Starting content stream session {session_id} for channel {channel_id}. Concurrent segment fetches for this channel: {len(active_content_sessions[channel_id])}")
         
         # Use dedicated content semaphore for higher throughput
         async with _content_semaphore:

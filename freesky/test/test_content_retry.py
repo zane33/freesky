@@ -4,6 +4,7 @@ A connect timeout on a playlist fetch used to kill the whole stream because
 players read a 500 as "channel is dead".
 """
 import asyncio
+import time
 import types
 
 import httpx
@@ -30,11 +31,11 @@ def _ok(body=b"#EXTM3U"):
 
 
 def test_retries_transient_then_succeeds():
-    client, calls = _fake_client([httpx.ConnectTimeout(""), httpx.Response(502), _ok()])
+    client, calls = _fake_client([httpx.Response(502), _ok()])
     backend.streaming_client = client
     resp = asyncio.run(backend._get_upstream_with_retry("http://x/a.m3u8", {}))
     assert resp.status_code == 200
-    assert len(calls) == 3
+    assert len(calls) == 2
 
 
 def test_gives_up_after_max_attempts():
@@ -144,10 +145,44 @@ def test_nested_playlist_serves_recent_stale_copy_on_cdn_failure():
     backend._nested_cache.clear(); backend._nested_alias.clear()
     _fail_client([httpx.Response(200, content=b"#EXTM3U\nhttp://cdn/live/1.ts\n")])
     assert _nested_request(path).status_code == 200 and path in backend._nested_cache
-    _fail_client([httpx.ConnectTimeout("")] * backend._NESTED_ATTEMPTS)
+    calls = _fail_client([httpx.ConnectTimeout("")] * backend._NESTED_ATTEMPTS)
     resp = _nested_request(path)
     assert resp.status_code == 200
     assert b"/api/content/" in resp.body and b"token=t" in resp.body
+    # one short attempt only: Dispatcharr kills ffmpeg after ~10s without bytes
+    assert len(calls) == backend._NESTED_FAST_ATTEMPTS
+    assert not backend._failover_tasks, "a fresh stale copy is a hiccup, not a dead feed"
+
+
+def test_nested_playlist_old_stale_copy_served_now_failover_in_background():
+    """Stale copy older than the hiccup window -> still answer immediately with
+    it, and re-resolve the feed off the request path; the alias lands for the
+    next reload."""
+    old = backend.encrypt("http://cdn-a/old.m3u8")
+    backend._nested_cache.clear(); backend._nested_alias.clear(); backend._failover_tasks.clear()
+    backend._content_channel[old] = "42"
+    backend._nested_cache[old] = ("#EXTM3U\n/api/content/stale.ts\n", time.time() - backend._NESTED_FRESH_OK - 1)
+
+    async def fake_resolve(channel_id, prefer=None):
+        return "#EXTM3U\nhttp://cdn-b/new.m3u8\n"
+    orig = backend._get_stream_parallel
+    backend._get_stream_parallel = fake_resolve
+    try:
+        # old feed dead (1 fast attempt), new feed answers (background)
+        calls = _fail_client([httpx.ConnectTimeout(""),
+                              httpx.Response(200, content=b"#EXTM3U\nhttp://cdn-b/9.ts\n")])
+
+        async def run():
+            t0 = time.time()
+            kind, payload = await backend._nested_playlist(old, None)
+            assert kind == "m3u8" and "stale.ts" in payload
+            assert len(calls) == 1, "request must not wait for the failover"
+            assert old in backend._failover_tasks
+            await backend._failover_tasks[old]
+            assert old in backend._nested_alias and "cdn-b" in calls[1]
+        asyncio.run(run())
+    finally:
+        backend._get_stream_parallel = orig
 
 
 def test_nested_playlist_fails_over_to_new_feed():

@@ -443,3 +443,26 @@ URL, later reloads aliased to it); a stale copy up to 120s; only then an
 error. Playlist fetches use 2 x 6s so the whole chain fits under Caddy's 35s
 `response_header_timeout`. Look for "serving Ns-old copy" and "failed over to
 a new feed" in the log.
+
+### Streams die during upstream outages even with the stale-copy policy
+
+**Symptom:** Log shows `Nested playlist fetch failed ... serving 16s-old copy` and
+a Caddy access line with `duration=8.16` or `duration=16.9` for the `.m3u8`
+request, then Dispatcharr restarts the stream.
+
+**Cause:** Dispatcharr kills ffmpeg after roughly 10s without bytes. The
+playlist reload was correct (always 200) but too slow: two 6s attempts plus a
+12s inline failover before the stale copy went out.
+
+**Fix (backend.py `_nested_playlist`):** wall-clock beats freshness.
+- Stale copy on hand -> ONE 4s attempt, then serve the stale copy immediately.
+- Stale copy older than 20s -> feed is dead, not hiccuping. Re-resolve in a
+  background task (`_failover_in_background`, one per path); the alias lands
+  for the next reload, the current request never waits for it.
+- No stale copy (first load) -> unchanged: 2x6s, then inline failover.
+- Segments: 2x5s instead of 3x8s so a bad segment fails inside the 10s window
+  and ffmpeg skips it.
+
+The `Concurrent segment fetches for this channel: 2` log line (formerly "active
+content sessions") is per-request, not per-viewer: ffmpeg prefetches the next
+segment while the current one downloads. `Active streams: N` is the viewer count.
