@@ -46,6 +46,7 @@ class SettingsState(rx.State):
     channels: List[Channel] = []
     disabled: List[str] = []
     search: str = ""
+    show: str = "All"  # All | Enabled | Disabled
     refreshing: bool = False
 
     # User management (admin only — the page itself is admin-gated)
@@ -458,11 +459,14 @@ class SettingsState(rx.State):
 
     @rx.var
     def matching(self) -> List[Channel]:
-        """Channels matching the search box, before paging."""
-        if not self.search:
-            return self.channels
+        """Channels matching the search box and enabled/disabled filter, before paging."""
         q = self.search.lower()
-        return [c for c in self.channels if q in c.name.lower()]
+        off = set(self.disabled)
+        return [
+            c for c in self.channels
+            if (not q or q in c.name.lower())
+            and (self.show == "All" or (c.id in off) == (self.show == "Disabled"))
+        ]
 
     @rx.var
     def page_count(self) -> int:
@@ -539,6 +543,11 @@ class SettingsState(rx.State):
     def set_search(self, query: str):
         self.search = query
         self.page = 0  # otherwise a narrow search lands on an empty page
+
+    @rx.event
+    def set_show(self, value: str):
+        self.show = value
+        self.page = 0
 
     @rx.event
     def next_page(self):
@@ -1567,6 +1576,12 @@ def settings() -> rx.Component:
                         value=SettingsState.search,
                         on_change=SettingsState.set_search,
                         flex="1",
+                    ),
+                    rx.select(
+                        ["All", "Enabled", "Disabled"],
+                        value=SettingsState.show,
+                        on_change=SettingsState.set_show,
+                        width="120px",
                     ),
                     rx.button(
                         SettingsState.enable_all_label,

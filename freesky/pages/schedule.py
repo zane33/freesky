@@ -141,7 +141,13 @@ class ScheduleState(rx.State):
 
     @rx.var
     def shown_count(self) -> str:
-        return f"{len(self.filtered_events)} of {len(self.events)} events"
+        """Say WHY events are hidden. "6 of 77" alone read as a bug when the
+        missing 71 had simply already kicked off."""
+        shown = len(self.filtered_events)
+        cutoff = datetime.now(ZoneInfo("UTC")) - timedelta(minutes=30)
+        past = sum(1 for e in self.events if e["dt"] <= cutoff) if self.switch else 0
+        note = f" · {past} already started (hidden)" if past else ""
+        return f"{shown} of {len(self.events)} events{note}"
 
 
 def event_card(event: EventItem) -> rx.Component:
