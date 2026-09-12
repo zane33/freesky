@@ -52,6 +52,33 @@
 - Check cache hit rates using `/health` endpoint
 - Use the performance monitoring script: `python monitor_performance.py http://localhost:${PORT:-3000}`
 
+### 5. Stream drops with `Error proxying content for session ...` (empty message)
+
+**Symptom**: playback stops; the log shows a 500 on `/api/content/...` and an
+error line with no cause after it, e.g.
+
+```
+ERROR - Error proxying content for session content_...:
+... status=500 duration=3.5
+```
+
+**Cause**: a transient upstream CDN failure — usually a connect timeout (the
+streaming client has a 3s connect budget) or a 5xx — on a playlist or segment
+fetch. httpx timeout exceptions carry an empty message, which is why the log
+line looked blank. The proxy returned 500, and every player reads a 500 on a
+playlist as "channel is dead" rather than retrying.
+
+**Fix (already applied)**: `/api/content` now retries transient upstream
+failures up to 3 times with a short backoff (`_UPSTREAM_ATTEMPTS` in
+`freesky/backend.py`). Segment streams are retried only before the first byte
+reaches the client, since restarting mid-body would corrupt the segment. Hard
+failures (403/404) are still surfaced immediately, and errors are logged with
+their exception type so empty-message failures are identifiable.
+
+**If it persists**: repeated `ConnectTimeout` after 3 attempts means the CDN
+edge is genuinely unreachable from the host — check DNS/IPv6 and any SOCKS5
+proxy configuration.
+
 ## Performance Optimizations
 
 ### Environment Variables for Performance
