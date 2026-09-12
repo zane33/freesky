@@ -377,3 +377,26 @@ instead of corrupting the profile.
 **Do not raise `WORKERS`** while virtual channels are in use. A single async
 worker is I/O-bound and ample for this load. It is also required for
 `/api/content` URLs, which are encrypted with a per-process key.
+
+## Dispatcharr / ffmpeg: stream drops with `ValueError: Upstream returned HTTP 403` traceback
+
+The CDN's segment URLs carry a path-embedded expiry. When one 403s, the proxy
+used to raise *inside* the response body after the `200` headers were already
+sent, so the client saw a dropped connection and a traceback filled the log.
+`/api/content/...` now opens the upstream before answering: a hard upstream
+status (403/404) is relayed as that status, transient ones (5xx/timeouts) are
+retried, and all cached `/api/stream` playlists are dropped so the player's
+next playlist request re-resolves a fresh feed.
+
+## Channels missing after importing the playlist into Dispatcharr
+
+Every `#EXTINF` now carries `tvg-id="<channel id>"` and `tvg-name`. Without them
+importers de-duplicate same-named feeds (e.g. two "SEE Denmark", the event
+"Backup Stream" feeds) into a single stream. Re-import the M3U after upgrading.
+
+## Channels re-enable themselves in Settings
+
+Toggling used to write the browser tab's snapshot of the disabled list over the
+file. A second tab or a socket reconnect racing `on_load` could push a stale
+list and re-enable channels turned off elsewhere. Toggles now read-modify-write
+the prefs file, so the file is the only source of truth.

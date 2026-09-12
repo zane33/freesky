@@ -823,6 +823,19 @@ async def _get_upstream_with_retry(url: str, headers: dict) -> httpx.Response:
             await asyncio.sleep(0.3 * (attempt + 1))
 
 
+def _release_session(session_id: str, channel_id: str) -> None:
+    """Drop a content session from the tracking maps (idempotent)."""
+    if not session_id or not channel_id:
+        return
+    sessions = active_content_sessions.get(channel_id)
+    if sessions and session_id in sessions:
+        del sessions[session_id]
+        session_to_channel.pop(session_id, None)
+        logger.info(f"Cleaned up content stream session {session_id} for channel {channel_id}. Remaining sessions for this channel: {len(sessions)}")
+        if not sessions:
+            del active_content_sessions[channel_id]
+
+
 @fastapi_app.get("/api/content/{path}/{ref}")
 @fastapi_app.get("/api/content/{path}")
 async def content(path: str, request: Request, ref: str = None):
@@ -869,6 +882,7 @@ async def content(path: str, request: Request, ref: str = None):
                 # The URL is only a hint: this CDN also serves binary segments from
                 # paths containing ".m3u8", and decoding those as text raised
                 # UnicodeDecodeError -> 500. Trust the body, not the name.
+                _release_session(session_id, channel_id)
                 if not nested.content.startswith(b"#EXTM3U"):
                     return Response(
                         content=nested.content,
@@ -897,91 +911,82 @@ async def content(path: str, request: Request, ref: str = None):
                     },
                 )
 
+            # Open upstream BEFORE building the response. Raising inside the body
+            # generator after the 200 headers were already sent surfaced as a
+            # traceback + dropped connection, which Dispatcharr/ffmpeg treated as the
+            # stream dying. Now a 403 upstream is a 403 downstream and the player
+            # simply re-asks for the playlist.
+            response = None
+            for attempt in range(_UPSTREAM_ATTEMPTS):
+                cm = streaming_client.stream("GET", upstream_url, headers=upstream_headers, timeout=30.0)
+                try:
+                    response = await asyncio.wait_for(cm.__aenter__(), 30.0)
+                    if response.status_code in _RETRYABLE_STATUS:
+                        raise _UpstreamTransient(f"Upstream returned HTTP {response.status_code}")
+                    break
+                except _RETRYABLE_EXC as e:
+                    await cm.__aexit__(None, None, None)
+                    response = None
+                    if attempt == _UPSTREAM_ATTEMPTS - 1:
+                        logger.warning(f"Stream session {session_id} gave up: {_describe(e)}")
+                        _release_session(session_id, channel_id)
+                        return Response(status_code=status.HTTP_502_BAD_GATEWAY)
+                    logger.warning(f"Stream session {session_id} failed to start ({_describe(e)}), retrying ({attempt + 1}/{_UPSTREAM_ATTEMPTS})")
+                    await asyncio.sleep(0.3 * (attempt + 1))
+
+            if response.status_code != 200:
+                logger.warning(f"Stream session {session_id} upstream HTTP {response.status_code}")
+                await cm.__aexit__(None, None, None)
+                _release_session(session_id, channel_id)
+                # ponytail: a 403/404 on a segment means the resolved feed is stale
+                # (path-embedded expiry). Drop every cached playlist so the next
+                # /api/stream re-resolves; cache is 90s anyway. Per-channel
+                # invalidation if the blanket clear ever shows up as latency.
+                stream_cache.clear()
+                return Response(status_code=response.status_code)
+
             async def proxy_stream():
                 last_heartbeat = time.time()
                 chunk_count = 0
-                
                 try:
-                    # Retry is only safe before the first chunk reaches the client;
-                    # after that the response body is already partly written and
-                    # restarting would corrupt the segment.
-                    for attempt in range(_UPSTREAM_ATTEMPTS):
-                        try:
-                            async with asyncio.timeout(30.0):  # Reduced timeout for faster failure detection
-                                async with streaming_client.stream("GET", upstream_url, headers=upstream_headers, timeout=30.0) as response:
-                                    logger.info(f"Stream session {session_id} established connection (status: {response.status_code})")
-                                    if response.status_code != 200:
-                                        # Surfacing this beats streaming an empty 200 body, which
-                                        # looked like success and hid the 403 entirely.
-                                        if response.status_code in _RETRYABLE_STATUS:
-                                            raise _UpstreamTransient(f"Upstream returned HTTP {response.status_code}")
-                                        raise ValueError(f"Upstream returned HTTP {response.status_code}")
-
-                                    # Use larger chunk size for better throughput
-                                    async for chunk in response.aiter_bytes(chunk_size=512 * 1024):  # 512KB chunks for optimal performance
-                                        chunk_count += 1
-                                        current_chunk_time = time.time()
-
-                                        # Update session timestamp less frequently to reduce overhead
-                                        if current_chunk_time - last_heartbeat > 5:
-                                            if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
-                                                active_content_sessions[channel_id][session_id] = current_chunk_time
-                                                last_heartbeat = current_chunk_time
-
-                                        yield chunk
-                            break
-                        except _RETRYABLE_EXC as e:
-                            if chunk_count or attempt == _UPSTREAM_ATTEMPTS - 1:
-                                raise
-                            logger.warning(f"Stream session {session_id} failed to start ({_describe(e)}), retrying ({attempt + 1}/{_UPSTREAM_ATTEMPTS})")
-                            await asyncio.sleep(0.3 * (attempt + 1))
-
+                    async for chunk in response.aiter_bytes(chunk_size=512 * 1024):
+                        chunk_count += 1
+                        now = time.time()
+                        if now - last_heartbeat > 5:
+                            if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
+                                active_content_sessions[channel_id][session_id] = now
+                                last_heartbeat = now
+                        yield chunk
                     logger.info(f"Stream session {session_id} completed normally after {chunk_count} chunks")
-                except asyncio.TimeoutError:
-                    logger.warning(f"Stream session {session_id} timed out after 30 seconds")
-                    raise
                 except Exception as e:
                     logger.error(f"Error in persistent proxy stream for session {session_id}: {_describe(e)}")
                     raise
                 finally:
-                    # Clean up session tracking when streaming actually ends
-                    if session_id and channel_id:
-                        if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
-                            del active_content_sessions[channel_id][session_id]
-                            if session_id in session_to_channel:
-                                del session_to_channel[session_id]
-                            logger.info(f"Cleaned up content stream session {session_id} for channel {channel_id}. Remaining sessions for this channel: {len(active_content_sessions.get(channel_id, {}))}")
-                            
-                            # Clean up empty channel entries
-                            if channel_id in active_content_sessions and not active_content_sessions[channel_id]:
-                                del active_content_sessions[channel_id]
-            
+                    await cm.__aexit__(None, None, None)
+                    _release_session(session_id, channel_id)
+
             return StreamingResponse(
-                proxy_stream(), 
-                media_type="application/octet-stream",
+                proxy_stream(),
+                media_type=response.headers.get("content-type", "application/octet-stream"),
                 headers={
                     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                     "Access-Control-Allow-Headers": "*",
                     "Access-Control-Expose-Headers": "*",
                     "Cache-Control": "public, max-age=3600",
                     "Accept-Ranges": "bytes",
-                    "Transfer-Encoding": "chunked",
                     "X-Session-ID": session_id
                 }
             )
     except Exception as e:
         logger.error(f"Error proxying content for session {session_id}: {_describe(e)}")
-        # Clean up session on error
-        if session_id and channel_id:
-            if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
-                del active_content_sessions[channel_id][session_id]
-                if session_id in session_to_channel:
-                    del session_to_channel[session_id]
-                logger.info(f"Cleaned up failed content stream session {session_id} for channel {channel_id}")
-                
-                # Clean up empty channel entries
-                if channel_id in active_content_sessions and not active_content_sessions[channel_id]:
-                    del active_content_sessions[channel_id]
+        _release_session(session_id, channel_id)
+        # A nested-playlist fetch that hit a hard upstream status (403/404) is
+        # relayed as that status, and the cached playlists that led here are
+        # dropped so the next /api/stream request re-resolves the feed.
+        m = re.search(r"Upstream returned HTTP (\d+)", str(e))
+        if m:
+            stream_cache.clear()
+            return Response(status_code=int(m.group(1)))
         return JSONResponse(content={"error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 async def update_channels():

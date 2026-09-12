@@ -766,7 +766,11 @@ class StepDaddyHybrid:
             # which has no idea what host the playlist came from.
             if logo and logo.startswith("/"):
                 logo = f"{base}{logo}"
-            entry = f" tvg-logo=\"{logo}\",{channel.name}" if logo else f",{channel.name}"
+            # tvg-id/tvg-name make every row unique for importers like Dispatcharr,
+            # which otherwise collapse same-named feeds ("SEE Denmark" x2, event
+            # "Backup Stream" ids) into one and the rest go "missing".
+            entry = f" tvg-id=\"{channel.id}\" tvg-name=\"{channel.name}\""
+            entry += f" tvg-logo=\"{logo}\",{channel.name}" if logo else f",{channel.name}"
             data += f"#EXTINF:-1{entry}\n{base}/api/stream/{channel.id}.m3u8{suffix}\n"
         return data
 

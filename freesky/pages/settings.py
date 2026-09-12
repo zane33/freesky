@@ -537,11 +537,12 @@ class SettingsState(rx.State):
     def toggle(self, channel_id: str):
         """Flip one channel. Saved immediately — a Save button would only add a
         way to lose the change."""
-        if channel_id in self.disabled:
-            self.disabled.remove(channel_id)
-        else:
-            self.disabled.append(channel_id)
-        channel_prefs.set_disabled(self.disabled)
+        # Read-modify-write against the FILE, not this tab's snapshot. Writing
+        # self.disabled wholesale meant a stale tab (or a reconnect that raced
+        # on_load) overwrote the file and silently re-enabled channels that
+        # had been switched off elsewhere.
+        disabled = channel_prefs.disabled_ids() ^ {str(channel_id)}
+        self.disabled = sorted(channel_prefs.set_disabled(disabled))
 
     @rx.event
     def add_user(self, form: dict):
@@ -642,9 +643,9 @@ class SettingsState(rx.State):
         unlabelled "Disable shown" did.
         """
         affected = {c.id for c in self.matching}
-        disabled = set(self.disabled) - affected if enabled else set(self.disabled) | affected
-        self.disabled = sorted(disabled)
-        channel_prefs.set_disabled(self.disabled)
+        current = channel_prefs.disabled_ids()  # file is the source of truth, see toggle()
+        disabled = current - affected if enabled else current | affected
+        self.disabled = sorted(channel_prefs.set_disabled(disabled))
         return rx.toast(
             f"{'Enabled' if enabled else 'Disabled'} {len(affected)} channel(s)"
         )
