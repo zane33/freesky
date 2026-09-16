@@ -29,7 +29,7 @@ services:
       - API_URL=http://192.168.3.148:3000  # Explicitly set for correct WebSocket connection
       
       # External Services
-      - DADDYLIVE_URI=${DADDYLIVE_URI:-https://dlhd.st}
+      - DADDYLIVE_URI=${DADDYLIVE_URI:-https://dlive.sx}
       
       # Application Settings
       - CHANNEL_PREFS_FILE=/app/data/channel_prefs.json  # Persisted via the ./data volume below

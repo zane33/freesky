@@ -652,7 +652,8 @@ async def stream(channel_id: str, request: Request = None):
                 # Use parallel multi-service streaming for faster response
                 stream_data = await asyncio.wait_for(
                     _get_stream_parallel(channel_id, prefer=prefer),
-                    timeout=15.0  # Aggressive timeout for parallel approach
+                    timeout=22.0  # must exceed the resolver's own budget (20s)
+                    # so a slow-but-live upstream resolves instead of 504ing
                 )
                 
                 if not stream_data:

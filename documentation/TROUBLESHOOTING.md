@@ -79,6 +79,31 @@ their exception type so empty-message failures are identifiable.
 edge is genuinely unreachable from the host — check DNS/IPv6 and any SOCKS5
 proxy configuration.
 
+### 6. Every channel returns 504 `{"error": "Stream generation timeout"}`
+
+**Symptom**: `/watch/<id>` loads but the player never starts; every
+`/api/stream/<id>.m3u8` (any channel, not just one) returns HTTP 504 after ~15s.
+
+**Cause**: upstream changed. Seen 2026-09, three changes at once:
+1. `dlhd.st` now 301s twice (`dlstreams.st` → `dlive.sx`), adding ~4s per hop and
+   blowing the resolver's per-hop timeout.
+2. The player page stopped obfuscating the URL in `atob('<base64>')` and now
+   assigns it plainly: `var STREAM_URL = "https:\/\/premium.hls.st\/...m3u8"`.
+   The atob-only scanner found zero candidates on every player.
+3. The CDN answers `503 Stream starting, please wait a moment...` while spinning
+   a feed up, which was read as "feed dead".
+
+**Fix**: `StepDaddyHybrid._stream_candidates` scans both the `atob()` and plain
+`STREAM_URL` forms, `_fetch_playlist` retries a 503 twice at 1.5s, the per-hop
+timeout is 8s, the resolve budget 20s and the endpoint timeout 22s.
+
+**When it happens again** (upstream moves roughly every few months): confirm with
+`curl -sLI https://dlive.sx` for a redirect, then set `DADDYLIVE_URI` to the new
+host in `.env` / `docker-compose.yml` and restart. If the host is right but
+resolution still fails, fetch a player page by hand
+(`/<player>/stream-<id>.php` → its iframe) and check how the m3u8 is embedded —
+a new embedding style needs a new pattern in `_stream_candidates`.
+
 ## Performance Optimizations
 
 ### Environment Variables for Performance

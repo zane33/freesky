@@ -225,6 +225,23 @@ class StepDaddyHybrid:
     # survives the next move without a code change.
     _IFRAME_RE = re.compile(r'<iframe[^>]+src=["\']([^"\']+)["\']', re.I)
     _ATOB_RE = re.compile(r"atob\(\s*['\"]([A-Za-z0-9+/=]+)['\"]\s*\)")
+    # As of 2026-09 the player page stopped hiding the URL in atob() and just
+    # assigns it: var STREAM_URL = "https:\/\/premium.hls.st\/playlist\/premium589.m3u8";
+    # Both forms are scanned so either upstream style resolves.
+    _PLAIN_M3U8_RE = re.compile(r'["\'](https?:(?:\\?/)+[^"\']+?\.m3u8[^"\']*)["\']')
+
+    @classmethod
+    def _stream_candidates(cls, page: str):
+        """Every m3u8 URL a player page offers, base64-obfuscated or plain."""
+        for encoded in cls._ATOB_RE.findall(page):
+            try:
+                url = base64.b64decode(encoded).decode()
+            except Exception:
+                continue  # not every atob() on the page is the stream URL
+            if url.startswith("http") and ".m3u8" in url:
+                yield url
+        for url in cls._PLAIN_M3U8_RE.findall(page):
+            yield url.replace("\\/", "/")
 
     # Upstream's watch.php offers several "players", each its own path that leads
     # to an independent iframe chain. Trying them in order gives real failover:
@@ -235,7 +252,7 @@ class StepDaddyHybrid:
 
     async def _resolve_via_iframe_chain(self, channel_id: str, max_hops: int = 4,
                                         max_pages: int = 8, prefer: str = None,
-                                        budget: float = 13.0, single_feed: bool = False):
+                                        budget: float = 20.0, single_feed: bool = False):
         """
         Follow the live upstream chain to a WORKING HLS playlist, failing over
         across the available players.
@@ -291,7 +308,7 @@ class StepDaddyHybrid:
                     # on one bad iframe. Fail that hop fast and try the next player.
                     response = await asyncio.wait_for(
                         self._session.get(url, headers=self._headers(referer)),
-                        timeout=4.0,
+                        timeout=8.0,
                     )
                 except Exception as e:
                     logger.debug(f"Hop failed for {url}: {e}")
@@ -299,32 +316,33 @@ class StepDaddyHybrid:
                 if response.status_code != 200:
                     continue
 
-                for encoded in self._ATOB_RE.findall(response.text):
+                tried_any = False
+                for candidate in self._stream_candidates(response.text):
+                    tried_any = True
                     try:
-                        candidate = base64.b64decode(encoded).decode()
-                    except Exception:
-                        continue  # not every atob() on the page is the stream URL
-                    if candidate.startswith("http") and ".m3u8" in candidate:
-                        try:
-                            content, has_audio = await self._fetch_playlist(candidate, url)
-                        except Exception as e:
-                            # We reached this player's CDN and it returned no real
-                            # playlist: the feed is down. Stop crawling this player's
-                            # ad iframes and move straight to the next player.
-                            last_error = e
-                            player_dead = True
-                            logger.debug(f"Player '{player}' feed dead for {channel_id}: {e}")
-                            break
-                        if has_audio or single_feed:
-                            logger.info(f"Resolved channel {channel_id} via '{player}' player")
-                            return content
-                        # Resolved but video-only. Remember it, then try the next
-                        # player for one that actually carries sound.
-                        if video_only_fallback is None:
-                            video_only_fallback = content
-                        logger.info(f"Player '{player}' for {channel_id} is video-only; trying next for audio")
+                        content, has_audio = await self._fetch_playlist(candidate, url)
+                    except Exception as e:
+                        # Not every m3u8 on the page is the feed (ads, fallbacks),
+                        # so try the rest before writing this player off.
+                        last_error = e
+                        logger.debug(f"Candidate dead for {channel_id}: {candidate}: {e}")
+                        continue
+                    if has_audio or single_feed:
+                        logger.info(f"Resolved channel {channel_id} via '{player}' player")
+                        return content
+                    # Resolved but video-only. Remember it, then try the next
+                    # player for one that actually carries sound.
+                    if video_only_fallback is None:
+                        video_only_fallback = content
+                    logger.info(f"Player '{player}' for {channel_id} is video-only; trying next for audio")
+                    player_dead = True
+                    break
+                else:
+                    # Every m3u8 this page offered was dead: the player's feed is
+                    # down, so stop crawling its ad iframes and move to the next.
+                    if tried_any:
                         player_dead = True
-                        break
+                        logger.debug(f"Player '{player}' feed dead for {channel_id}")
 
                 if not player_dead:
                     for src in self._IFRAME_RE.findall(response.text):
@@ -369,9 +387,16 @@ class StepDaddyHybrid:
         Returns (proxied_playlist, has_audio) so the resolver can fail over off a
         video-only feed to one that actually has sound.
         """
-        response = await self._session.get(m3u8_url, headers=self._headers(referer))
-        if response.status_code != 200 or not response.text.startswith("#EXTM3U"):
-            raise ValueError(f"Bad playlist from {m3u8_url}: HTTP {response.status_code}")
+        # The CDN answers 503 "Stream starting, please wait a moment..." while it
+        # spins the feed up — a live channel, not a dead one. One short retry is
+        # the difference between playing and reporting the player dead.
+        for attempt in range(3):
+            response = await self._session.get(m3u8_url, headers=self._headers(referer))
+            if response.status_code == 200 and response.text.startswith("#EXTM3U"):
+                break
+            if response.status_code != 503 or attempt == 2:
+                raise ValueError(f"Bad playlist from {m3u8_url}: HTTP {response.status_code}")
+            await asyncio.sleep(1.5)
 
         has_audio = self._declares_audio(response.text)
         # Variant/segment URIs are relative to the playlist, but _process_stream_content
