@@ -56,3 +56,27 @@ def test_segment_proxy_connection_hygiene():
     block = block[:block.index(")\n")]
     assert "http2=False" in block, "streaming_client must stay on HTTP/1.1"
     assert "asyncio.wait_for(cm.__aenter__" not in src, "cancelling __aenter__ half-opens connections"
+
+
+def test_caddy_outlives_backend_stream_deadline():
+    """Caddy must not give up on /api/stream before the backend answers.
+
+    The backend's resolve budget was raised without touching the Caddyfile, so
+    Caddy cut every request off at 20s against a 22s backend deadline and returned
+    a bare 504 with no body — no channel would open at all.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    backend = (root / "freesky" / "backend.py").read_text()
+    wait_for = float(re.search(r"timeout=(\d+(?:\.\d+)?)\s*#\s*must exceed the resolver", backend).group(1))
+
+    caddy = (root / "Caddyfile").read_text()
+    stream_block = caddy[caddy.index("@api_stream"):]
+    stream_block = stream_block[:stream_block.index("@api_logo")]
+    caddy_timeout = float(re.search(r"response_header_timeout (\d+)s", stream_block).group(1))
+
+    assert caddy_timeout > wait_for, (
+        f"Caddy gives /api/stream {caddy_timeout}s but the backend may take {wait_for}s"
+    )

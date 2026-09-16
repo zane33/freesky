@@ -197,9 +197,11 @@ services:
           memory: ${MEMORY_LIMIT:-8G}
         reservations:
           memory: 512M
-    
     # Restart Policy
     restart: unless-stopped
+    #GPU Accelration
+    devices:
+      - /dev/dri:/dev/dri
     
     # Health Check
     healthcheck:

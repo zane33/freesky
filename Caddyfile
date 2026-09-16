@@ -106,16 +106,17 @@
 			flush_interval -1
 			header_up X-Real-IP {remote_host}
 			header_down -Server
-			# Resolving a channel can take up to ~13s when the primary player is
-			# down and we fail over to another (see _resolve_via_iframe_chain). A 5s
-			# cap here turned every slow-but-working channel into a 502. Keep it above
-			# the backend's own deadline.
+			# Resolving a channel costs ~11s when the primary player is up and more
+			# when we fail over (see _resolve_via_iframe_chain: 20s budget, wrapped in
+			# a 22s wait_for). This MUST stay above that 22s or Caddy cuts the request
+			# off first and every slow-but-working channel becomes a bare 504 — which
+			# is exactly what a 20s cap here did against a 22s backend deadline.
 			transport http {
 				read_buffer 8192      # Smaller buffer for playlist delivery
 				write_buffer 8192
 				max_response_header 8KB
 				dial_timeout 2s
-				response_header_timeout 20s
+				response_header_timeout 25s
 			}
 		}
 	}
