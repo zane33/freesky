@@ -6,10 +6,12 @@ channel failed over through all six players and 504'd. Both forms must work.
 """
 import base64
 
-from freesky.free_sky_hybrid import StepDaddyHybrid
-
 
 def test_stream_candidates_plain_and_encoded():
+    # imported here, not at module scope: the source-inspection tests below must
+    # still run where reflex/curl_cffi are not installed.
+    from freesky.free_sky_hybrid import StepDaddyHybrid
+
     plain = 'var STREAM_URL = "https:\\/\\/premium.hls.st\\/playlist\\/premium589.m3u8";'
     encoded = "atob('%s')" % base64.b64encode(b"https://cdn.example/live/1.m3u8").decode()
 
@@ -37,3 +39,20 @@ if __name__ == "__main__":
     test_stream_candidates_plain_and_encoded()
     test_playlist_cache_shorter_than_live_window()
     print("ok")
+
+
+def test_segment_proxy_connection_hygiene():
+    """Segments must not share a multiplexed connection.
+
+    With http2=True on streaming_client, a player disconnecting mid-segment left
+    the h2 stream dangling and poisoned the pooled connection: 3 aborted segments
+    took the next fetch on that host from 0.6s to 30.2s, then to instant 502s.
+    Cancelling __aenter__ with asyncio.wait_for half-opened connections the same way.
+    """
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1].joinpath("backend.py").read_text()
+    block = src[src.index("streaming_client = httpx.AsyncClient("):]
+    block = block[:block.index(")\n")]
+    assert "http2=False" in block, "streaming_client must stay on HTTP/1.1"
+    assert "asyncio.wait_for(cm.__aenter__" not in src, "cancelling __aenter__ half-opens connections"

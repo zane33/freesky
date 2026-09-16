@@ -129,6 +129,36 @@ prefetchers were deleted.
 `curl -sk "https://<host>/api/stream/<id>.m3u8?token=..." | grep MEDIA-SEQUENCE`
 twice, ~10s apart — the sequence number must increase.
 
+### 8. Intermittent 502/504 on segments — "hit and miss" in Dispatcharr/VLC
+
+**Symptom**: the channel plays in the browser but an external consumer
+(Dispatcharr, ffmpeg, VLC) is unreliable. Fetching a window's segments by hand
+shows some returning `502` almost instantly and others `504` after exactly 35s
+(Caddy's `response_header_timeout`), while the same upstream URLs fetch fine
+with curl. Failures cluster on one CDN host, then move to another later.
+
+**Cause**: `streaming_client` had `http2=True`. Every request to a CDN host then
+shares ONE connection, and a player disconnecting mid-segment — which ffmpeg does
+constantly as it skips or restarts — left that h2 stream dangling. The connection
+stayed in the pool poisoned. Reproduced: aborting 3 segments mid-download took the
+next fetch on that host from 0.6s to **30.2s**, with later ones failing instantly.
+`asyncio.wait_for(cm.__aenter__(), ...)` made it worse by cancelling requests
+mid-handshake, leaving connections half-open.
+
+**Why the browser looked fine**: hls.js retries a failed segment and skips on;
+ffmpeg treats the same failure as the stream ending.
+
+**Fix**: `streaming_client` uses HTTP/1.1 (`http2=False`) — segments are 5-7MB
+sequential downloads, so multiplexing bought nothing and an aborted HTTP/1.1
+transfer only closes its own connection. The header wait now uses httpx's own
+`read` timeout instead of `asyncio.wait_for`, so a timeout tears the request down
+cleanly. `client` (logos, keys) keeps HTTP/2; those are small and not aborted.
+
+**Diagnosing a repeat**: fetch a playlist, then fetch each `/api/content/` line in
+turn. All-200 is healthy. If some fail, check the same URLs upstream first — if
+upstream is 200 and the proxy is not, it is the proxy, and connection reuse is the
+first place to look.
+
 ## Performance Optimizations
 
 ### Environment Variables for Performance

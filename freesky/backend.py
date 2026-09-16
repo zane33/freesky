@@ -72,7 +72,14 @@ client = httpx.AsyncClient(
 
 # Global persistent streaming client for better connection reuse
 streaming_client = httpx.AsyncClient(
-    http2=True,   # Enable HTTP/2 for better streaming performance
+    # HTTP/1.1 deliberately. Segments are 5-7MB sequential downloads, so h2
+    # multiplexing buys nothing — but it makes every request to a CDN host share
+    # ONE connection, and a player disconnecting mid-segment (ffmpeg skipping or
+    # restarting, which Dispatcharr does constantly) leaves that h2 stream dangling.
+    # Measured: 3 aborted segments took the next fetch on that host from 0.6s to
+    # 30.2s, and later ones failed instantly with a transport error -> 502. On
+    # HTTP/1.1 an aborted transfer just closes its own connection.
+    http2=False,
     timeout=httpx.Timeout(45.0, connect=3.0),  # Aggressive timeouts for fast streams
     limits=httpx.Limits(
         max_keepalive_connections=200,  # Large connection pool for persistent connections
@@ -965,23 +972,38 @@ async def content(path: str, request: Request, ref: str = None):
             # traceback + dropped connection, which Dispatcharr/ffmpeg treated as the
             # stream dying. Now a 403 upstream is a 403 downstream and the player
             # simply re-asks for the playlist.
+            # Header wait is httpx's own read timeout, NOT asyncio.wait_for. Cancelling
+            # __aenter__ mid-handshake left the connection half-open in the pool, so the
+            # next request on it stalled until Caddy gave up at 35s; httpx's timeout
+            # tears the request down cleanly instead.
             response = None
+            # read=_UPSTREAM_TIMEOUT also caps each body chunk, which is what we want:
+            # a CDN stalling mid-segment aborts in 5s so ffmpeg skips it, rather than
+            # hanging past the ~10s Dispatcharr gives it before killing the stream.
+            open_timeout = httpx.Timeout(30.0, connect=5.0, read=_UPSTREAM_TIMEOUT, pool=5.0)
             for attempt in range(_UPSTREAM_ATTEMPTS):
-                cm = streaming_client.stream("GET", upstream_url, headers=upstream_headers, timeout=30.0)
+                last_exc = None
+                cm = streaming_client.stream("GET", upstream_url, headers=upstream_headers,
+                                             timeout=open_timeout)
                 try:
-                    response = await asyncio.wait_for(cm.__aenter__(), _UPSTREAM_TIMEOUT)
-                    if response.status_code in _RETRYABLE_STATUS:
-                        raise _UpstreamTransient(f"Upstream returned HTTP {response.status_code}")
-                    break
+                    response = await cm.__aenter__()
                 except _RETRYABLE_EXC as e:
+                    # __aenter__ raised, so httpx already released the connection —
+                    # calling __aexit__ on a stream that never opened raises itself.
+                    response, last_exc = None, e
+                else:
+                    if response.status_code not in _RETRYABLE_STATUS:
+                        break
+                    last_exc = _UpstreamTransient(f"Upstream returned HTTP {response.status_code}")
                     await cm.__aexit__(None, None, None)
                     response = None
-                    if attempt == _UPSTREAM_ATTEMPTS - 1:
-                        logger.warning(f"Stream session {session_id} gave up: {_describe(e)}")
-                        _release_session(session_id, channel_id)
-                        return Response(status_code=status.HTTP_502_BAD_GATEWAY)
-                    logger.warning(f"Stream session {session_id} failed to start ({_describe(e)}), retrying ({attempt + 1}/{_UPSTREAM_ATTEMPTS})")
-                    await asyncio.sleep(0.3 * (attempt + 1))
+
+                if attempt == _UPSTREAM_ATTEMPTS - 1:
+                    logger.warning(f"Stream session {session_id} gave up: {_describe(last_exc)}")
+                    _release_session(session_id, channel_id)
+                    return Response(status_code=status.HTTP_502_BAD_GATEWAY)
+                logger.warning(f"Stream session {session_id} failed to start ({_describe(last_exc)}), retrying ({attempt + 1}/{_UPSTREAM_ATTEMPTS})")
+                await asyncio.sleep(0.3 * (attempt + 1))
 
             if response.status_code != 200:
                 logger.warning(f"Stream session {session_id} upstream HTTP {response.status_code}")
