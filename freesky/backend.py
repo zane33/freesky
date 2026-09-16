@@ -272,6 +272,88 @@ async def _race_stream_tasks(channel_id: str, pending: set, deadline: float, sta
         return None
 
 
+def _process_stream_content(content: str, referer: str) -> str:
+    """Rewrite an M3U8 so segments and keys are fetched through our proxy.
+
+    Note: `config` here is the Reflex config, imported at the top of this
+    module. It used to be missing entirely, so every call that reached the
+    `config.proxy_content` check below raised NameError — which surfaced as a
+    dead channel on the vidembed and fallback paths that use this function.
+    """
+    if content.startswith('#EXTM3U'):
+        # Process M3U8 playlists
+        lines = content.split('\n')
+        processed_lines = []
+        
+        for line in lines:
+            if line.startswith('http') and config.proxy_content:
+                # Proxy content URLs
+                line = f"/api/content/{encrypt(line)}{hls_ext(line)}"
+            elif line.startswith('#EXT-X-MEDIA:') and config.proxy_content:
+                # Separate audio/subtitle renditions carry their playlist in a
+                # URI="..." attr, not on their own line. Without this, ffmpeg
+                # (Dispatcharr) can't reach the audio track -> video-only stream.
+                m = re.search(r'URI="(https?://.*?)"', line)
+                if m:
+                    uri = m.group(1)
+                    line = line.replace(uri, f"/api/content/{encrypt(uri)}{hls_ext(uri)}")
+            elif line.startswith('#EXT-X-KEY:'):
+                # Process encryption keys
+                original_url = re.search(r'URI="(.*?)"', line)
+                if original_url:
+                    line = line.replace(original_url.group(1), 
+                        f"/api/key/{encrypt(original_url.group(1))}/{encrypt(urlparse(referer).netloc)}")
+            
+            processed_lines.append(line)
+        
+        return '\n'.join(processed_lines)
+    else:
+        return content
+
+# Concurrency control for streaming with high-performance limits
+_stream_semaphore = asyncio.Semaphore(max_concurrent_streams)
+_content_semaphore = asyncio.Semaphore(max_concurrent_streams * 10)  # Increased to 10x for much better segment throughput
+
+logger.info("Backend initialized with connection pooling")
+
+def extract_channel_from_content_path(content_path: str) -> str:
+    """Extract channel identifier from content path for session tracking"""
+    try:
+        # Decrypt the content URL to analyze it
+        decrypted_url = free_sky.content_url(content_path)
+        
+        # Look for channel identifiers in the URL
+        # Common patterns: /channel_id/, /stream-123/, etc.
+        import re
+        
+        # Try to find channel ID patterns in the URL
+        patterns = [
+            r'/([0-9]+)/',  # /123/
+            r'stream-([0-9]+)',  # stream-123
+            r'channel_([0-9]+)',  # channel_123
+            r'/([0-9]+)\.',  # /123.ts
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, decrypted_url)
+            if match:
+                return match.group(1)
+        
+        # Fallback: use a hash of the base URL for grouping
+        from urllib.parse import urlparse
+        parsed = urlparse(decrypted_url)
+        base_path = '/'.join(parsed.path.split('/')[:3])  # First 3 path segments
+        return str(abs(hash(base_path)) % 10000)  # Convert to a 4-digit identifier
+        
+    except Exception as e:
+        logger.debug(f"Could not extract channel from content path: {e}")
+        return "unknown"
+
+# Start channel update task
+channel_update_task = None
+
+
+
 @fastapi_app.on_event("startup")
 async def startup_event():
     # Background task now managed by Reflex lifespan
