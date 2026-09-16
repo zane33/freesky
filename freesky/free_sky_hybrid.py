@@ -7,6 +7,7 @@ import html
 import json
 import os
 import re
+import time
 import reflex as rx
 import logging
 import asyncio
@@ -250,6 +251,13 @@ class StepDaddyHybrid:
     # are tried before giving up. A channel-specific preference can pin one first.
     PLAYER_PATHS = ["stream", "watch", "cast", "plus", "casting", "player"]
 
+    # channel_id -> (upstream m3u8 url, referer, resolved_at). Crawling the iframe
+    # chain costs ~4s, but a live playlist has to be re-fetched every few seconds
+    # or the player runs out of segments. Remembering the URL makes the refresh a
+    # single ~0.3s GET; a failed refresh drops the entry and re-crawls.
+    _resolved: dict = {}
+    _RESOLVED_TTL = 600
+
     async def _resolve_via_iframe_chain(self, channel_id: str, max_hops: int = 4,
                                         max_pages: int = 8, prefer: str = None,
                                         budget: float = 20.0, single_feed: bool = False):
@@ -329,11 +337,12 @@ class StepDaddyHybrid:
                         continue
                     if has_audio or single_feed:
                         logger.info(f"Resolved channel {channel_id} via '{player}' player")
+                        self._resolved[channel_id] = (candidate, url, time.time())
                         return content
                     # Resolved but video-only. Remember it, then try the next
                     # player for one that actually carries sound.
                     if video_only_fallback is None:
-                        video_only_fallback = content
+                        video_only_fallback = (content, candidate, url)
                     logger.info(f"Player '{player}' for {channel_id} is video-only; trying next for audio")
                     player_dead = True
                     break
@@ -352,7 +361,9 @@ class StepDaddyHybrid:
 
         if video_only_fallback is not None:
             logger.warning(f"No feed with audio for channel {channel_id}; using video-only fallback")
-            return video_only_fallback
+            content, candidate, referer = video_only_fallback
+            self._resolved[channel_id] = (candidate, referer, time.time())
+            return content
         raise ValueError(
             f"No working stream found for channel {channel_id} across "
             f"{len(players)} players" + (f" (last: {last_error})" if last_error else "")
@@ -422,6 +433,16 @@ class StepDaddyHybrid:
         player. `_handle_new_architecture`/`_handle_old_architecture` remain for
         the multi_service_streamer callers but are no longer on this path.
         """
+        if not prefer:
+            hit = self._resolved.get(channel_id)
+            if hit and time.time() - hit[2] < self._RESOLVED_TTL:
+                try:
+                    content, _ = await self._fetch_playlist(hit[0], hit[1])
+                    return content
+                except Exception as e:
+                    # The feed moved or died; fall through to a full re-crawl.
+                    logger.info(f"Cached feed for {channel_id} stopped working ({e}); re-resolving")
+                    self._resolved.pop(channel_id, None)
         return await self._resolve_via_iframe_chain(channel_id, prefer=prefer, single_feed=single_feed)
 
     async def _handle_new_architecture(self, vidembed_url: str, referer: str):

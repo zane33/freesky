@@ -124,11 +124,12 @@ class LRUCache(OrderedDict):
 
 # Cache with size limit and TTL optimized for streaming
 stream_cache = LRUCache(maxsize=max_concurrent_streams * 15)  # Further increased cache size
-cache_ttl = 90  # Increased to 90 seconds for longer-lived cache entries
+cache_ttl = 5  # A live media playlist holds a ~36s sliding window, so a cache
+# longer than a few seconds hands the player the same segments over and over
+# until its buffer drains and playback dies. 5s only de-dupes concurrent viewers;
+# the expensive part (resolving the upstream URL) is cached separately in
+# StepDaddyHybrid._resolved.
 
-# Advanced segment prefetching cache
-segment_cache = LRUCache(maxsize=500)  # Cache for prefetched segments
-segment_cache_ttl = 300  # 5 minutes for segments
 
 # Track active tasks and streaming sessions for cleanup
 active_tasks: Dict[str, asyncio.Task] = {}
@@ -191,10 +192,10 @@ async def _get_stream_parallel(channel_id: str, prefer: str = None):
         # errored out first, so every channel 404'd on the fastest failure.
         pending = set(tasks)
         # 8s cut off channels that resolve correctly but whose first upstream hop
-        # slows to ~7s under load, turning working streams into false 504s. 13s
-        # stays under the outer 15s wait_for while giving the iframe-chain failover
+        # slows to ~7s under load, turning working streams into false 504s. 20s
+        # stays under the outer 22s wait_for while giving the iframe-chain failover
         # room to try more than one player.
-        deadline = time.time() + 13.0
+        deadline = time.time() + 20.0
 
         try:
             return await _race_stream_tasks(channel_id, pending, deadline, start_time)
@@ -270,174 +271,6 @@ async def _race_stream_tasks(channel_id: str, pending: set, deadline: float, sta
         stream_monitor.record_stream_attempt(channel_id, False, 0.0)
         return None
 
-
-async def prefetch_segments(m3u8_content: str, channel_id: str):
-    """Prefetch the first few segments of a stream for faster playback"""
-    try:
-        lines = m3u8_content.split('\n')
-        segment_urls = []
-        
-        # Extract the first 3 segments for prefetching
-        for line in lines:
-            if line.startswith('/api/content/') and len(segment_urls) < 3:
-                segment_urls.append(line.strip())
-        
-        if not segment_urls:
-            return
-        
-        logger.info(f"Prefetching {len(segment_urls)} segments for channel {channel_id}")
-        
-        # Prefetch segments concurrently
-        async def prefetch_segment(segment_url: str):
-            try:
-                segment_key = f"seg_{hash(segment_url)}"
-                current_time = time.time()
-                
-                # Check if already cached
-                if segment_key in segment_cache:
-                    cached_data, cache_time = segment_cache[segment_key]
-                    if current_time - cache_time < segment_cache_ttl:
-                        return
-                
-                # Use the streaming client to prefetch
-                full_url = f"{api_url}{segment_url}"
-                response = await streaming_client.get(full_url, timeout=5.0)
-                
-                if response.status_code == 200:
-                    segment_cache[segment_key] = (response.content, current_time)
-                    logger.debug(f"Prefetched segment {segment_url[:50]}...")
-                    
-            except Exception as e:
-                logger.debug(f"Failed to prefetch segment {segment_url}: {str(e)}")
-        
-        # Prefetch in parallel but don't wait for completion
-        tasks = [asyncio.create_task(prefetch_segment(url)) for url in segment_urls]
-        
-        # Don't await - let prefetching happen in background
-        asyncio.gather(*tasks, return_exceptions=True)
-        
-    except Exception as e:
-        logger.debug(f"Error in segment prefetching: {str(e)}")
-
-async def prefetch_popular_stream(channel_id: str):
-    """Prefetch stream to keep cache warm for popular channels"""
-    try:
-        await asyncio.sleep(45)  # Wait 45s then refresh cache
-        cache_key = f"stream_{channel_id}"
-        current_time = time.time()
-        
-        # Check if cache needs refresh
-        if cache_key in stream_cache:
-            cached_data, cache_time = stream_cache[cache_key]
-            if current_time - cache_time < cache_ttl:
-                return  # Still fresh
-        
-        # Prefetch new stream data
-        logger.debug(f"Prefetching stream for popular channel {channel_id}")
-        stream_data = await asyncio.wait_for(
-            multi_streamer.get_stream(channel_id),
-            timeout=8.0  # Quick prefetch timeout
-        )
-        
-        if stream_data and stream_data.startswith("VIDEMBED_URL:"):
-            vidembed_url = stream_data.replace("VIDEMBED_URL:", "")
-            try:
-                hls_data = await asyncio.wait_for(
-                    extract_hls_from_vidembed(vidembed_url),
-                    timeout=6.0  # Quick HLS extraction
-                )
-                if hls_data:
-                    stream_data = _process_stream_content(hls_data, vidembed_url)
-            except asyncio.TimeoutError:
-                pass  # Use vidembed URL as fallback
-        
-        if stream_data:
-            stream_cache[cache_key] = (stream_data, current_time)
-            logger.debug(f"Successfully prefetched stream for channel {channel_id}")
-            
-    except Exception as e:
-        logger.debug(f"Prefetch failed for channel {channel_id}: {str(e)}")
-        # Silent failure for prefetch
-
-def _process_stream_content(content: str, referer: str) -> str:
-    """Rewrite an M3U8 so segments and keys are fetched through our proxy.
-
-    Note: `config` here is the Reflex config, imported at the top of this
-    module. It used to be missing entirely, so every call that reached the
-    `config.proxy_content` check below raised NameError — which surfaced as a
-    dead channel on the vidembed and fallback paths that use this function.
-    """
-    if content.startswith('#EXTM3U'):
-        # Process M3U8 playlists
-        lines = content.split('\n')
-        processed_lines = []
-        
-        for line in lines:
-            if line.startswith('http') and config.proxy_content:
-                # Proxy content URLs
-                line = f"/api/content/{encrypt(line)}{hls_ext(line)}"
-            elif line.startswith('#EXT-X-MEDIA:') and config.proxy_content:
-                # Separate audio/subtitle renditions carry their playlist in a
-                # URI="..." attr, not on their own line. Without this, ffmpeg
-                # (Dispatcharr) can't reach the audio track -> video-only stream.
-                m = re.search(r'URI="(https?://.*?)"', line)
-                if m:
-                    uri = m.group(1)
-                    line = line.replace(uri, f"/api/content/{encrypt(uri)}{hls_ext(uri)}")
-            elif line.startswith('#EXT-X-KEY:'):
-                # Process encryption keys
-                original_url = re.search(r'URI="(.*?)"', line)
-                if original_url:
-                    line = line.replace(original_url.group(1), 
-                        f"/api/key/{encrypt(original_url.group(1))}/{encrypt(urlparse(referer).netloc)}")
-            
-            processed_lines.append(line)
-        
-        return '\n'.join(processed_lines)
-    else:
-        return content
-
-# Concurrency control for streaming with high-performance limits
-_stream_semaphore = asyncio.Semaphore(max_concurrent_streams)
-_content_semaphore = asyncio.Semaphore(max_concurrent_streams * 10)  # Increased to 10x for much better segment throughput
-
-logger.info("Backend initialized with connection pooling")
-
-def extract_channel_from_content_path(content_path: str) -> str:
-    """Extract channel identifier from content path for session tracking"""
-    try:
-        # Decrypt the content URL to analyze it
-        decrypted_url = free_sky.content_url(content_path)
-        
-        # Look for channel identifiers in the URL
-        # Common patterns: /channel_id/, /stream-123/, etc.
-        import re
-        
-        # Try to find channel ID patterns in the URL
-        patterns = [
-            r'/([0-9]+)/',  # /123/
-            r'stream-([0-9]+)',  # stream-123
-            r'channel_([0-9]+)',  # channel_123
-            r'/([0-9]+)\.',  # /123.ts
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, decrypted_url)
-            if match:
-                return match.group(1)
-        
-        # Fallback: use a hash of the base URL for grouping
-        from urllib.parse import urlparse
-        parsed = urlparse(decrypted_url)
-        base_path = '/'.join(parsed.path.split('/')[:3])  # First 3 path segments
-        return str(abs(hash(base_path)) % 10000)  # Convert to a 4-digit identifier
-        
-    except Exception as e:
-        logger.debug(f"Could not extract channel from content path: {e}")
-        return "unknown"
-
-# Start channel update task
-channel_update_task = None
 
 @fastapi_app.on_event("startup")
 async def startup_event():
@@ -698,13 +531,6 @@ async def stream(channel_id: str, request: Request = None):
                     stream_cache[cache_key] = (stream_data, current_time)
                 _remember_playlist_paths(stream_data, channel_id)
                 logger.info(f"Successfully generated stream for channel {channel_id}")
-                
-                # Schedule prefetch for this channel to keep it warm
-                asyncio.create_task(prefetch_popular_stream(channel_id))
-                
-                # Start segment prefetching for faster playback
-                if stream_data and stream_data.startswith('#EXTM3U'):
-                    asyncio.create_task(prefetch_segments(stream_data, channel_id))
                 
                 return Response(
                     content=_authorize_proxied_urls(stream_data, stream_token),
@@ -1511,7 +1337,6 @@ async def health():
         "status": "healthy",
         "channels_count": len(free_sky.channels),
         "cache_size": len(stream_cache),
-        "segment_cache_size": len(segment_cache),
         "active_channels": len(active_content_sessions),  # Channels with active video streaming
         "total_active_streams": total_active_content_streams,  # Real video streaming sessions
         "total_m3u8_requests": total_m3u8_requests,  # Playlist requests (for debugging)

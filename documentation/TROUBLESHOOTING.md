@@ -104,6 +104,31 @@ resolution still fails, fetch a player page by hand
 (`/<player>/stream-<id>.php` → its iframe) and check how the m3u8 is embedded —
 a new embedding style needs a new pattern in `_stream_candidates`.
 
+### 7. Stream plays for ~30s then stalls or crashes
+
+**Symptom**: the channel starts fine, plays roughly half a minute, then freezes
+or the player errors out. Caddy's access log shows the player re-requesting
+`/api/stream/<id>.m3u8` every few seconds, each served in ~0.004s
+(`x-stream-source: cache`).
+
+**Cause**: an upstream live playlist is a sliding window of ~6 segments (~36s)
+that advances every few seconds. `cache_ttl` was 90s, so every refresh handed the
+player back the *same* six segments. Once it had played them its buffer drained
+and playback died. A second contributor: `prefetch_segments` re-downloaded the
+first three segments of that window — the ones already played, ~6MB each — on
+every generate.
+
+**Fix**: `cache_ttl` is 5s (de-dupes concurrent viewers, nothing more) and
+`StepDaddyHybrid._resolved` caches the resolved *upstream m3u8 URL* per channel
+for 10 minutes instead. The refresh is then a single ~1s GET rather than a ~4s
+iframe-chain crawl; a failed refresh drops the entry and re-crawls. Both
+prefetchers were deleted.
+
+**Rule of thumb**: the playlist cache must stay well under the upstream window
+(`#EXT-X-TARGETDURATION` x segment count). Check with
+`curl -sk "https://<host>/api/stream/<id>.m3u8?token=..." | grep MEDIA-SEQUENCE`
+twice, ~10s apart — the sequence number must increase.
+
 ## Performance Optimizations
 
 ### Environment Variables for Performance
