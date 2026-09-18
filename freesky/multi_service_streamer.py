@@ -52,15 +52,38 @@ class BaseStreamer(ABC):
 class DLHDStreamer(BaseStreamer):
     """DaddyLive HD Streamer (your existing service)"""
     
+    # ponytail: this used to build a StepDaddyHybrid — and therefore a fresh
+    # curl_cffi AsyncSession — on every single request, and never closed it. Since
+    # backend.py races this path against its own resolver, each stream request
+    # opened two sessions, leaked one, and ran the crawl twice against upstream.
+    # One shared instance per process fixes all three; `_resolved` was already a
+    # class attribute, so the cache behaviour is unchanged.
+    _shared_streamer = None
+    _shared_lock = asyncio.Lock()
+
     def __init__(self):
         super().__init__("DLHD")
         self.base_url = config.daddylive_uri  # DADDYLIVE_URI, never a static host
-    
+
+    @classmethod
+    async def _get_streamer(cls):
+        """Return the process-wide StepDaddyHybrid, creating it once.
+
+        Returns:
+            The shared StepDaddyHybrid instance. Guarded by a lock so concurrent
+            first requests cannot each construct one and leak all but the last.
+        """
+        if cls._shared_streamer is None:
+            async with cls._shared_lock:
+                if cls._shared_streamer is None:
+                    from .free_sky_hybrid import StepDaddyHybrid
+                    cls._shared_streamer = StepDaddyHybrid()
+        return cls._shared_streamer
+
     async def get_stream_url(self, channel_id: str) -> Optional[str]:
         """Get stream URL using your existing hybrid approach"""
         try:
-            from .free_sky_hybrid import StepDaddyHybrid
-            streamer = StepDaddyHybrid()
+            streamer = await self._get_streamer()
             result = await streamer.stream(channel_id)
             
             if result.startswith("VIDEMBED_URL:"):

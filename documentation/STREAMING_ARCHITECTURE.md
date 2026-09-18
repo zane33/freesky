@@ -177,3 +177,103 @@ If you're upgrading from the legacy architecture:
 4. **Add Client-Side Support**: Handle cases where vidembed URL is returned
 
 This architecture allows the application to provide seamless access to streaming content while adapting to the evolving streaming service infrastructure. 
+---
+
+## Upstream chain as of 2026-09 (verified)
+
+The `auth.php` / `server_lookup.php` / `channelKey` / `authTs`-`authRnd`-`authSig`
+dance described earlier in this document **no longer exists upstream**. The signed
+playlist URL now arrives pre-minted inside the player page. The live chain is three
+requests plus one local decode:
+
+| # | Request | Referer sent | Extract |
+|---|---------|--------------|---------|
+| 1 | `{DADDYLIVE_URI}/{player}/stream-{id}.php` | `{base}/watch.php?id={id}` | `<iframe … id="thatframe">` → player host + slug |
+| 2 | `https://{player_host}/e/{slug}` | same | `_econfig='<base64>'` |
+| 3 | *local decode, no HTTP* | — | `stream_url_nop2p` |
+| 4 | the signed `.m3u8`, then its segments | player page URL | playlist / MPEG-TS |
+
+`_econfig` decodes as: base64 → split into 4 quarters → drop the character at
+index 3 of each → reorder `[2,0,3,1]` → base64 → JSON. Pure local computation;
+**no JavaScript is executed and no browser is required.** Implemented as
+`StepDaddyHybrid._decode_econfig`.
+
+### Header requirements differ per hop — and the token is UA-bound
+
+Two separate mechanisms, and both must be satisfied:
+
+| Hop | Requires | Ignores |
+|-----|----------|---------|
+| `.m3u8` | the **same User-Agent that minted the token** | Referer (absent or bogus both pass) |
+| segment | **Referer** of the player origin | User-Agent |
+
+The CDN binds each signed token to the User-Agent that fetched the embed page.
+Verified by cross-fetching:
+
+```
+token minted with Chrome 153  ->  Chrome 153: 200   Firefox 137: 403
+token minted with Firefox 137 ->  Firefox 137: 200   Chrome 153: 403
+```
+
+**The UA value is arbitrary — both work. Only consistency matters.** There is no
+allowlist and no "current Chrome" requirement, so there is nothing here that rots
+on Google's release cadence.
+
+**This creates a hard coupling.** `StepDaddyHybrid.USER_AGENT` mints the token and
+`backend._upstream_headers` spends it when proxying playlists and segments. If the
+two ever disagree, every stream 403s while every page still loads normally. Both
+now read the single constant; do not reintroduce a literal at either site.
+`UPSTREAM_USER_AGENT` overrides both together.
+
+> **Measurement caution.** This gate is easy to misdiagnose. Holding one token
+> fixed and varying the UA makes the binding look exactly like an exact-string
+> allowlist — every other UA 403s, including adjacent Chrome versions and other
+> platforms. Distinguishing the two requires minting a *fresh* token per UA and
+> cross-fetching. The same trap applies to the channel page's Referer check,
+> which is satisfied by *any* non-empty Referer (15/15 with, 0/15 without) but
+> looks origin-specific if only present-vs-absent is tested.
+
+### Playlist URL lifetime
+
+Signed URLs carry `?s=<signature>&e=<epoch>`. The signature **replays freely**
+until `e` (verified: a URL minted 10 minutes earlier still returned 200, and again
+45s later, while `#EXT-X-MEDIA-SEQUENCE` advanced). `e` currently sits ~6h out.
+A corrupted `s` and an expired `e` both return **403** and are indistinguishable
+without parsing `e` locally, which `_cache_ttl_for` does:
+
+```
+ttl = clamp(e - now - M3U8_EXPIRY_MARGIN, M3U8_TTL_MIN, M3U8_TTL_MAX)
+```
+
+Tunable via `M3U8_EXPIRY_MARGIN` (1800), `M3U8_TTL_MIN` (60), `M3U8_TTL_MAX`
+(18000). Falls back to the flat `_RESOLVED_TTL` when `e` is absent.
+
+### Player path status
+
+`PLAYER_PATHS` is ordered best-first from measurement, and nothing is deleted —
+hosts are discovered rather than hardcoded, and upstream has already rotated twice.
+
+| Path | State (2026-09) |
+|------|-----------------|
+| `stream` | **working** — `_econfig` chain |
+| `plus` | live host, payload in `/setup.js` — no extractor yet |
+| `casting` | live host, payload split across 9 base64 fragments — no extractor yet; endpoint also returns `503 provider-cap` |
+| `cast` | resolves to the *same* embed as `stream` — duplicate, not independent failover |
+| `watch` | 403, plus a second iframe whose host no longer resolves |
+| `player` | host no longer resolves |
+
+### How this failure presented
+
+Worth recording, because it was invisible to every conventional check: upstream
+returned **HTTP 200 at every hop**, the correct document each time, with the real
+player iframe present. The only defect was that no extractor matched a page that
+visibly contained a stream — `_ATOB_RE` requires `atob('<literal>')` and upstream
+had moved to applying `atob()` to *variables*, while `_PLAIN_M3U8_RE` had no
+plaintext URL to find. The observable symptom was `No working stream found for
+channel N across 6 players`, a 20s crawl, and a Caddy 504. Two of the six players
+did have genuinely dead hosts (DNS `NODATA` and `SERVFAIL`), which made the logs
+look like an upstream outage rather than a parsing failure.
+
+The useful signal for this class of fault is **not** "did the request succeed" but
+"did a page that passed its sentinel yield zero candidates" — the right document,
+unreadable.

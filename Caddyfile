@@ -1,3 +1,13 @@
+{
+	# Caddy's own runtime log, separated from the access log and from the app's
+	# stdout so that neither can interleave into the other's records.
+	log default {
+		output stderr
+		format json
+		level INFO
+	}
+}
+
 # Shared server config. Kept in a snippet so it can be served on more than one
 # listener: with ENABLE_HTTPS=true, start.sh appends a second site block for the
 # TLS port that imports this same snippet. A `tls` directive cannot live in a
@@ -5,9 +15,28 @@
 # attempts to configure TLS connection policies"), so the two listeners have to be
 # separate blocks rather than two addresses on one.
 (app) {
-	log {
+	# One structured access line per request, on its own fd, at INFO.
+	#
+	# This block previously ran at DEBUG with no `output`, which produced the
+	# unreadable production logs: DEBUG makes Caddy emit a dozen-plus internal
+	# records per /api/stream/* request (matchers, reverse_proxy dial/retry, TLS)
+	# on top of the single "handled request" line, and with no `output` the
+	# logger shares stderr with granian/Reflex — two writers on one unbuffered fd
+	# interleave mid-record, which is how single fields ended up sheared onto
+	# their own lines as runs of bare "ERR ERR ERR". JSON escaping cannot protect
+	# against another process writing between our write() calls.
+	#
+	# Naming the logger also matters: the snippet is imported by two site blocks
+	# when ENABLE_HTTPS=true (start.sh appends a second block), so an unnamed
+	# logger was instantiated twice, doubling volume onto the same fd.
+	log access {
+		output file /var/log/caddy/access.log {
+			roll_size 50MiB
+			roll_keep 5
+			roll_keep_for 336h
+		}
 		format json
-		level DEBUG
+		level INFO
 	}
 
 	# Optimized compression settings - exclude streaming endpoints

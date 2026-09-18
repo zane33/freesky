@@ -56,12 +56,35 @@ class StepDaddyHybrid:
         
         logger.info(f"StepDaddyHybrid initialized with max_streams: {max_streams}")
 
+    # ponytail: the CDN binds each signed playlist token to the User-Agent that
+    # fetched the embed page and minted it. Verified 2026-09 by cross-fetching:
+    #
+    #   token minted with Chrome 153  -> Chrome 153: 200   Firefox 137: 403
+    #   token minted with Firefox 137 -> Firefox 137: 200   Chrome 153: 403
+    #
+    # So the VALUE is arbitrary — both work — and only CONSISTENCY matters. Vary
+    # the UA between minting and fetching and every stream 403s.
+    #
+    # That makes this constant a hard coupling with backend._upstream_headers,
+    # which proxies the playlist and segment fetches: the resolver mints the
+    # token, the backend spends it, and if the two disagree nothing plays. Both
+    # sites MUST read this one value — do not reintroduce a literal at either.
+    # (Measuring this is easy to get wrong: hold one token fixed and vary the UA
+    # and the binding looks exactly like an exact-match allowlist.)
+    #
+    # The segment hop additionally requires a Referer of the player origin, and
+    # ignores the UA; the m3u8 hop is the reverse. Both must be satisfied.
+    DEFAULT_USER_AGENT = (
+        "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0"
+    )
+    USER_AGENT = os.environ.get("UPSTREAM_USER_AGENT", "").strip() or DEFAULT_USER_AGENT
+
     def _headers(self, referer: str = None, origin: str = None):
         if referer is None:
             referer = self._base_url
         headers = {
             "Referer": referer,
-            "user-agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0",
+            "user-agent": self.USER_AGENT,
         }
         if origin:
             headers["Origin"] = origin
@@ -230,6 +253,63 @@ class StepDaddyHybrid:
     # assigns it: var STREAM_URL = "https:\/\/premium.hls.st\/playlist\/premium589.m3u8";
     # Both forms are scanned so either upstream style resolves.
     _PLAIN_M3U8_RE = re.compile(r'["\'](https?:(?:\\?/)+[^"\']+?\.m3u8[^"\']*)["\']')
+    # As of 2026-09 the surviving players stopped exposing the URL in any form the
+    # two patterns above can see: atob() is now applied to *variables*, and no
+    # plaintext URL appears anywhere in the body. The payload moved into a single
+    # base64 blob assigned to _econfig, which decodes to the player's whole JSON
+    # config. Neither older pattern matches it, which is what took every channel
+    # down — the pages were fetched correctly and simply could not be read.
+    _ECONFIG_RE = re.compile(r"_econfig\s*=\s*['\"]([A-Za-z0-9+/=]+)['\"]")
+
+    @classmethod
+    def _decode_econfig(cls, blob: str):
+        """Decode an `_econfig` blob to its stream URL, or None if it isn't one.
+
+        Reversed from the player's obfuscated stream.js. The blob is base64 over a
+        4-way split of an inner base64 document: each quarter carries one junk
+        character at index 3, and the quarters are emitted in the order [2,0,3,1].
+        Undo those and the result is base64 JSON holding the signed playlist URL.
+
+        Pure local computation — no JavaScript is executed and no browser is
+        involved, which is the only reason this class of obfuscation is tractable
+        at all. Returns None on any malformation so the caller can fall through to
+        the other extractors.
+
+        Args:
+            blob: the base64 string captured by `_ECONFIG_RE`.
+
+        Returns:
+            The stream URL, or None if the blob is absent, malformed, or carries
+            no usable URL.
+        """
+        try:
+            s = base64.b64decode(blob).decode("latin1")  # byte-transparent; utf-8 would corrupt
+            if len(s) < 8:
+                return None
+            size = -(-len(s) // 4)  # ceil, without importing math
+            parts = [s[i * size:(i + 1) * size] for i in range(4)]
+            out = [None] * 4
+            for i, part in enumerate(parts):
+                if len(part) < 4:
+                    return None  # a short quarter means the index-3 strip is meaningless
+                part = part[:3] + part[4:]
+                out[[2, 0, 3, 1][i]] = base64.b64decode(
+                    part + "=" * (-len(part) % 4)
+                ).decode("latin1")
+            joined = "".join(out)
+            cfg = json.loads(base64.b64decode(joined + "=" * (-len(joined) % 4)))
+        except Exception as e:
+            # Hostile, rotating input: enumerating binascii/JSON/Index errors would
+            # be wrong within a month. DEBUG because this runs per page per player
+            # and a miss is the normal case on players that use another encoding.
+            logger.debug(f"_econfig decode failed ({type(e).__name__})")
+            return None
+        # nop2p skips the WebRTC swarm the player would otherwise join; irrelevant
+        # to a server-side proxy and identical in practice.
+        url = cfg.get("stream_url_nop2p") or cfg.get("stream_url")
+        if isinstance(url, str) and url.startswith("http") and ".m3u8" in url:
+            return url
+        return None
 
     @classmethod
     def _stream_candidates(cls, page: str):
@@ -243,13 +323,27 @@ class StepDaddyHybrid:
                 yield url
         for url in cls._PLAIN_M3U8_RE.findall(page):
             yield url.replace("\\/", "/")
+        for blob in cls._ECONFIG_RE.findall(page):
+            url = cls._decode_econfig(blob)
+            if url:
+                yield url
 
     # Upstream's watch.php offers several "players", each its own path that leads
     # to an independent iframe chain. Trying them in order gives real failover:
     # when one player's CDN feed is offline the next may still be live. Order is
     # best-first from measurement (stream/watch resolve most reliably); the rest
     # are tried before giving up. A channel-specific preference can pin one first.
-    PLAYER_PATHS = ["stream", "watch", "cast", "plus", "casting", "player"]
+    # Order is best-first from measurement (2026-09): `stream` is the confirmed
+    # working _econfig chain; `plus` and `casting` are live hosts whose payloads
+    # use encodings we cannot decode yet; `cast` resolves to the SAME embed as
+    # `stream`, so it is a duplicate rather than independent failover and earns no
+    # early slot; `watch` (403, plus a DNS-dead second iframe) and `player`
+    # (DNS-dead) go last. Nothing is deleted — hosts are discovered, not
+    # hardcoded, and upstream has already rotated twice; deleting paths optimises
+    # for today's dead hosts and forfeits the next rotation. Once the first player
+    # resolves, the tail is never reached, so ordering buys what deletion would
+    # without the regression risk.
+    PLAYER_PATHS = ["stream", "plus", "casting", "cast", "watch", "player"]
 
     # channel_id -> (upstream m3u8 url, referer, resolved_at). Crawling the iframe
     # chain costs ~4s, but a live playlist has to be re-fetched every few seconds
@@ -257,6 +351,36 @@ class StepDaddyHybrid:
     # single ~0.3s GET; a failed refresh drops the entry and re-crawls.
     _resolved: dict = {}
     _RESOLVED_TTL = 600
+
+    # Signed CDN URLs carry their own expiry: ?e=<epoch>, currently ~6h out, and
+    # the ?s= signature replays freely until then (verified: a URL minted 10 min
+    # earlier still served 200, and again 45s later, while the media sequence
+    # advanced). A flat 600s therefore re-crawls ~35 times inside one token's life
+    # for no benefit. Deriving the TTL from `e` tracks upstream's own stated
+    # expiry and self-corrects if it shortens; the margin means we never hand a
+    # player a URL that dies mid-session. Corrupted `s` and expired `e` both
+    # return 403 and are indistinguishable without parsing `e` ourselves.
+    _M3U8_EXPIRY_MARGIN = int(os.environ.get("M3U8_EXPIRY_MARGIN", "1800"))
+    _M3U8_TTL_MIN = int(os.environ.get("M3U8_TTL_MIN", "60"))
+    _M3U8_TTL_MAX = int(os.environ.get("M3U8_TTL_MAX", "18000"))
+
+    @classmethod
+    def _cache_ttl_for(cls, m3u8_url: str) -> int:
+        """How long a resolved playlist URL stays usable, from its own `e` param.
+
+        Args:
+            m3u8_url: the signed CDN URL just resolved.
+
+        Returns:
+            Seconds to cache, clamped to [_M3U8_TTL_MIN, _M3U8_TTL_MAX]. Falls
+            back to _RESOLVED_TTL when `e` is absent or unparseable, so an
+            upstream that drops the parameter degrades to today's behaviour.
+        """
+        match = re.search(r"[?&]e=(\d{9,})", m3u8_url or "")
+        if not match:
+            return cls._RESOLVED_TTL
+        remaining = int(match.group(1)) - time.time() - cls._M3U8_EXPIRY_MARGIN
+        return int(max(cls._M3U8_TTL_MIN, min(cls._M3U8_TTL_MAX, remaining)))
 
     async def _resolve_via_iframe_chain(self, channel_id: str, max_hops: int = 4,
                                         max_pages: int = 8, prefer: str = None,
@@ -435,7 +559,7 @@ class StepDaddyHybrid:
         """
         if not prefer:
             hit = self._resolved.get(channel_id)
-            if hit and time.time() - hit[2] < self._RESOLVED_TTL:
+            if hit and time.time() - hit[2] < self._cache_ttl_for(hit[0]):
                 try:
                     content, _ = await self._fetch_playlist(hit[0], hit[1])
                     return content
@@ -443,7 +567,58 @@ class StepDaddyHybrid:
                     # The feed moved or died; fall through to a full re-crawl.
                     logger.info(f"Cached feed for {channel_id} stopped working ({e}); re-resolving")
                     self._resolved.pop(channel_id, None)
+            return await self._resolve_single_flight(channel_id, single_feed=single_feed)
         return await self._resolve_via_iframe_chain(channel_id, prefer=prefer, single_feed=single_feed)
+
+    # channel_id -> in-flight resolution. A crawl costs up to 20s, so without this
+    # every viewer arriving during one starts their own: the incident logs show
+    # "Active streams: 1/2/3" for a single channel, three independent crawls all
+    # failing the same way. Followers wait on the leader instead, and share its
+    # failure too, so a dead channel fails fast for everyone after the first.
+    _inflight: dict = {}
+
+    async def _resolve_single_flight(self, channel_id: str, single_feed: bool = False):
+        """Resolve a channel, collapsing concurrent callers onto one crawl.
+
+        Args:
+            channel_id: channel being resolved.
+            single_feed: passed through to the resolver.
+
+        Returns:
+            The proxied playlist produced by `_resolve_via_iframe_chain`.
+
+        Raises:
+            Whatever the resolver raises — propagated to every waiter, so N
+            concurrent viewers of a dead channel cost one crawl, not N.
+        """
+        existing = self._inflight.get(channel_id)
+        if existing is not None:
+            logger.debug(f"Joining in-flight resolution for channel {channel_id}")
+            # shield: a follower timing out or disconnecting must not cancel the
+            # leader's crawl out from under the other waiters.
+            return await asyncio.shield(existing)
+
+        future = asyncio.get_event_loop().create_future()
+        self._inflight[channel_id] = future
+        try:
+            result = await self._resolve_via_iframe_chain(
+                channel_id, single_feed=single_feed
+            )
+        except BaseException as e:
+            if not future.done():
+                future.set_exception(e)
+            raise
+        else:
+            if not future.done():
+                future.set_result(result)
+            return result
+        finally:
+            # Must be finally: a leaked key wedges this channel until restart.
+            self._inflight.pop(channel_id, None)
+            # Nobody may be awaiting a failed future; retrieve to silence asyncio's
+            # "exception was never retrieved" warning.
+            if future.done() and future.exception() is not None:
+                future.exception()
 
     async def _handle_new_architecture(self, vidembed_url: str, referer: str):
         """Handle the new vidembed.re architecture with proper iframe-based authentication"""

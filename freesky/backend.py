@@ -702,9 +702,16 @@ async def content_options(path: str):
 
 def _upstream_headers(ref: str = None) -> dict:
     """Headers for CDN fetches. The CDN 403s any request whose Referer is not the
-    embedding player page, so replay the one baked into the URL by the rewriter."""
+    embedding player page, so replay the one baked into the URL by the rewriter.
+
+    The User-Agent is sourced from StepDaddy.USER_AGENT rather than written here:
+    the CDN binds each signed token to the UA that minted it, so the resolver and
+    this proxy must send the same string or every playlist and segment 403s. That
+    coupling used to hold only by coincidence — both happened to carry the same
+    literal. See StepDaddyHybrid.USER_AGENT for the measurements.
+    """
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0",
+        "User-Agent": StepDaddy.USER_AGENT,
     }
     if ref:
         try:
@@ -828,7 +835,11 @@ async def _failover_nested(path: str):
     logger.warning(f"Nested playlist for channel {channel_id} unreachable; re-resolving feed")
     stream_cache.pop(f"stream_{channel_id}", None)
     try:
-        data = await asyncio.wait_for(_get_stream_parallel(channel_id), 12.0)
+        # Must exceed the resolver's own 20s budget (free_sky_hybrid
+        # _resolve_via_iframe_chain) — matching the 22s used on the main stream
+        # path. At 12s this cancelled every crawl mid-flight, so a nested-playlist
+        # failover could never actually complete one.
+        data = await asyncio.wait_for(_get_stream_parallel(channel_id), 22.0)
     except Exception as e:
         logger.error(f"Failover resolve for channel {channel_id} failed: {_describe(e)}")
         return None

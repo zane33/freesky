@@ -292,6 +292,12 @@ until curl -s http://localhost:$BACKEND_PORT/health &>/dev/null; do
 done
 echo "Backend started successfully"
 
+# The access log writes to its own file rather than sharing stderr with this
+# script and granian — interleaved writers on one fd were shearing single log
+# records across multiple lines. Caddy does not create the parent directory, so
+# a missing /var/log/caddy would abort startup.
+mkdir -p /var/log/caddy
+
 # Start Caddy in the foreground with explicit configuration
 echo "Starting Caddy..."
 exec caddy run --config "$CADDYFILE" --adapter caddyfile

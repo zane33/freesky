@@ -30,7 +30,18 @@ services:
       
       # External Services
       - DADDYLIVE_URI=${DADDYLIVE_URI:-https://dlive.sx}
-      
+      # The CDN binds each signed playlist token to the User-Agent that minted it.
+      # The value is arbitrary — Chrome and Firefox both work — but the resolver
+      # and the segment proxy must send the SAME one, or every stream 403s while
+      # pages still load. Setting this overrides both together; leave it empty
+      # unless you have a reason. See documentation/STREAMING_ARCHITECTURE.md.
+      - UPSTREAM_USER_AGENT=${UPSTREAM_USER_AGENT:-}
+      # Playlist cache lifetime is derived from the signed URL's own ?e= expiry
+      # (clamped), rather than a flat TTL. Defaults shown; override only to tune.
+      - M3U8_EXPIRY_MARGIN=${M3U8_EXPIRY_MARGIN:-1800}
+      - M3U8_TTL_MIN=${M3U8_TTL_MIN:-60}
+      - M3U8_TTL_MAX=${M3U8_TTL_MAX:-18000}
+
       # Application Settings
       - CHANNEL_PREFS_FILE=/app/data/channel_prefs.json  # Persisted via the ./data volume below
       - USERS_FILE=/app/data/users.json
