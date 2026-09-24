@@ -11,7 +11,7 @@ import time
 from functools import lru_cache
 from typing import Optional, Dict, Set
 from rxconfig import config
-from freesky.free_sky_hybrid import StepDaddyHybrid as StepDaddy
+from freesky.free_sky_hybrid import StepDaddyHybrid as StepDaddy, ChannelOffAirError
 from freesky.free_sky import Channel
 from fastapi import Response, status, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
@@ -42,6 +42,39 @@ logger = logging.getLogger(__name__)
 frontend_port = int(os.environ.get("PORT", "3000"))
 backend_port = int(os.environ.get("BACKEND_PORT", "8005"))
 max_concurrent_streams = int(os.environ.get("MAX_CONCURRENT_STREAMS", "25"))  # Increased from 5 to 25 for better throughput
+# How many channels may be RESOLVED concurrently. Deliberately separate from
+# MAX_CONCURRENT_STREAMS, which deployments set low (docker-compose.yml pins it to
+# 5) to cap simultaneous viewers: its only enforcement point was the resolve
+# semaphore, so 5 slow channels held every slot and starved healthy ones. Measured
+# during the 2026-09 off-air incident: ESPN went from 0.35s to 19.57s with five
+# stuck channels in flight. Resolution is cheap and mostly waiting on upstream, so
+# it gets its own, larger budget.
+max_concurrent_resolves = int(os.environ.get("MAX_CONCURRENT_RESOLVES", "25"))
+# How long a channel that upstream says is off air is remembered as such. Without
+# this every retry re-paid the full resolve cost: Dispatcharr alone retries 3x per
+# channel, and nothing recorded the failure in between.
+failed_stream_cache_ttl = int(os.environ.get("FAILED_STREAM_CACHE_TTL", "60"))
+# Seconds the resolver may spend finding a working upstream feed before we give up.
+#
+# Sized against Dispatcharr's client init window, which is the tightest consumer we
+# have: 30s, hardcoded (CLIENT_WAIT_TIMEOUT in its config_helper.py, not settable by
+# env or UI). Inside those 30s it must also open our playlist with ffmpeg, pull
+# segments and remux ~1MB of MPEG-TS (INITIAL_BEHIND_CHUNKS=4 x ~256KB) before it
+# will serve a single byte to a client. The old 20s budget left ~8s for all of
+# that, which is not enough — a slow-but-working channel resolved and then stalled
+# at "0/4 chunks" anyway.
+#
+# 10s is chosen from measurement, not guesswork: fresh crawls that bypass every
+# cache take 3.0-6.5s in production, so this clears the measured p100 with margin
+# while leaving Dispatcharr ~20s to open, probe, fetch a segment through our own
+# /api/content/ proxy and mux 1MB. It is deliberately above the 8s that was tried
+# once and regressed (a first hop can slow to ~7s under load). Raise it if you only
+# watch in a browser and would rather wait than lose a slow channel; lower it if
+# your client's own init window is tighter than Dispatcharr's 30s.
+stream_resolve_budget = float(os.environ.get("STREAM_RESOLVE_BUDGET", "10.0"))
+# The endpoint's own ceiling must sit just above the resolver's, so a resolve that
+# finishes at the buzzer is still returned instead of being cancelled into a 504.
+stream_request_timeout = stream_resolve_budget + 2.0
 api_url = os.environ.get("API_URL", f"http://0.0.0.0:{frontend_port}")  # Use frontend port for client-facing URLs
 
 # Parse API_URL to create WebSocket URL with backend port
@@ -137,6 +170,11 @@ cache_ttl = 5  # A live media playlist holds a ~36s sliding window, so a cache
 # the expensive part (resolving the upstream URL) is cached separately in
 # StepDaddyHybrid._resolved.
 
+# Negative cache: channel_id -> (reason, timestamp) for channels upstream has told
+# us are not broadcasting. Checked BEFORE the resolve semaphore is acquired, so an
+# off-air channel costs neither a slot nor a crawl until the entry expires.
+failed_stream_cache = LRUCache(maxsize=max_concurrent_streams * 15)
+
 
 # Track active tasks and streaming sessions for cleanup
 active_tasks: Dict[str, asyncio.Task] = {}
@@ -157,7 +195,10 @@ async def _get_stream_parallel(channel_id: str, prefer: str = None):
         # Check if channel should be skipped due to recent failures
         if stream_monitor.should_skip_channel(channel_id):
             logger.warning(f"Skipping channel {channel_id} due to recent failures")
-            stream_monitor.record_stream_attempt(channel_id, False, 0.0)
+            # Deliberately NOT recorded as an attempt. The backoff window is
+            # measured from the last attempt, so counting a skip would push that
+            # clock forward on every request and a busy channel could never reach
+            # the end of its own backoff.
             return None
 
         # Create multiple tasks for different streaming approaches
@@ -199,10 +240,12 @@ async def _get_stream_parallel(channel_id: str, prefer: str = None):
         # errored out first, so every channel 404'd on the fastest failure.
         pending = set(tasks)
         # 8s cut off channels that resolve correctly but whose first upstream hop
-        # slows to ~7s under load, turning working streams into false 504s. 20s
-        # stays under the outer 22s wait_for while giving the iframe-chain failover
-        # room to try more than one player.
-        deadline = time.time() + 20.0
+        # slows to ~7s under load, turning working streams into false 504s. The
+        # budget stays under the endpoint's own wait_for while giving the
+        # iframe-chain failover room to try more than one player. See
+        # stream_resolve_budget for why it is sized against Dispatcharr's 30s
+        # client init window rather than against upstream alone.
+        deadline = time.time() + stream_resolve_budget
 
         try:
             return await _race_stream_tasks(channel_id, pending, deadline, start_time)
@@ -213,6 +256,11 @@ async def _get_stream_parallel(channel_id: str, prefer: str = None):
                 if not task.done():
                     task.cancel()
 
+    except ChannelOffAirError:
+        # A definitive "not broadcasting" from upstream. Record it and propagate:
+        # the fallback below is the same dead path and would only add latency.
+        stream_monitor.record_stream_attempt(channel_id, False, time.time() - start_time)
+        raise
     except Exception as e:
         logger.error(f"Error in parallel stream fetch: {str(e)}")
         stream_monitor.record_stream_attempt(channel_id, False, 0.0)
@@ -229,7 +277,15 @@ async def _get_stream_parallel(channel_id: str, prefer: str = None):
 
 async def _race_stream_tasks(channel_id: str, pending: set, deadline: float, start_time: float):
     """First task that SUCCEEDS wins; then the sequential fallback. Split out so
-    _get_stream_parallel can cancel `pending` in a finally on outer cancellation."""
+    _get_stream_parallel can cancel `pending` in a finally on outer cancellation.
+
+    Raises:
+        ChannelOffAirError: the upstream CDN denied having this channel's feed.
+            Raised in preference to returning None so the caller can answer 404
+            immediately instead of paying for a sequential fallback that walks the
+            very same dead path.
+    """
+    offair_error = None
     while pending:
         remaining = deadline - time.time()
         if remaining <= 0:
@@ -246,6 +302,13 @@ async def _race_stream_tasks(channel_id: str, pending: set, deadline: float, sta
         for task in done:
             try:
                 result = await task
+            except ChannelOffAirError as e:
+                # Definitive upstream answer, not a transient miss. Remember it and
+                # let the remaining racers finish; if none of them succeeds we
+                # surface this instead of grinding through the sequential fallback.
+                logger.info(f"Parallel task {task.get_name()} reports channel off air: {e}")
+                offair_error = e
+                continue
             except Exception as e:
                 logger.debug(f"Parallel task {task.get_name()} failed: {str(e)}")
                 continue
@@ -265,6 +328,12 @@ async def _race_stream_tasks(channel_id: str, pending: set, deadline: float, sta
         except asyncio.CancelledError:
             pass
 
+    # The upstream told us the feed does not exist. The sequential fallback below
+    # re-enters the SAME DLHD path (enabled_services == ["DLHD"]) for another full
+    # 20s crawl, which cannot end differently — and, starting ~2s before the outer
+    # 22s wait_for, could only ever turn a clean 404 into a 504.
+    if offair_error is not None:
+        raise offair_error
 
     # If all parallel attempts failed, try sequential fallback
     logger.warning("All parallel attempts failed, trying sequential fallback")
@@ -318,7 +387,7 @@ def _process_stream_content(content: str, referer: str) -> str:
         return content
 
 # Concurrency control for streaming with high-performance limits
-_stream_semaphore = asyncio.Semaphore(max_concurrent_streams)
+_stream_semaphore = asyncio.Semaphore(max_concurrent_resolves)
 _content_semaphore = asyncio.Semaphore(max_concurrent_streams * 10)  # Increased to 10x for much better segment throughput
 
 logger.info("Backend initialized with connection pooling")
@@ -498,6 +567,28 @@ def _authorize_proxied_urls(content: str, token: str) -> str:
     return "\n".join(out)
 
 
+def _offair_response(channel_id: str, reason: str) -> JSONResponse:
+    """The 404 returned for a channel upstream is not currently broadcasting.
+
+    404 rather than 504 is the point: a gateway timeout tells a client like
+    Dispatcharr that WE are broken, so it retries hard and reports an error to the
+    user. 404 says the channel has nothing to play right now, which is both true
+    and something every player already knows how to handle.
+
+    Args:
+        channel_id: the channel that is off air.
+        reason: upstream detail, for the client log.
+
+    Returns:
+        A 404 JSONResponse describing the channel as off air.
+    """
+    return JSONResponse(
+        content={"error": "Channel is not currently broadcasting", "channel": channel_id,
+                 "detail": reason},
+        status_code=status.HTTP_404_NOT_FOUND,
+    )
+
+
 @fastapi_app.get("/stream/{channel_id}.m3u8")
 @fastapi_app.get("/api/stream/{channel_id}.m3u8")
 async def stream(channel_id: str, request: Request = None):
@@ -548,6 +639,19 @@ async def stream(channel_id: str, request: Request = None):
                     }
                 )
         
+        # Negative cache, checked BEFORE the semaphore so an off-air channel never
+        # occupies a resolve slot. A manual feed pick (`prefer`) always re-checks:
+        # the admin is explicitly asking whether that source is live now.
+        if not prefer and cache_key in failed_stream_cache:
+            reason, failed_at = failed_stream_cache[cache_key]
+            if current_time - failed_at < failed_stream_cache_ttl:
+                logger.info(
+                    f"Channel {channel_id} known off air for "
+                    f"{current_time - failed_at:.0f}s, failing fast for client {client_id}"
+                )
+                return _offair_response(channel_id, reason)
+            del failed_stream_cache[cache_key]
+
         # Use semaphore to control concurrent stream generation
         async with _stream_semaphore:
             # Double-check cache after acquiring semaphore (another request might have populated it)
@@ -574,12 +678,15 @@ async def stream(channel_id: str, request: Request = None):
                 # Use parallel multi-service streaming for faster response
                 stream_data = await asyncio.wait_for(
                     _get_stream_parallel(channel_id, prefer=prefer),
-                    timeout=22.0  # must exceed the resolver's own budget (20s)
-                    # so a slow-but-live upstream resolves instead of 504ing
+                    timeout=stream_request_timeout  # must exceed the resolver's own
+                    # budget so a slow-but-live upstream resolves instead of 504ing
                 )
                 
                 if not stream_data:
                     logger.error(f"No stream found for channel {channel_id} on any service")
+                    # Also negatively cached: the resolver just spent its whole
+                    # budget proving this, and an immediate retry would repeat it.
+                    failed_stream_cache[cache_key] = ("Stream not found on any service", time.time())
                     return JSONResponse(
                         content={"error": "Stream not found on any service"},
                         status_code=status.HTTP_404_NOT_FOUND
@@ -618,6 +725,9 @@ async def stream(channel_id: str, request: Request = None):
                 # override, so it doesn't become the channel's default for everyone.
                 if not prefer:
                     stream_cache[cache_key] = (stream_data, current_time)
+                # It is back on air — drop any stale off-air entry so a channel that
+                # recovers early is not held down for the rest of the TTL.
+                failed_stream_cache.pop(cache_key, None)
                 _remember_playlist_paths(stream_data, channel_id)
                 logger.info(f"Successfully generated stream for channel {channel_id}")
                 
@@ -631,8 +741,26 @@ async def stream(channel_id: str, request: Request = None):
                     }
                 )
                 
+            except ChannelOffAirError as e:
+                # Upstream is reachable and answered definitively: nothing is being
+                # broadcast on this channel. Remember it so the next request (and
+                # every client retry) costs nothing until the entry expires.
+                logger.info(f"Channel {channel_id} is off air: {e}")
+                failed_stream_cache[cache_key] = (str(e), time.time())
+                return _offair_response(channel_id, str(e))
+
             except asyncio.TimeoutError:
-                logger.error(f"Timeout generating stream for channel {channel_id}")
+                # Record the failure HERE. Every record_stream_attempt(False) call
+                # lives inside _get_stream_parallel, and wait_for CANCELS that
+                # coroutine — CancelledError is a BaseException, so its `except
+                # Exception` never ran either. The result was that a timeout moved
+                # no metric at all: /health reported 18/18 channels healthy through
+                # an 18-channel outage, and should_skip_channel had nothing to act
+                # on.
+                elapsed = time.time() - current_time
+                logger.error(f"Timeout generating stream for channel {channel_id} after {elapsed:.1f}s")
+                stream_monitor.record_stream_attempt(channel_id, False, elapsed)
+                failed_stream_cache[cache_key] = ("Stream generation timeout", time.time())
                 return JSONResponse(
                     content={"error": "Stream generation timeout"},
                     status_code=status.HTTP_504_GATEWAY_TIMEOUT
@@ -1456,6 +1584,14 @@ async def health():
         "total_active_streams": total_active_content_streams,  # Real video streaming sessions
         "total_m3u8_requests": total_m3u8_requests,  # Playlist requests (for debugging)
         "max_concurrent_streams": max_concurrent_streams,
+        "max_concurrent_resolves": max_concurrent_resolves,
+        # Channels upstream currently reports as off air. A non-empty list here
+        # with healthy metrics is the signature of an upstream outage, not a bug.
+        "offair_channels": sorted(
+            key.removeprefix("stream_")
+            for key, (_, failed_at) in list(failed_stream_cache.items())
+            if time.time() - failed_at < failed_stream_cache_ttl
+        ),
         "content_semaphore_limit": max_concurrent_streams * 10,  # Content streaming capacity
         "stream_utilization": f"{(total_active_content_streams / max_concurrent_streams) * 100:.1f}%",
         "content_sessions_per_channel": {ch: len(sessions) for ch, sessions in active_content_sessions.items()},

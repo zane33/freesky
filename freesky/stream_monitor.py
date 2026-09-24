@@ -31,7 +31,14 @@ class StreamMonitor:
         self.error_counts: Dict[str, int] = defaultdict(int)
         self.success_counts: Dict[str, int] = defaultdict(int)
         self.last_checks: Dict[str, float] = {}
-        
+        # When each channel last FAILED, and how many failures it has strung
+        # together since its last success. Both are needed because last_checks
+        # only ever records successes: a channel that has never once resolved has
+        # last_success == 0, which made should_skip_channel's backoff compare
+        # against the epoch and therefore never skip anything.
+        self.last_failures: Dict[str, float] = {}
+        self.consecutive_failures: Dict[str, int] = defaultdict(int)
+
         # Performance thresholds
         self.max_response_time = 5.0  # seconds
         self.min_success_rate = 0.7   # 70%
@@ -45,8 +52,11 @@ class StreamMonitor:
             self.success_counts[channel_id] += 1
             self.response_times[channel_id].append(response_time)
             self.last_checks[channel_id] = current_time
+            self.consecutive_failures[channel_id] = 0
         else:
             self.error_counts[channel_id] += 1
+            self.last_failures[channel_id] = current_time
+            self.consecutive_failures[channel_id] += 1
         
         # Update metrics
         self._update_metrics(channel_id)
@@ -64,10 +74,12 @@ class StreamMonitor:
         response_times = list(self.response_times[channel_id])
         avg_response_time = sum(response_times) / len(response_times) if response_times else 0.0
         
-        # Calculate consecutive failures
-        consecutive_failures = 0
-        if not self.last_checks.get(channel_id, 0) or (time.time() - self.last_checks[channel_id]) > 60:
-            consecutive_failures = min(self.error_counts[channel_id], self.max_consecutive_failures)
+        # Consecutive failures, counted directly. This used to be inferred as
+        # "total errors, if the last success was over 60s ago", which reported a
+        # channel that had failed once an hour ago as freshly failing, and could
+        # never exceed max_consecutive_failures — so the backoff in
+        # should_skip_channel had no headroom to grow.
+        consecutive_failures = self.consecutive_failures[channel_id]
         
         # Calculate quality score (0-1)
         quality_score = self._calculate_quality_score(success_rate, avg_response_time, consecutive_failures)
@@ -146,19 +158,35 @@ class StreamMonitor:
         return [channel_id for channel_id, _ in channel_scores[:limit]]
     
     def should_skip_channel(self, channel_id: str) -> bool:
-        """Check if a channel should be temporarily skipped"""
+        """Whether to skip a channel that keeps failing, under exponential backoff.
+
+        Args:
+            channel_id: channel being considered.
+
+        Returns:
+            True while the channel is inside its backoff window.
+
+        The backoff is measured from the last ATTEMPT, not the last success. It
+        used to use `metrics.last_success`, which defaults to 0 for a channel that
+        has never resolved — so `time.time() - 0` was ~1.8e9 seconds, always larger
+        than any retry window, and the breaker never fired for exactly the channels
+        it existed to protect. During the 2026-09 off-air incident that left 18
+        permanently failing channels retrying at full cost forever.
+        """
         if channel_id not in self.metrics:
             return False
-            
+
         metrics = self.metrics[channel_id]
-        
+
         # Skip if too many consecutive failures
         if metrics.consecutive_failures >= self.max_consecutive_failures:
-            # Check if enough time has passed for retry (exponential backoff)
-            time_since_last = time.time() - metrics.last_success
+            last_attempt = max(metrics.last_success, self.last_failures.get(channel_id, 0))
+            if not last_attempt:
+                return False  # nothing recorded yet; let it try
+            time_since_last = time.time() - last_attempt
             min_retry_time = 60 * (2 ** min(metrics.consecutive_failures - self.max_consecutive_failures, 3))
             return time_since_last < min_retry_time
-            
+
         return False
     
     def get_metrics_summary(self) -> Dict:

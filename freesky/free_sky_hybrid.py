@@ -29,6 +29,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Seconds a single crawl may spend hunting for a working feed. Shared with
+# backend.stream_resolve_budget via the same environment variable so the resolver
+# and the endpoint that wraps it cannot drift apart; see that constant for why it
+# is sized against Dispatcharr's hardcoded 30s client init window.
+RESOLVE_BUDGET = float(os.environ.get("STREAM_RESOLVE_BUDGET", "10.0"))
+
+
+class ChannelOffAirError(ValueError):
+    """The upstream CDN says this channel's feed does not exist right now.
+
+    Distinct from "we could not find a stream URL". The signed playlist URL was
+    minted successfully by the player chain, but fetching it returned 404 — the
+    origin has no such stream, i.e. the channel is not currently broadcasting.
+    Verified 2026-09 against channels 588/820/589/260: the site's OWN player
+    (driven by a real browser) minted a URL and got the same 404, while live
+    channels on the identical code path returned 200.
+
+    Subclasses ValueError so the existing `except Exception` / `except ValueError`
+    handlers around playlist fetching keep behaving as they did; callers that want
+    to fail fast opt in by catching this type specifically.
+    """
+
+
 # ponytail: Channel used to be redefined here with identical fields. Two classes
 # with the same shape are still two types: anything annotated
 # `List[free_sky.Channel]` silently rejected the ones built here, which is how the
@@ -364,6 +387,11 @@ class StepDaddyHybrid:
     _M3U8_TTL_MIN = int(os.environ.get("M3U8_TTL_MIN", "60"))
     _M3U8_TTL_MAX = int(os.environ.get("M3U8_TTL_MAX", "18000"))
 
+    # How many DIFFERENT players must have their feed 404'd by the CDN before we
+    # call a channel off air and stop crawling. One is not enough: players sit on
+    # different providers and a page can advertise a stale ad/fallback URL.
+    _OFFAIR_PLAYER_QUORUM = 2
+
     @classmethod
     def _cache_ttl_for(cls, m3u8_url: str) -> int:
         """How long a resolved playlist URL stays usable, from its own `e` param.
@@ -384,10 +412,16 @@ class StepDaddyHybrid:
 
     async def _resolve_via_iframe_chain(self, channel_id: str, max_hops: int = 4,
                                         max_pages: int = 8, prefer: str = None,
-                                        budget: float = 20.0, single_feed: bool = False):
+                                        budget: float = None, single_feed: bool = False):
         """
         Follow the live upstream chain to a WORKING HLS playlist, failing over
         across the available players.
+
+        `budget` is the total seconds this crawl may take; None means RESOLVE_BUDGET.
+        Raises ChannelOffAirError as soon as _OFFAIR_PLAYER_QUORUM players have had
+        their feed 404'd by the CDN, rather than spending the rest of the budget
+        re-confirming that a channel which is not broadcasting is still not
+        broadcasting.
 
         As of 2026-07 a player chain is: /<player>/stream-N.php -> <player-host>
         /premiumtv/daddyN.php?id=N, whose Clappr config carries the m3u8 URL inside
@@ -409,16 +443,23 @@ class StepDaddyHybrid:
             players = [prefer]
 
         watch_url = f"{self._base_url}/watch.php?id={channel_id}"
-        deadline = asyncio.get_event_loop().time() + budget
+        deadline = asyncio.get_event_loop().time() + (RESOLVE_BUDGET if budget is None else budget)
         last_error = None
         # A feed that resolves but declares no audio is kept here and only used if
         # no player with audio turns up — so a silent channel still shows a picture
         # rather than 404ing, but any feed WITH audio always wins.
         video_only_fallback = None
+        # Players whose feed the CDN answered 404 for. One 404 is not proof the
+        # channel is off air — players sit on different providers, and a page can
+        # advertise a stale ad/fallback URL. Two independent providers both saying
+        # "no such stream" is proof enough, and stopping there is the difference
+        # between ~6s and the full 20s budget for a channel that is not on.
+        offair_players = set()
 
         for player in players:
             if asyncio.get_event_loop().time() > deadline:
                 break  # a dead channel shouldn't burn the whole request on every player
+            player_saw_offair = False
             # Seed each player from its own entry page but keep watch.php as the
             # referer, mirroring how the site navigates between players.
             start = f"{self._base_url}/{player}/stream-{channel_id}.php"
@@ -453,6 +494,15 @@ class StepDaddyHybrid:
                     tried_any = True
                     try:
                         content, has_audio = await self._fetch_playlist(candidate, url)
+                    except ChannelOffAirError as e:
+                        # The origin minted this URL and then denied having the
+                        # stream. Note it and still try the page's other
+                        # candidates, in case this one was an ad or a stale
+                        # fallback rather than the feed.
+                        player_saw_offair = True
+                        last_error = e
+                        logger.debug(f"Candidate off air for {channel_id}: {candidate}: {e}")
+                        continue
                     except Exception as e:
                         # Not every m3u8 on the page is the feed (ads, fallbacks),
                         # so try the rest before writing this player off.
@@ -482,6 +532,17 @@ class StepDaddyHybrid:
                         # Skip templated srcs like "' + url + '" in inline scripts.
                         if "://" in src or src.startswith("/"):
                             queue.append((urljoin(url, src), url, depth + 1))
+
+            # This player offered a feed and the CDN denied having it. Once two
+            # independent players agree, stop crawling: the channel is not being
+            # broadcast and the remaining players cost seconds to tell us so again.
+            if player_saw_offair:
+                offair_players.add(player)
+                if len(offair_players) >= self._OFFAIR_PLAYER_QUORUM:
+                    raise ChannelOffAirError(
+                        f"Channel {channel_id} is off air: players "
+                        f"{sorted(offair_players)} all returned HTTP 404 from the CDN"
+                    )
 
         if video_only_fallback is not None:
             logger.warning(f"No feed with audio for channel {channel_id}; using video-only fallback")
@@ -529,6 +590,12 @@ class StepDaddyHybrid:
             response = await self._session.get(m3u8_url, headers=self._headers(referer))
             if response.status_code == 200 and response.text.startswith("#EXTM3U"):
                 break
+            # 404 means the origin has no such stream: the channel is off air, not
+            # that this candidate was the wrong URL. Retrying or trying the next
+            # player cannot conjure a feed that is not being broadcast, and doing
+            # so is what made an off-air channel cost the full 20s budget.
+            if response.status_code == 404:
+                raise ChannelOffAirError(f"Off air (HTTP 404) from {m3u8_url}")
             if response.status_code != 503 or attempt == 2:
                 raise ValueError(f"Bad playlist from {m3u8_url}: HTTP {response.status_code}")
             await asyncio.sleep(1.5)

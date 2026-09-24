@@ -136,7 +136,18 @@ services:
       # intermittent 502s from the control panel.
       - WORKERS=${WORKERS:-1}
       - MAX_CONCURRENT_STREAMS=${MAX_CONCURRENT_STREAMS:-5}  # Reduced from 10 to 5
-      
+      # Resolution concurrency is deliberately NOT tied to the viewer cap above.
+      # It used to be: the 5 there sized the resolve semaphore, so five slow or
+      # off-air channels held every slot and healthy channels queued behind them
+      # (ESPN measured at 19.57s instead of 0.35s). See TROUBLESHOOTING issue 9.
+      - MAX_CONCURRENT_RESOLVES=${MAX_CONCURRENT_RESOLVES:-25}
+      # How long a channel upstream reports as off air is remembered, in seconds.
+      - FAILED_STREAM_CACHE_TTL=${FAILED_STREAM_CACHE_TTL:-60}
+      # Seconds the resolver may spend finding a working feed. Sized against
+      # Dispatcharr's hardcoded 30s client init window, which must also fit ffmpeg
+      # opening the playlist and buffering ~1MB of TS. See TROUBLESHOOTING issue 10.
+      - STREAM_RESOLVE_BUDGET=${STREAM_RESOLVE_BUDGET:-10}
+
       # Reflex Framework Settings
       - REFLEX_ENV=prod
       - REFLEX_SKIP_COMPILE=1

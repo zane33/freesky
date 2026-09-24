@@ -95,7 +95,9 @@ proxy configuration.
 
 **Fix**: `StepDaddyHybrid._stream_candidates` scans both the `atob()` and plain
 `STREAM_URL` forms, `_fetch_playlist` retries a 503 twice at 1.5s, the per-hop
-timeout is 8s, the resolve budget 20s and the endpoint timeout 22s.
+timeout is 8s, and the resolve budget is `STREAM_RESOLVE_BUDGET` (default 10s)
+inside an endpoint timeout of budget + 2s. (Those were 20s/22s when this issue was
+written; they were cut to fit Dispatcharr's 30s init window — see issue 10.)
 
 **When it happens again** (upstream moves roughly every few months): confirm with
 `curl -sLI https://dlive.sx` for a redirect, then set `DADDYLIVE_URI` to the new
@@ -159,6 +161,94 @@ turn. All-200 is healthy. If some fail, check the same URLs upstream first — i
 upstream is 200 and the proxy is not, it is the proxy, and connection reuse is the
 first place to look.
 
+### 9. *Some* channels return 504 after ~22s while others play fine
+
+**Symptom**: a subset of channels — often whole groups, e.g. most of Sky Sport NZ
+or FOX Sports AU — return HTTP 504 `{"error": "Stream generation timeout"}` after
+~21s, deterministically, while their neighbours return 200 in under a second.
+Clients that retry (Dispatcharr's ffmpeg tries 3x) hang for over a minute before
+giving up. Healthy channels also slow to ~20s whenever several bad ones are being
+requested at the same time.
+
+Note the difference from issue 6: there, *every* channel fails and the cause is
+upstream changing its page format. Here resolution still works — it just has
+nothing to resolve to.
+
+**Cause**: those channels are not being broadcast. Confirmed 2026-09 by driving
+the site's own player in a real browser: the JS minted a signed playlist URL
+correctly and the CDN answered **HTTP 404** — the origin has no such stream.
+Live channels on the identical code path returned 200.
+
+The 504 was our own handling, not the outage:
+1. A 404 candidate was treated like any other dead URL, so the resolver walked all
+   six players before giving up, burning its whole 20s budget.
+2. Nothing cached the failure, so every retry paid full price.
+3. `MAX_CONCURRENT_STREAMS` (pinned to 5 in `docker-compose.yml`) sized the
+   *resolve* semaphore, so five stuck channels starved every healthy one —
+   measured: ESPN went from 0.35s to 19.57s.
+4. `asyncio.wait_for` cancels the coroutine holding every
+   `record_stream_attempt(False)` call, and `CancelledError` is a `BaseException`,
+   so the timeout recorded nothing. `/health` reported 18/18 channels healthy
+   throughout an 18-channel outage, and `should_skip_channel` had no data to act
+   on — it could not fire anyway, because it measured backoff from `last_success`,
+   which is `0` for a channel that has never resolved.
+
+**Fix**: a CDN 404 now raises `ChannelOffAirError`. Once two independent players
+agree (`_OFFAIR_PLAYER_QUORUM`), the resolver stops immediately and the endpoint
+returns **404 "Channel is not currently broadcasting"** instead of 504 — a player
+handles that gracefully, where a 504 says *we* are broken. The result is cached in
+`failed_stream_cache` for `FAILED_STREAM_CACHE_TTL` seconds and cleared the moment
+the channel comes back. Resolution concurrency moved to its own
+`MAX_CONCURRENT_RESOLVES`, and timeouts are recorded as failures at the point the
+504 is returned.
+
+**When it happens again**: check whether it is genuinely off air before touching
+the resolver. A fresh crawl bypassing every cache is
+`curl "http://<host>:3000/api/stream/<id>.m3u8?player=stream"` — if healthy
+channels resolve fresh in ~3s, the scraper is fine and the failing channels are
+simply not broadcasting. Expect the failing set to track the sports schedule.
+
+### 10. Dispatcharr: channel stalls at "0/4 chunks" and the client aborts after 30s
+
+**Symptom**: Dispatcharr (proxy mode) logs
+`Channel <uuid> connected but waiting for buffer to fill: 0/4 chunks`, then
+`stalled in connecting state with no buffer data after 30s, aborting init wait`.
+The same URL plays fine in VLC or a browser.
+
+**Cause**: Dispatcharr's client init window is **30 seconds and hardcoded** —
+`CLIENT_WAIT_TIMEOUT` defaults to 30 in its `config_helper.py` and is not declared
+in `apps/proxy/config.py`, so it is settable by neither env var nor UI. (The
+`channel_init_grace_period` you *can* set in Settings → Proxy is a different,
+earlier timer; raising it past 30 gains nothing.)
+
+Everything has to fit inside those 30s: our resolve, ffmpeg opening the playlist,
+pulling segments, and remuxing **~1MB of MPEG-TS** — `INITIAL_BEHIND_CHUNKS = 4`
+chunks of `188 * 1361` ≈ 256KB each. The chunks are size-based, not duration-based,
+so a low-bitrate channel takes longer to reach them.
+
+A 20s resolve budget left only ~8s for all of that, which is why a healthy but slow
+channel could resolve and *still* stall at 0 chunks.
+
+**Fix**: `STREAM_RESOLVE_BUDGET` defaults to 10s, leaving ~20s to buffer. Measured
+fresh crawls (bypassing every cache) run 3.0–6.5s in production, so this clears the
+real distribution comfortably. Aim to return a playlist in **≤5s**; treat 10s as the
+ceiling.
+
+**Also worth knowing about Dispatcharr's proxy mode** (verified against 0.31.0):
+- It **never inspects our HTTP status code**. 404, 503 and 504 are identical to it;
+  its stderr parser reads only codec/format metadata. What matters is how *fast* we
+  fail, because a 22s failure meant it never reached retry 2 of 3, let alone its
+  stream-switch failover.
+- Playback failures **never** disable a stream or channel in its database.
+- Content-type, CORS and `Cache-Control` are irrelevant in proxy mode — the
+  consumer is ffmpeg, not a browser.
+- Its ffmpeg profile sends **no User-Agent** (`Lavf/*`). Never gate `/api/stream/`
+  or `/api/content/` on User-Agent or Dispatcharr will look exactly like an off-air
+  channel.
+- Its M3U sync **deletes** streams that disappear from the playlist we serve. So
+  **never filter off-air channels out of `/playlist.m3u8`** — that, not a 404, is
+  the one thing that genuinely poisons a channel.
+
 ## Performance Optimizations
 
 ### Environment Variables for Performance
@@ -178,6 +268,18 @@ docker exec <container_name> env | grep -E "(PORT|API_URL|DADDYLIVE_URI|PROXY_CO
 - `PROXY_CONTENT`: Whether to proxy video content
 - `SOCKS5`: Optional SOCKS5 proxy configuration
 - `WORKERS`: Number of backend worker processes
+- `MAX_CONCURRENT_STREAMS`: Cap on simultaneous viewers; also sizes the playlist
+  caches (default: 25, pinned to 5 in `docker-compose.yml`)
+- `MAX_CONCURRENT_RESOLVES`: How many channels may be resolved upstream at once
+  (default: 25). Kept separate from `MAX_CONCURRENT_STREAMS` because a low viewer
+  cap used to throttle resolution too, letting a handful of slow or off-air
+  channels starve healthy ones — see issue 9
+- `STREAM_RESOLVE_BUDGET`: Seconds the resolver may spend finding a working feed
+  (default: 10). Sized against Dispatcharr's **hardcoded 30s** client init window —
+  see issue 10. Raise it for browser-only viewing, lower it for a tighter client
+- `FAILED_STREAM_CACHE_TTL`: Seconds to remember that a channel is off air before
+  re-checking (default: 60). Lower it if channels come back mid-event and you want
+  them picked up sooner; raise it to cut upstream load during long outages
 
 ### Example Usage
 
