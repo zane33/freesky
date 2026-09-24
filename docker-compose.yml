@@ -10,7 +10,7 @@ services:
         BACKEND_PORT: 8005
     
     # Replace with actual container ID/name or comment out for default networking
-    network_mode: host
+    network_mode: container:glueton-gluetun-1
     
     # Ports are not needed when using container networking
     # Comment out if using container networking
