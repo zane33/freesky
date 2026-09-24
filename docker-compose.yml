@@ -146,7 +146,7 @@ services:
       # Seconds the resolver may spend finding a working feed. Sized against
       # Dispatcharr's hardcoded 30s client init window, which must also fit ffmpeg
       # opening the playlist and buffering ~1MB of TS. See TROUBLESHOOTING issue 10.
-      - STREAM_RESOLVE_BUDGET=${STREAM_RESOLVE_BUDGET:-10}
+      - STREAM_RESOLVE_BUDGET=${STREAM_RESOLVE_BUDGET:-16}
       # Browser fallback for players whose payload we cannot decode statically.
       # Only ONE upstream player (`stream`, via _econfig) is statically readable;
       # the rest compute their playlist URL in obfuscated JS at run time. Without

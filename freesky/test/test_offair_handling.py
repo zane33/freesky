@@ -237,6 +237,31 @@ def test_non_wrapped_image_is_not_misread_as_a_stream():
     assert off(b"\x89PNG\r\n\x1a\n" + bytes(1000)) == 0
 
 
+def test_resolve_budget_fits_between_the_browser_and_dispatcharr():
+    """The budget is pinned on both sides and both bounds are load-bearing.
+
+    Too low and a channel that needs the browser fallback (9.7-11.4s measured) is
+    cut off mid-resolve into a 504 — channel 588 died at exactly 12.03s against the
+    old 10s budget. Too high and either Caddy's 25s response_header_timeout or
+    Dispatcharr's hardcoded 30s client window fires first, and we never answer.
+    """
+    try:
+        from freesky import backend
+    except Exception:
+        print("  (skipped: reflex unavailable)")
+        return
+
+    # Must outlast the slowest measured browser resolve, with margin.
+    assert backend.stream_resolve_budget >= 13.0
+    # The endpoint ceiling must sit above the resolver, or a resolve that finishes
+    # at the buzzer is cancelled into a 504 instead of being returned.
+    assert backend.stream_request_timeout > backend.stream_resolve_budget
+    # ...and below Caddy's 25s header timeout for /api/.
+    assert backend.stream_request_timeout < 25.0
+    # ...leaving Dispatcharr enough of its 30s to mux 1MB (3.7s worst case measured).
+    assert 30.0 - backend.stream_request_timeout >= 8.0
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

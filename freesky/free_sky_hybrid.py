@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # backend.stream_resolve_budget via the same environment variable so the resolver
 # and the endpoint that wraps it cannot drift apart; see that constant for why it
 # is sized against Dispatcharr's hardcoded 30s client init window.
-RESOLVE_BUDGET = float(os.environ.get("STREAM_RESOLVE_BUDGET", "10.0"))
+RESOLVE_BUDGET = float(os.environ.get("STREAM_RESOLVE_BUDGET", "16.0"))
 
 
 class DefinitiveResolveFailure(ValueError):

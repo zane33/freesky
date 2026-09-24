@@ -60,20 +60,31 @@ failed_stream_cache_ttl = int(os.environ.get("FAILED_STREAM_CACHE_TTL", "60"))
 #
 # Sized against Dispatcharr's client init window, which is the tightest consumer we
 # have: 30s, hardcoded (CLIENT_WAIT_TIMEOUT in its config_helper.py, not settable by
-# env or UI). Inside those 30s it must also open our playlist with ffmpeg, pull
-# segments and remux ~1MB of MPEG-TS (INITIAL_BEHIND_CHUNKS=4 x ~256KB) before it
-# will serve a single byte to a client. The old 20s budget left ~8s for all of
-# that, which is not enough — a slow-but-working channel resolved and then stalled
-# at "0/4 chunks" anyway.
+# env or UI). Whatever we spend resolving, Dispatcharr must spend the remainder
+# opening our playlist with ffmpeg and muxing ~1MB of MPEG-TS
+# (INITIAL_BEHIND_CHUNKS=4 x ~256KB) before it serves a single byte to a client.
 #
-# 10s is chosen from measurement, not guesswork: fresh crawls that bypass every
-# cache take 3.0-6.5s in production, so this clears the measured p100 with margin
-# while leaving Dispatcharr ~20s to open, probe, fetch a segment through our own
-# /api/content/ proxy and mux 1MB. It is deliberately above the 8s that was tried
-# once and regressed (a first hop can slow to ~7s under load). Raise it if you only
-# watch in a browser and would rather wait than lose a slow channel; lower it if
-# your client's own init window is tighter than Dispatcharr's 30s.
-stream_resolve_budget = float(os.environ.get("STREAM_RESOLVE_BUDGET", "10.0"))
+# 16s is chosen from measurement on 2026-09-24, both halves timed separately:
+#
+#   resolve, static `stream` player only ......... 2.5s
+#   resolve, browser fallback (`plus` player) .... 9.7-11.4s
+#   ffmpeg open + mux 1MB, 3 runs ................ 3.7s, 0.7s, 0.7s
+#
+# The browser fallback is the binding constraint: a channel the static decoders
+# cannot read costs ~11.4s, and the previous 10s budget (12s endpoint ceiling) cut
+# those off mid-resolve and returned 504 — the exact failure Dispatcharr logged
+# against channel 588, which died at 12.03s. 16s clears the measured p100 with ~4s
+# of margin and still leaves Dispatcharr 12s, roughly 3x the 3.7s worst case above.
+#
+# An earlier revision of this comment justified the 10s value by claiming
+# Dispatcharr needed ~20s to mux, because channels stalled at "0/4 chunks". That
+# diagnosis was wrong: the stall was image-wrapped segments (see
+# _media_payload_offset), not slow muxing, and the measurements above are what the
+# mux actually costs now that segments decode.
+#
+# Upper bound: stream_request_timeout must stay under Caddy's response_header_timeout
+# for /api/ (25s, see Caddyfile), or Caddy cuts the request off before we answer.
+stream_resolve_budget = float(os.environ.get("STREAM_RESOLVE_BUDGET", "16.0"))
 # The endpoint's own ceiling must sit just above the resolver's, so a resolve that
 # finishes at the buzzer is still returned instead of being cancelled into a 504.
 stream_request_timeout = stream_resolve_budget + 2.0

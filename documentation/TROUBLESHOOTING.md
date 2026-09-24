@@ -95,9 +95,10 @@ proxy configuration.
 
 **Fix**: `StepDaddyHybrid._stream_candidates` scans both the `atob()` and plain
 `STREAM_URL` forms, `_fetch_playlist` retries a 503 twice at 1.5s, the per-hop
-timeout is 8s, and the resolve budget is `STREAM_RESOLVE_BUDGET` (default 10s)
+timeout is 8s, and the resolve budget is `STREAM_RESOLVE_BUDGET` (default 16s)
 inside an endpoint timeout of budget + 2s. (Those were 20s/22s when this issue was
-written; they were cut to fit Dispatcharr's 30s init window — see issue 10.)
+written, were cut to 10s/12s to fit Dispatcharr's 30s init window, and were raised
+again to 16s/18s once the browser fallback landed — see issue 10 for the numbers.)
 
 **When it happens again** (upstream moves roughly every few months): confirm with
 `curl -sLI https://dlive.sx` for a redirect, then set `DADDYLIVE_URI` to the new
@@ -238,13 +239,27 @@ pulling segments, and remuxing **~1MB of MPEG-TS** — `INITIAL_BEHIND_CHUNKS = 
 chunks of `188 * 1361` ≈ 256KB each. The chunks are size-based, not duration-based,
 so a low-bitrate channel takes longer to reach them.
 
-A 20s resolve budget left only ~8s for all of that, which is why a healthy but slow
-channel could resolve and *still* stall at 0 chunks.
+**Fix**: `STREAM_RESOLVE_BUDGET` defaults to **16s**, leaving Dispatcharr 12s. Both
+halves were timed separately on 2026-09-24:
 
-**Fix**: `STREAM_RESOLVE_BUDGET` defaults to 10s, leaving ~20s to buffer. Measured
-fresh crawls (bypassing every cache) run 3.0–6.5s in production, so this clears the
-real distribution comfortably. Aim to return a playlist in **≤5s**; treat 10s as the
-ceiling.
+| Phase | Measured |
+|---|---|
+| Resolve, static `stream` player | 2.5s |
+| Resolve, browser fallback (`plus`, see issue 11) | 9.7–11.4s |
+| ffmpeg open + mux 1MB (3 runs) | 3.7s, 0.7s, 0.7s |
+
+The browser fallback is the binding constraint, and 12s for the mux is ~3x its worst
+case. The endpoint answers by 18s (`budget + 2`), which must stay under Caddy's 25s
+`response_header_timeout` for `/api/` — raising the budget past 23s means raising
+that too.
+
+> **A 10s budget was tried first and was wrong.** It cut the browser fallback off
+> mid-resolve: channel 588 died at exactly **12.03s**, one tick past the 12s endpoint
+> ceiling, and Dispatcharr logged it as `HTTP error 504 Gateway Timeout`. The 10s
+> value had been justified by claiming the mux needed ~20s, because channels stalled
+> at "0/4 chunks" — but that stall was **image-wrapped segments** (issue 12), not
+> slow muxing. Once segments decoded, the mux measured under 4s. If you find yourself
+> shrinking this budget to cure a 0/4 stall, check issue 12 first.
 
 **Also worth knowing about Dispatcharr's proxy mode** (verified against 0.31.0):
 - It **never inspects our HTTP status code**. 404, 503 and 504 are identical to it;
@@ -384,8 +399,9 @@ docker exec <container_name> env | grep -E "(PORT|API_URL|DADDYLIVE_URI|PROXY_CO
   cap used to throttle resolution too, letting a handful of slow or off-air
   channels starve healthy ones — see issue 9
 - `STREAM_RESOLVE_BUDGET`: Seconds the resolver may spend finding a working feed
-  (default: 10). Sized against Dispatcharr's **hardcoded 30s** client init window —
-  see issue 10. Raise it for browser-only viewing, lower it for a tighter client
+  (default: 16). Must outlast the browser fallback (9.7–11.4s measured) and still
+  leave room inside Dispatcharr's **hardcoded 30s** client init window and Caddy's
+  25s header timeout — see issue 10 for the full budget breakdown
 - `BROWSER_RESOLVE`: Run players we cannot decode statically in headless Chromium
   (default: 1). See issue 11 — without it, a channel whose `stream` provider is
   down appears dead even when another player carries it

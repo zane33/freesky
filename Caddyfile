@@ -136,12 +136,14 @@
 			flush_interval -1
 			header_up X-Real-IP {remote_host}
 			header_down -Server
-			# Resolving a channel costs ~3-6.5s measured, and the resolver is capped by
-			# STREAM_RESOLVE_BUDGET (default 10s) inside a wait_for of budget + 2s.
-			# This MUST stay above that outer timeout or Caddy cuts the request off
-			# first and every slow-but-working channel becomes a bare 504 — which is
-			# exactly what a 20s cap here did against a 22s backend deadline. Leave
-			# headroom if you raise STREAM_RESOLVE_BUDGET.
+			# Resolving a channel costs 2.5s statically and 9.7-11.4s when it has to
+			# fall back to a browser, and the resolver is capped by
+			# STREAM_RESOLVE_BUDGET (default 16s) inside a wait_for of budget + 2s,
+			# so the backend answers by 18s. This MUST stay above that outer timeout
+			# or Caddy cuts the request off first and every slow-but-working channel
+			# becomes a bare 504 — which is exactly what a 20s cap here did against a
+			# 22s backend deadline. Raising STREAM_RESOLVE_BUDGET past 23s means
+			# raising this too.
 			transport http {
 				read_buffer 8192      # Smaller buffer for playlist delivery
 				write_buffer 8192
