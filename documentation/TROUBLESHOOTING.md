@@ -320,6 +320,44 @@ for `Resolved channel <id> via '<player>' player (browser)` in the log. Note tha
 `?player=<name>` bypasses both caches, so it is the way to test a single provider
 without waiting for the negative cache to expire.
 
+### 12. Plays in the browser but ffmpeg/Dispatcharr says "Invalid data found when processing input"
+
+**Symptom**: the watch page plays a channel perfectly, while Dispatcharr (or plain
+ffmpeg) fails on the same URL with
+
+```
+Error when loading first segment 'http://.../api/content/....ts?token=...'
+Error opening input: Invalid data found when processing input
+```
+
+Browser-works-but-ffmpeg-does-not is the diagnostic signature. It means the
+playlist is fine and the SEGMENTS are the problem.
+
+**Cause**: some providers disguise the transport stream as an image. Observed
+2026-09-24 on the `plus` provider (juxrd.hundxvision.co.uk): every segment is
+served as `Content-Type: image/webp` and begins with a 42-byte RIFF container —
+`RIFF....WEBPVP8L....EXIF....` — with the MPEG-TS as the EXIF chunk's payload, a
+clean multiple of 188 bytes. The provider's own JavaScript strips this in the
+player. hls.js tolerated the prefix; ffmpeg did not.
+
+**Fix**: `_media_payload_offset` in `freesky/backend.py` detects the container,
+walks its RIFF chunks to the chunk holding the transport stream, and streams from
+there. It falls back to locating three TS sync bytes (`0x47`) at 188-byte spacing
+if the container is shaped differently, and returns 0 — i.e. passes through
+untouched — for ordinary providers and for genuine images. The proxy buffers only
+the first 1KB of a segment to make that decision, and relabels an `image/*`
+segment as `video/mp2t` on the way out.
+
+**Diagnosing a repeat**: fetch a segment by hand and look at the first bytes:
+
+```bash
+curl -s "http://<host>:3000/api/content/<...>.ts?token=..." | xxd | head -3
+```
+
+A healthy segment starts `47 ...` (TS sync). Anything else — `RIFF`, `\x89PNG`,
+`\xff\xd8` — is a wrapper, and the offset of the first 188-aligned `0x47` run is
+where the real stream begins.
+
 ## Performance Optimizations
 
 ### Environment Variables for Performance

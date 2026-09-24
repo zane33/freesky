@@ -967,6 +967,60 @@ _NESTED_ATTEMPTS, _NESTED_TIMEOUT = 2, 6.0   # no stale copy: 2x6s + failover mu
 # the feed happens in the background and lands as an alias for the next reload.
 _NESTED_FAST_ATTEMPTS, _NESTED_FAST_TIMEOUT = 1, 4.0
 _failover_tasks: Dict[str, asyncio.Task] = {}  # proxied path -> in-flight background failover
+_TS_SYNC = 0x47
+_TS_PACKET = 188
+# How much of a segment to buffer before deciding whether it is wrapped. Enough to
+# walk the RIFF chunk headers and, failing that, to see three TS sync bytes at
+# 188-byte spacing.
+_WRAPPER_PROBE_BYTES = 1024
+
+
+def _media_payload_offset(head: bytes) -> int:
+    """Offset of the real MPEG-TS payload inside an image-wrapped segment.
+
+    Some upstream providers hide the transport stream inside a valid image
+    container so that a naive fetch looks like a picture. Observed 2026-09-24 on
+    the `plus` provider (juxrd.hundxvision.co.uk): every segment arrives as
+    `Content-Type: image/webp`, beginning `RIFF....WEBPVP8L....EXIF....` with the
+    TS as the EXIF chunk's payload, 42 bytes in, and a clean multiple of 188 bytes
+    after that.
+
+    The player's own JavaScript strips this client-side. hls.js in a browser
+    tolerated it, so the watch page played; ffmpeg did not, and Dispatcharr failed
+    with "Error when loading first segment ... Invalid data found when processing
+    input" while the browser was fine — which is a confusing pair of symptoms to
+    see together.
+
+    Args:
+        head: the first bytes of the segment, at least _WRAPPER_PROBE_BYTES when
+            available.
+
+    Returns:
+        The offset to start streaming from; 0 when the segment is not wrapped, so
+        an ordinary provider is passed through untouched.
+    """
+    if not (head.startswith(b"RIFF") and head[8:12] == b"WEBP"):
+        return 0
+    # Walk the RIFF chunks: 4-byte id, 4-byte little-endian size, payload, padded
+    # to an even length. The payload we want is whichever chunk holds the TS.
+    pos = 12
+    while pos + 8 <= len(head):
+        size = int.from_bytes(head[pos + 4:pos + 8], "little")
+        data = pos + 8
+        if data < len(head) and head[data] == _TS_SYNC:
+            return data
+        pos = data + size + (size & 1)
+    # The chunk walk ran past what we buffered (or the container is shaped
+    # differently). Fall back to the stream's own signature: TS sync bytes repeating
+    # every 188 bytes. Three in a row is not something image data produces by
+    # chance.
+    for i in range(max(0, len(head) - 2 * _TS_PACKET)):
+        if (head[i] == _TS_SYNC and head[i + _TS_PACKET] == _TS_SYNC
+                and head[i + 2 * _TS_PACKET] == _TS_SYNC):
+            return i
+    return 0
+
+
 _CONTENT_M3U8_RE = re.compile(r"^/api/content/([^/\s]+)(?:/([^/\s]+))?\.m3u8", re.M)
 
 
@@ -1209,6 +1263,11 @@ async def content(path: str, request: Request, ref: str = None):
             async def proxy_stream():
                 last_heartbeat = time.time()
                 chunk_count = 0
+                # Buffer the head of the segment so a wrapped one can be unwrapped
+                # before any of it reaches the player. Held only until the probe is
+                # satisfied, so memory cost is bounded by _WRAPPER_PROBE_BYTES.
+                probe = b""
+                unwrapped = False
                 try:
                     async for chunk in response.aiter_bytes(chunk_size=512 * 1024):
                         chunk_count += 1
@@ -1217,7 +1276,19 @@ async def content(path: str, request: Request, ref: str = None):
                             if channel_id in active_content_sessions and session_id in active_content_sessions[channel_id]:
                                 active_content_sessions[channel_id][session_id] = now
                                 last_heartbeat = now
+                        if not unwrapped:
+                            probe += chunk
+                            if len(probe) < _WRAPPER_PROBE_BYTES:
+                                continue  # not enough yet to judge
+                            offset = _media_payload_offset(probe)
+                            if offset:
+                                logger.info(f"Stream session {session_id} unwrapped "
+                                            f"{offset}-byte image header from segment")
+                            chunk, probe, unwrapped = probe[offset:], b"", True
                         yield chunk
+                    if not unwrapped and probe:
+                        # Segment ended before the probe filled — a very short one.
+                        yield probe[_media_payload_offset(probe):]
                     logger.info(f"Stream session {session_id} completed normally after {chunk_count} chunks")
                 except Exception as e:
                     logger.error(f"Error in persistent proxy stream for session {session_id}: {_describe(e)}")
@@ -1226,9 +1297,15 @@ async def content(path: str, request: Request, ref: str = None):
                     await cm.__aexit__(None, None, None)
                     _release_session(session_id, channel_id)
 
+            # An image content-type on a segment is part of the same disguise; the
+            # bytes we hand on are transport stream, so say so. ffmpeg mostly trusts
+            # the data, but a player that believes the header would never try.
+            upstream_type = response.headers.get("content-type", "application/octet-stream")
+            media_type = "video/mp2t" if upstream_type.startswith("image/") else upstream_type
+
             return StreamingResponse(
                 proxy_stream(),
-                media_type=response.headers.get("content-type", "application/octet-stream"),
+                media_type=media_type,
                 headers={
                     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                     "Access-Control-Allow-Headers": "*",

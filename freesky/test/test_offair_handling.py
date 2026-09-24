@@ -200,6 +200,43 @@ def test_browser_escalation_is_capped():
     assert 1 <= StepDaddyHybrid._MAX_BROWSER_ATTEMPTS <= 6
 
 
+# The exact 42-byte header observed on the `plus` provider's segments, 2026-09-24.
+_REAL_WEBP_HEADER = bytes.fromhex(
+    "52494646d6666a00574542505650384c0d0000002f00000010071011118888fe070045584946b4666a00"
+)
+
+
+def _unwrapper():
+    """Load _media_payload_offset without importing the whole backend (reflex)."""
+    import pathlib, re
+    src = pathlib.Path(__file__).resolve().parents[1].joinpath("backend.py").read_text()
+    block = re.search(r"_TS_SYNC = 0x47.*?\n_CONTENT_M3U8_RE", src, re.S).group(0)
+    ns = {}
+    exec(block.replace("_CONTENT_M3U8_RE", "pass  #"), ns)
+    return ns["_media_payload_offset"]
+
+
+def test_image_wrapped_segment_is_unwrapped():
+    """Segments arrive disguised as WebP images; ffmpeg rejects them as "Invalid
+    data found when processing input" while hls.js in a browser plays them, so the
+    watch page worked and Dispatcharr did not."""
+    off = _unwrapper()
+    payload = bytes([0x47]) + bytes(187) + bytes([0x47]) + bytes(187)
+    assert off(_REAL_WEBP_HEADER + payload) == 42
+
+
+def test_plain_transport_stream_is_untouched():
+    """An ordinary provider must pass through byte-for-byte."""
+    off = _unwrapper()
+    assert off(bytes([0x47]) + bytes(187) + bytes([0x47]) + bytes(187)) == 0
+
+
+def test_non_wrapped_image_is_not_misread_as_a_stream():
+    """A real image (no TS inside) must not be truncated into garbage."""
+    off = _unwrapper()
+    assert off(b"\x89PNG\r\n\x1a\n" + bytes(1000)) == 0
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
