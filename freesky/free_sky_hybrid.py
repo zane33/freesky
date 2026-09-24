@@ -387,9 +387,10 @@ class StepDaddyHybrid:
     _M3U8_TTL_MIN = int(os.environ.get("M3U8_TTL_MIN", "60"))
     _M3U8_TTL_MAX = int(os.environ.get("M3U8_TTL_MAX", "18000"))
 
-    # How many DIFFERENT players must have their feed 404'd by the CDN before we
-    # call a channel off air and stop crawling. One is not enough: players sit on
-    # different providers and a page can advertise a stale ad/fallback URL.
+    # How many DIFFERENT players must have had SOME of their feeds 404'd before we
+    # call a channel off air. Only the weak signal needs a quorum: a player whose
+    # feeds ALL 404 is conclusive on its own (see _resolve_via_iframe_chain), which
+    # matters because in practice only one player yields a readable candidate.
     _OFFAIR_PLAYER_QUORUM = 2
 
     @classmethod
@@ -459,7 +460,11 @@ class StepDaddyHybrid:
         for player in players:
             if asyncio.get_event_loop().time() > deadline:
                 break  # a dead channel shouldn't burn the whole request on every player
-            player_saw_offair = False
+            # Candidates this player offered, and how many the CDN 404'd. Counted
+            # per player rather than per page: one player can span several pages
+            # of its iframe chain, and the verdict belongs to the player.
+            cand_tried = 0
+            cand_offair = 0
             # Seed each player from its own entry page but keep watch.php as the
             # referer, mirroring how the site navigates between players.
             start = f"{self._base_url}/{player}/stream-{channel_id}.php"
@@ -492,6 +497,7 @@ class StepDaddyHybrid:
                 tried_any = False
                 for candidate in self._stream_candidates(response.text):
                     tried_any = True
+                    cand_tried += 1
                     try:
                         content, has_audio = await self._fetch_playlist(candidate, url)
                     except ChannelOffAirError as e:
@@ -499,7 +505,7 @@ class StepDaddyHybrid:
                         # stream. Note it and still try the page's other
                         # candidates, in case this one was an ad or a stale
                         # fallback rather than the feed.
-                        player_saw_offair = True
+                        cand_offair += 1
                         last_error = e
                         logger.debug(f"Candidate off air for {channel_id}: {candidate}: {e}")
                         continue
@@ -533,15 +539,29 @@ class StepDaddyHybrid:
                         if "://" in src or src.startswith("/"):
                             queue.append((urljoin(url, src), url, depth + 1))
 
-            # This player offered a feed and the CDN denied having it. Once two
-            # independent players agree, stop crawling: the channel is not being
-            # broadcast and the remaining players cost seconds to tell us so again.
-            if player_saw_offair:
+            # EVERY feed this player offered was 404. That is the origin denying the
+            # stream exists, not us picking the wrong URL off the page — the stale
+            # ad/fallback case this guards against would leave at least one
+            # candidate answering something other than 404. Stop here: continuing
+            # costs seconds per remaining player to be told the same thing.
+            #
+            # Measured 2026-09 and the reason this fires on ONE player: of the six
+            # players, only `stream` yields a candidate our decoders can read at all
+            # (`plus` and `casting` carry no _econfig). So a quorum of two players
+            # was unreachable by construction, and off-air channels fell through to
+            # a 22s timeout instead. The quorum below still applies to the weaker
+            # "some candidates 404" signal.
+            if cand_tried and cand_offair == cand_tried:
+                raise ChannelOffAirError(
+                    f"Channel {channel_id} is off air: every feed offered by player "
+                    f"'{player}' ({cand_offair}) returned HTTP 404 from the CDN"
+                )
+            if cand_offair:
                 offair_players.add(player)
                 if len(offair_players) >= self._OFFAIR_PLAYER_QUORUM:
                     raise ChannelOffAirError(
                         f"Channel {channel_id} is off air: players "
-                        f"{sorted(offair_players)} all returned HTTP 404 from the CDN"
+                        f"{sorted(offair_players)} returned HTTP 404 from the CDN"
                     )
 
         if video_only_fallback is not None:

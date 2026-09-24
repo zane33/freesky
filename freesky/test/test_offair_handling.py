@@ -103,6 +103,30 @@ def test_offair_error_is_a_valueerror():
     assert issubclass(ChannelOffAirError, ValueError)
 
 
+def test_each_failure_kind_keeps_its_own_response():
+    """A cached failure must replay what the live attempt returned. Caching only
+    the reason string made a timeout report itself as "not currently
+    broadcasting", which read as a total outage during the 2026-09 incident."""
+    try:
+        from freesky import backend
+    except Exception:  # reflex not installed in this environment
+        print("  (skipped: reflex unavailable)")
+        return
+
+    offair = backend._failure_response("588", backend._FAILURE_OFFAIR, "HTTP 404 from CDN")
+    timeout = backend._failure_response("588", backend._FAILURE_TIMEOUT)
+    missing = backend._failure_response("588", backend._FAILURE_NOT_FOUND)
+
+    assert offair.status_code == 404
+    assert timeout.status_code == 504   # honest: we timed out, we did not learn it is off air
+    assert missing.status_code == 404
+    # The three must not be mistakable for one another.
+    bodies = {r.body for r in (offair, timeout, missing)}
+    assert len(bodies) == 3
+    assert b"not currently broadcasting" in offair.body
+    assert b"not currently broadcasting" not in timeout.body
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -567,26 +567,43 @@ def _authorize_proxied_urls(content: str, token: str) -> str:
     return "\n".join(out)
 
 
-def _offair_response(channel_id: str, reason: str) -> JSONResponse:
-    """The 404 returned for a channel upstream is not currently broadcasting.
+# The three ways resolving a channel can fail, and the response each one owes the
+# client. Kept as data so a cached failure replays EXACTLY what the live attempt
+# returned: an earlier version cached the reason string only and replayed
+# everything as "not currently broadcasting", so a plain timeout announced itself
+# as an off-air channel and sent a human hunting for a breakage that wasn't there.
+_FAILURE_OFFAIR = "offair"
+_FAILURE_TIMEOUT = "timeout"
+_FAILURE_NOT_FOUND = "not_found"
 
-    404 rather than 504 is the point: a gateway timeout tells a client like
-    Dispatcharr that WE are broken, so it retries hard and reports an error to the
-    user. 404 says the channel has nothing to play right now, which is both true
-    and something every player already knows how to handle.
+_FAILURE_RESPONSES = {
+    # 404 rather than 504 for a genuine off-air channel: a gateway timeout tells a
+    # client like Dispatcharr that WE are broken, so it retries hard and surfaces an
+    # error. 404 says the channel has nothing to play right now, which is true and
+    # something every player already handles.
+    _FAILURE_OFFAIR: ("Channel is not currently broadcasting", status.HTTP_404_NOT_FOUND),
+    _FAILURE_TIMEOUT: ("Stream generation timeout", status.HTTP_504_GATEWAY_TIMEOUT),
+    _FAILURE_NOT_FOUND: ("Stream not found on any service", status.HTTP_404_NOT_FOUND),
+}
+
+
+def _failure_response(channel_id: str, kind: str, detail: str = None) -> JSONResponse:
+    """Build the response for a failed resolve of `kind`.
 
     Args:
-        channel_id: the channel that is off air.
-        reason: upstream detail, for the client log.
+        channel_id: the channel that failed.
+        kind: one of _FAILURE_OFFAIR / _FAILURE_TIMEOUT / _FAILURE_NOT_FOUND.
+        detail: upstream specifics, for the client log. Omitted when it would
+            merely repeat the headline message.
 
     Returns:
-        A 404 JSONResponse describing the channel as off air.
+        The JSONResponse that a live attempt of this kind would have returned.
     """
-    return JSONResponse(
-        content={"error": "Channel is not currently broadcasting", "channel": channel_id,
-                 "detail": reason},
-        status_code=status.HTTP_404_NOT_FOUND,
-    )
+    message, code = _FAILURE_RESPONSES[kind]
+    content = {"error": message, "channel": channel_id}
+    if detail and detail != message:
+        content["detail"] = detail
+    return JSONResponse(content=content, status_code=code)
 
 
 @fastapi_app.get("/stream/{channel_id}.m3u8")
@@ -643,13 +660,13 @@ async def stream(channel_id: str, request: Request = None):
         # occupies a resolve slot. A manual feed pick (`prefer`) always re-checks:
         # the admin is explicitly asking whether that source is live now.
         if not prefer and cache_key in failed_stream_cache:
-            reason, failed_at = failed_stream_cache[cache_key]
+            kind, reason, failed_at = failed_stream_cache[cache_key]
             if current_time - failed_at < failed_stream_cache_ttl:
                 logger.info(
-                    f"Channel {channel_id} known off air for "
-                    f"{current_time - failed_at:.0f}s, failing fast for client {client_id}"
+                    f"Channel {channel_id} failed ({kind}) {current_time - failed_at:.0f}s "
+                    f"ago, failing fast for client {client_id}"
                 )
-                return _offair_response(channel_id, reason)
+                return _failure_response(channel_id, kind, reason)
             del failed_stream_cache[cache_key]
 
         # Use semaphore to control concurrent stream generation
@@ -686,11 +703,9 @@ async def stream(channel_id: str, request: Request = None):
                     logger.error(f"No stream found for channel {channel_id} on any service")
                     # Also negatively cached: the resolver just spent its whole
                     # budget proving this, and an immediate retry would repeat it.
-                    failed_stream_cache[cache_key] = ("Stream not found on any service", time.time())
-                    return JSONResponse(
-                        content={"error": "Stream not found on any service"},
-                        status_code=status.HTTP_404_NOT_FOUND
-                    )
+                    failed_stream_cache[cache_key] = (
+                        _FAILURE_NOT_FOUND, "Stream not found on any service", time.time())
+                    return _failure_response(channel_id, _FAILURE_NOT_FOUND)
                 
                 # Handle vidembed URLs - try to extract HLS stream
                 if stream_data.startswith("VIDEMBED_URL:"):
@@ -746,8 +761,8 @@ async def stream(channel_id: str, request: Request = None):
                 # broadcast on this channel. Remember it so the next request (and
                 # every client retry) costs nothing until the entry expires.
                 logger.info(f"Channel {channel_id} is off air: {e}")
-                failed_stream_cache[cache_key] = (str(e), time.time())
-                return _offair_response(channel_id, str(e))
+                failed_stream_cache[cache_key] = (_FAILURE_OFFAIR, str(e), time.time())
+                return _failure_response(channel_id, _FAILURE_OFFAIR, str(e))
 
             except asyncio.TimeoutError:
                 # Record the failure HERE. Every record_stream_attempt(False) call
@@ -760,11 +775,9 @@ async def stream(channel_id: str, request: Request = None):
                 elapsed = time.time() - current_time
                 logger.error(f"Timeout generating stream for channel {channel_id} after {elapsed:.1f}s")
                 stream_monitor.record_stream_attempt(channel_id, False, elapsed)
-                failed_stream_cache[cache_key] = ("Stream generation timeout", time.time())
-                return JSONResponse(
-                    content={"error": "Stream generation timeout"},
-                    status_code=status.HTTP_504_GATEWAY_TIMEOUT
-                )
+                failed_stream_cache[cache_key] = (
+                    _FAILURE_TIMEOUT, f"resolver exceeded {stream_request_timeout:.0f}s", time.time())
+                return _failure_response(channel_id, _FAILURE_TIMEOUT)
             except Exception as e:
                 logger.error(f"Error generating stream for channel {channel_id}: {str(e)}")
                 return JSONResponse(
@@ -1585,13 +1598,18 @@ async def health():
         "total_m3u8_requests": total_m3u8_requests,  # Playlist requests (for debugging)
         "max_concurrent_streams": max_concurrent_streams,
         "max_concurrent_resolves": max_concurrent_resolves,
-        # Channels upstream currently reports as off air. A non-empty list here
-        # with healthy metrics is the signature of an upstream outage, not a bug.
-        "offair_channels": sorted(
-            key.removeprefix("stream_")
-            for key, (_, failed_at) in list(failed_stream_cache.items())
-            if time.time() - failed_at < failed_stream_cache_ttl
-        ),
+        # Channels that recently failed to resolve, grouped by WHY. A long
+        # "offair" list with otherwise healthy metrics is the signature of an
+        # upstream outage rather than a bug here; a long "timeout" list instead
+        # points at our own resolver or budget.
+        "recent_failures": {
+            kind: sorted(
+                key.removeprefix("stream_")
+                for key, (k, _, failed_at) in list(failed_stream_cache.items())
+                if k == kind and time.time() - failed_at < failed_stream_cache_ttl
+            )
+            for kind in (_FAILURE_OFFAIR, _FAILURE_TIMEOUT, _FAILURE_NOT_FOUND)
+        },
         "content_semaphore_limit": max_concurrent_streams * 10,  # Content streaming capacity
         "stream_utilization": f"{(total_active_content_streams / max_concurrent_streams) * 100:.1f}%",
         "content_sessions_per_channel": {ch: len(sessions) for ch, sessions in active_content_sessions.items()},

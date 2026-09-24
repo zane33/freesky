@@ -193,12 +193,24 @@ The 504 was our own handling, not the outage:
    on — it could not fire anyway, because it measured backoff from `last_success`,
    which is `0` for a channel that has never resolved.
 
-**Fix**: a CDN 404 now raises `ChannelOffAirError`. Once two independent players
-agree (`_OFFAIR_PLAYER_QUORUM`), the resolver stops immediately and the endpoint
-returns **404 "Channel is not currently broadcasting"** instead of 504 — a player
+**Fix**: a CDN 404 now raises `ChannelOffAirError`. When *every* feed a player
+offered 404s, the resolver stops immediately and the endpoint returns
+**404 "Channel is not currently broadcasting"** instead of 504 — a player
 handles that gracefully, where a 504 says *we* are broken. The result is cached in
 `failed_stream_cache` for `FAILED_STREAM_CACHE_TTL` seconds and cleared the moment
-the channel comes back. Resolution concurrency moved to its own
+the channel comes back. Each cached failure keeps its own kind (`offair` /
+`timeout` / `not_found`) so a replay returns exactly what the live attempt did —
+caching only the reason string once made a plain timeout report itself as
+"not currently broadcasting", which reads as a total outage when it is not.
+`/health` exposes these as `recent_failures`, grouped by kind: a long `offair`
+list with healthy metrics means upstream, a long `timeout` list means us.
+
+**Why one player is enough to call it off air**: measured 2026-09, only the
+`stream` player yields a candidate our decoders can read — `plus` and `casting`
+carry no `_econfig`. Requiring two players to agree was therefore unreachable by
+construction, and off-air channels fell through to a timeout anyway. Requiring
+*all* of one player's candidates to 404 still excludes the stale-ad case, which
+would leave at least one candidate answering something other than 404. Resolution concurrency moved to its own
 `MAX_CONCURRENT_RESOLVES`, and timeouts are recorded as failures at the point the
 504 is returned.
 
