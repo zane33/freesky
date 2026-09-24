@@ -127,6 +127,57 @@ def test_each_failure_kind_keeps_its_own_response():
     assert b"not currently broadcasting" not in timeout.body
 
 
+def _load_browser_resolver():
+    """Import browser_resolver without pulling in reflex via the package."""
+    import importlib.util, pathlib
+    path = pathlib.Path(__file__).resolve().parents[1] / "browser_resolver.py"
+    spec = importlib.util.spec_from_file_location("_br", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_browser_resolver_is_a_noop_when_disabled():
+    """BROWSER_RESOLVE=0 must not start a browser or raise."""
+    import asyncio, os
+    os.environ["BROWSER_RESOLVE"] = "0"
+    try:
+        br = _load_browser_resolver()
+        assert br.ENABLED is False
+        out = asyncio.run(br.browser_resolver.resolve(
+            "https://example.invalid/e/x", referer="https://example.invalid/p",
+            user_agent="UA"))
+        assert out is None
+    finally:
+        os.environ.pop("BROWSER_RESOLVE", None)
+
+
+def test_browser_resolver_degrades_when_browser_unavailable():
+    """A missing Chromium must return None, not explode: the caller then falls
+    back to static decoding rather than failing the whole resolve."""
+    import asyncio, os
+    os.environ["BROWSER_EXECUTABLE_PATH"] = "/nonexistent/chrome-binary"
+    try:
+        br = _load_browser_resolver()
+        out = asyncio.run(br.browser_resolver.resolve(
+            "https://example.invalid/e/x", referer="https://example.invalid/p",
+            user_agent="UA", timeout=2.0))
+        assert out is None
+    finally:
+        os.environ.pop("BROWSER_EXECUTABLE_PATH", None)
+
+
+def test_browser_escalation_is_capped():
+    """The per-resolve escalation cap must be a small positive number — each
+    attempt costs the full timeout when a provider has no feed."""
+    try:
+        from freesky.free_sky_hybrid import StepDaddyHybrid
+    except Exception:
+        print("  (skipped: reflex unavailable)")
+        return
+    assert 1 <= StepDaddyHybrid._MAX_BROWSER_ATTEMPTS <= 6
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

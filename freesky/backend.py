@@ -11,13 +11,15 @@ import time
 from functools import lru_cache
 from typing import Optional, Dict, Set
 from rxconfig import config
-from freesky.free_sky_hybrid import StepDaddyHybrid as StepDaddy, ChannelOffAirError
+from freesky.free_sky_hybrid import (StepDaddyHybrid as StepDaddy, ChannelOffAirError,
+                                     NoResolvableFeedError, DefinitiveResolveFailure)
 from freesky.free_sky import Channel
 from fastapi import Response, status, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 # CORSMiddleware removed - CORS handled by Caddy
 from .utils import urlsafe_base64_decode, encrypt, hls_ext, strip_hls_ext
 from .vidembed_extractor import extract_hls_from_vidembed
+from .browser_resolver import browser_resolver
 from .multi_service_streamer import multi_streamer
 from .stream_monitor import stream_monitor
 from . import channel_prefs
@@ -256,8 +258,8 @@ async def _get_stream_parallel(channel_id: str, prefer: str = None):
                 if not task.done():
                     task.cancel()
 
-    except ChannelOffAirError:
-        # A definitive "not broadcasting" from upstream. Record it and propagate:
+    except DefinitiveResolveFailure:
+        # A definitive answer from upstream. Record it and propagate:
         # the fallback below is the same dead path and would only add latency.
         stream_monitor.record_stream_attempt(channel_id, False, time.time() - start_time)
         raise
@@ -302,11 +304,11 @@ async def _race_stream_tasks(channel_id: str, pending: set, deadline: float, sta
         for task in done:
             try:
                 result = await task
-            except ChannelOffAirError as e:
+            except DefinitiveResolveFailure as e:
                 # Definitive upstream answer, not a transient miss. Remember it and
                 # let the remaining racers finish; if none of them succeeds we
                 # surface this instead of grinding through the sequential fallback.
-                logger.info(f"Parallel task {task.get_name()} reports channel off air: {e}")
+                logger.info(f"Parallel task {task.get_name()} ended the crawl definitively: {e}")
                 offair_error = e
                 continue
             except Exception as e:
@@ -454,6 +456,16 @@ async def shutdown_event():
     # Clear task registry
     active_tasks.clear()
     
+    # Shut the resolver's browser down before the HTTP clients. It owns a child
+    # Chromium process, which outlives the interpreter if nobody closes it.
+    try:
+        await asyncio.wait_for(browser_resolver.close(), timeout=10.0)
+        logger.info("Browser resolver closed successfully")
+    except asyncio.TimeoutError:
+        logger.warning("Browser resolver close timed out")
+    except Exception as e:
+        logger.error(f"Error closing browser resolver: {e}")
+
     # Close HTTP clients with timeout
     try:
         await asyncio.wait_for(client.aclose(), timeout=10.0)
@@ -756,13 +768,14 @@ async def stream(channel_id: str, request: Request = None):
                     }
                 )
                 
-            except ChannelOffAirError as e:
+            except DefinitiveResolveFailure as e:
                 # Upstream is reachable and answered definitively: nothing is being
                 # broadcast on this channel. Remember it so the next request (and
                 # every client retry) costs nothing until the entry expires.
-                logger.info(f"Channel {channel_id} is off air: {e}")
-                failed_stream_cache[cache_key] = (_FAILURE_OFFAIR, str(e), time.time())
-                return _failure_response(channel_id, _FAILURE_OFFAIR, str(e))
+                logger.info(f"Channel {channel_id} resolve ended definitively: {e}")
+                kind = _FAILURE_OFFAIR if isinstance(e, ChannelOffAirError) else _FAILURE_NOT_FOUND
+                failed_stream_cache[cache_key] = (kind, str(e), time.time())
+                return _failure_response(channel_id, kind, str(e))
 
             except asyncio.TimeoutError:
                 # Record the failure HERE. Every record_stream_attempt(False) call

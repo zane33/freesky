@@ -1,0 +1,1 @@
+{"error":"Channel is not currently broadcasting","channel":"588","detail":"Channel 588 is off air: every feed offered by player 'stream' (1) returned HTTP 404 from the CDN"}

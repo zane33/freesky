@@ -19,6 +19,7 @@ from .free_sky import Channel
 from .utils import encrypt, decrypt, urlsafe_base64, extract_and_decode_var, hls_ext
 from .token_validator import TokenValidator, extract_viable_streams
 from . import channel_prefs
+from . import browser_resolver as _browser
 from rxconfig import config
 
 # Set up logging
@@ -36,7 +37,32 @@ logger = logging.getLogger(__name__)
 RESOLVE_BUDGET = float(os.environ.get("STREAM_RESOLVE_BUDGET", "10.0"))
 
 
-class ChannelOffAirError(ValueError):
+class DefinitiveResolveFailure(ValueError):
+    """Base for outcomes that end a crawl early because more crawling cannot help.
+
+    Callers catch this to skip the sequential fallback, which re-walks the same
+    players; the subclass says what to tell the client.
+    """
+
+
+class NoResolvableFeedError(DefinitiveResolveFailure):
+    """Every player we can DECODE came back 404, but others we cannot read remain.
+
+    Not the same as off air, and the distinction is not academic. Measured
+    2026-09-24 on channel 588: the `stream` player (the only one whose payload our
+    `_econfig` decoder reads) 404'd, while the `plus` player — a JW Player embed on
+    exmxbxe.cfd whose payload we cannot decode — served a perfectly playable feed
+    in a real browser. Calling that "off air" told the operator a live channel was
+    dead and sent them looking for a fault that was ours.
+
+    So this is an admission of our own blind spot: the channel may well be
+    broadcasting somewhere we cannot currently look. It still aborts the crawl
+    early, because re-walking players we cannot decode cannot change the outcome —
+    it just does so honestly, and reports as "not found" rather than "off air".
+    """
+
+
+class ChannelOffAirError(DefinitiveResolveFailure):
     """The upstream CDN says this channel's feed does not exist right now.
 
     Distinct from "we could not find a stream URL". The signed playlist URL was
@@ -393,6 +419,11 @@ class StepDaddyHybrid:
     # matters because in practice only one player yields a readable candidate.
     _OFFAIR_PLAYER_QUORUM = 2
 
+    # How many players may be escalated to a real browser within one resolve.
+    # `stream` then `plus` covers the observed cases; the third is slack for a
+    # rotation. Each costs ~2s of the budget.
+    _MAX_BROWSER_ATTEMPTS = int(os.environ.get("MAX_BROWSER_ATTEMPTS", "3"))
+
     @classmethod
     def _cache_ttl_for(cls, m3u8_url: str) -> int:
         """How long a resolved playlist URL stays usable, from its own `e` param.
@@ -456,6 +487,9 @@ class StepDaddyHybrid:
         # "no such stream" is proof enough, and stopping there is the difference
         # between ~6s and the full 20s budget for a channel that is not on.
         offair_players = set()
+        # Browser resolves cost ~2s each; cap them so a channel no provider carries
+        # cannot spend the whole budget launching contexts.
+        browser_attempts = 0
 
         for player in players:
             if asyncio.get_event_loop().time() > deadline:
@@ -465,6 +499,9 @@ class StepDaddyHybrid:
             # of its iframe chain, and the verdict belongs to the player.
             cand_tried = 0
             cand_offair = 0
+            # The provider this player frames. Captured even when the crawl is cut
+            # short, because it is what the browser fallback below needs.
+            player_embed = None
             # Seed each player from its own entry page but keep watch.php as the
             # referer, mirroring how the site navigates between players.
             start = f"{self._base_url}/{player}/stream-{channel_id}.php"
@@ -493,6 +530,12 @@ class StepDaddyHybrid:
                     continue
                 if response.status_code != 200:
                     continue
+
+                if depth == 0 and player_embed is None:
+                    for src in self._IFRAME_RE.findall(response.text):
+                        if "://" in src or src.startswith("/"):
+                            player_embed = urljoin(url, src)
+                            break
 
                 tried_any = False
                 for candidate in self._stream_candidates(response.text):
@@ -551,10 +594,54 @@ class StepDaddyHybrid:
             # was unreachable by construction, and off-air channels fell through to
             # a 22s timeout instead. The quorum below still applies to the weaker
             # "some candidates 404" signal.
-            if cand_tried and cand_offair == cand_tried:
-                raise ChannelOffAirError(
-                    f"Channel {channel_id} is off air: every feed offered by player "
-                    f"'{player}' ({cand_offair}) returned HTTP 404 from the CDN"
+            # Static decoding got nothing usable from this player. If it framed a
+            # provider we cannot read, run that provider in a real browser — the
+            # only general way to reach players like `plus`, whose playlist URL is
+            # computed by obfuscated JS at run time. Measured ~2s, and the result
+            # is cached for hours, so this is affordable inside the budget.
+            #
+            # Only for players we could NOT read. If static decoding did read this
+            # provider and it answered 404, its feed is genuinely down and driving a
+            # browser at it just burns the budget confirming that — measured at the
+            # full timeout, which then starved the `plus` player that actually
+            # had channel 588. A browser helps where we are blind, not where we can
+            # already see.
+            if (player_embed and cand_tried == 0
+                    and browser_attempts < self._MAX_BROWSER_ATTEMPTS):
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining > 2.0:
+                    browser_attempts += 1
+                    m3u8 = await _browser.browser_resolver.resolve(
+                        player_embed, referer=start, user_agent=self.USER_AGENT,
+                        timeout=min(remaining - 0.5, _browser.TIMEOUT),
+                    )
+                    if m3u8:
+                        try:
+                            # The referer for later segment fetches is the provider
+                            # origin, not our own page.
+                            content, has_audio = await self._fetch_playlist(m3u8, player_embed)
+                        except Exception as e:
+                            last_error = e
+                            logger.debug(f"Browser-resolved feed dead for {channel_id}: {e}")
+                        else:
+                            if has_audio or single_feed:
+                                logger.info(f"Resolved channel {channel_id} via '{player}' "
+                                            f"player (browser)")
+                                self._resolved[channel_id] = (m3u8, player_embed, time.time())
+                                return content
+                            if video_only_fallback is None:
+                                video_only_fallback = (content, m3u8, player_embed)
+
+            # Only meaningful when the browser fallback is off: with it enabled the
+            # other players are worth trying, because a provider we cannot decode
+            # statically may still be live — which is exactly how channel 588 was
+            # wrongly reported dead.
+            if not _browser.ENABLED and cand_tried and cand_offair == cand_tried:
+                raise NoResolvableFeedError(
+                    f"No resolvable feed for channel {channel_id}: every feed offered "
+                    f"by player '{player}' ({cand_offair}) returned HTTP 404. Other "
+                    f"players may still carry it — their payloads are not decodable "
+                    f"yet, so this is our blind spot, not proof the channel is off air"
                 )
             if cand_offair:
                 offair_players.add(player)

@@ -147,6 +147,20 @@ services:
       # Dispatcharr's hardcoded 30s client init window, which must also fit ffmpeg
       # opening the playlist and buffering ~1MB of TS. See TROUBLESHOOTING issue 10.
       - STREAM_RESOLVE_BUDGET=${STREAM_RESOLVE_BUDGET:-10}
+      # Browser fallback for players whose payload we cannot decode statically.
+      # Only ONE upstream player (`stream`, via _econfig) is statically readable;
+      # the rest compute their playlist URL in obfuscated JS at run time. Without
+      # this, a channel whose `stream` provider is down looks dead even while
+      # another player carries it — which is what happened to channel 588.
+      # Set BROWSER_RESOLVE=0 to disable (static decoding only).
+      - BROWSER_RESOLVE=${BROWSER_RESOLVE:-1}
+      # A successful capture measures ~2s; a provider with no feed costs the full
+      # timeout, so keep this small enough that a second player still fits inside
+      # STREAM_RESOLVE_BUDGET.
+      - BROWSER_RESOLVE_TIMEOUT=${BROWSER_RESOLVE_TIMEOUT:-6}
+      # Concurrent browser contexts, and how many players one resolve may escalate.
+      - MAX_BROWSER_RESOLVES=${MAX_BROWSER_RESOLVES:-2}
+      - MAX_BROWSER_ATTEMPTS=${MAX_BROWSER_ATTEMPTS:-3}
 
       # Reflex Framework Settings
       - REFLEX_ENV=prod

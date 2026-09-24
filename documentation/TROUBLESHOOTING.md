@@ -261,6 +261,53 @@ ceiling.
   **never filter off-air channels out of `/playlist.m3u8`** — that, not a 404, is
   the one thing that genuinely poisons a channel.
 
+### 11. A channel is dead everywhere (browser, Dispatcharr, curl) but upstream has it
+
+**Symptom**: one channel fails identically in the watch page, in Dispatcharr and
+with curl, returning 404 "Stream not found on any service" (or, before this was
+understood, "Channel is not currently broadcasting"). Other channels are fine.
+Failing everywhere at once looks like an upstream outage — it usually is not.
+
+**Cause**: upstream offers each channel through six independent "players", each on
+its own provider. Only `stream` publishes a payload our static decoders can read
+(`_econfig`); `plus`, `casting`, `cast` and `watch` compute the playlist URL in
+obfuscated JavaScript at run time. When the `stream` provider's feed is down we saw
+its 404 and concluded the channel was dead — while another player was serving it
+perfectly.
+
+Measured 2026-09-24 on channel 588, driving each player in a real browser:
+
+| player | provider | result |
+|---|---|---|
+| `stream` | assetrage.net | 404 |
+| **`plus`** | **exmxbxe.cfd** | **playable 200** |
+| `casting` | api.cdnlivetv.tv | 503 |
+| `cast` | tiestep.top | 404 |
+| `watch` | hamis.romponalis.st | 503 |
+
+**Fix**: when a player frames a provider we cannot decode, `browser_resolver.py`
+runs that embed in headless Chromium and captures the playlist URL from network
+traffic. Measured ~2s; the resolved URL is then cached for hours, so the cost is
+about one browser context per channel per few hours.
+
+Two details that are load-bearing:
+- **It only escalates players we could NOT read.** If static decoding did read a
+  provider and it answered 404, that feed is genuinely down; driving a browser at
+  it costs the full timeout to confirm what we already know, and that starved the
+  `plus` player that actually had 588.
+- **It mints with `StepDaddyHybrid.USER_AGENT`.** The CDN binds each signed token
+  to the minting User-Agent, and the backend spends the token later. A default
+  Chromium UA yields a token that 403s on our own proxy hop — indistinguishable
+  from a dead feed.
+
+**Knobs**: `BROWSER_RESOLVE=0` disables it; `BROWSER_RESOLVE_TIMEOUT` (6s),
+`MAX_BROWSER_RESOLVES` (2 concurrent), `MAX_BROWSER_ATTEMPTS` (3 players per
+resolve), `BROWSER_EXECUTABLE_PATH` for a system Chromium. If Chromium is missing
+the resolver logs a warning once and falls back to static decoding.
+
+**Diagnosing a repeat**: drive each player in a browser and see which providers
+answer 200. If one does and we still fail, the gap is ours, not upstream's.
+
 ## Performance Optimizations
 
 ### Environment Variables for Performance
@@ -289,6 +336,13 @@ docker exec <container_name> env | grep -E "(PORT|API_URL|DADDYLIVE_URI|PROXY_CO
 - `STREAM_RESOLVE_BUDGET`: Seconds the resolver may spend finding a working feed
   (default: 10). Sized against Dispatcharr's **hardcoded 30s** client init window —
   see issue 10. Raise it for browser-only viewing, lower it for a tighter client
+- `BROWSER_RESOLVE`: Run players we cannot decode statically in headless Chromium
+  (default: 1). See issue 11 — without it, a channel whose `stream` provider is
+  down appears dead even when another player carries it
+- `BROWSER_RESOLVE_TIMEOUT` / `MAX_BROWSER_RESOLVES` / `MAX_BROWSER_ATTEMPTS`:
+  per-resolve cap (6s), concurrent contexts (2), players escalated per resolve (3)
+- `BROWSER_EXECUTABLE_PATH`: explicit Chromium path for images without Playwright's
+  own download
 - `FAILED_STREAM_CACHE_TTL`: Seconds to remember that a channel is off air before
   re-checking (default: 60). Lower it if channels come back mid-event and you want
   them picked up sooner; raise it to cut upstream load during long outages
