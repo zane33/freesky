@@ -305,8 +305,20 @@ Two details that are load-bearing:
 resolve), `BROWSER_EXECUTABLE_PATH` for a system Chromium. If Chromium is missing
 the resolver logs a warning once and falls back to static decoding.
 
+**Cold start**: Chromium takes seconds to launch, and paying that inside a request
+came out of the channel's resolve budget — so the FIRST request for a
+browser-resolved channel after every restart overran, returned 504, and was then
+negatively cached. From outside, a redeploy looked like the fix had not worked.
+The browser is now started in the background at application startup
+(`_warm_browser_resolver`), and a `timeout` failure is cached for at most 15s
+rather than the full `FAILED_STREAM_CACHE_TTL`, because a timeout is a far weaker
+verdict than a CDN 404.
+
 **Diagnosing a repeat**: drive each player in a browser and see which providers
-answer 200. If one does and we still fail, the gap is ours, not upstream's.
+answer 200. If one does and we still fail, the gap is ours, not upstream's. Look
+for `Resolved channel <id> via '<player>' player (browser)` in the log. Note that
+`?player=<name>` bypasses both caches, so it is the way to test a single provider
+without waiting for the negative cache to expire.
 
 ## Performance Optimizations
 

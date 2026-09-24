@@ -108,6 +108,22 @@ class BrowserResolver:
                 self._browser = None
         return self._browser
 
+    async def warm(self) -> bool:
+        """Start the browser ahead of first use.
+
+        Called at application startup. Chromium takes seconds to launch, and if
+        that happens inside a request it comes out of that channel's resolve
+        budget — which made the first request for a browser-resolved channel time
+        out after every restart, and then sit in the negative cache for a minute.
+
+        Returns:
+            True if the browser is running, False if it is unavailable (in which
+            case resolves silently fall back to static decoding).
+        """
+        if not ENABLED:
+            return False
+        return await self._ensure_browser() is not None
+
     async def resolve(self, embed_url: str, referer: str, user_agent: str,
                       timeout: float = None) -> str:
         """Run `embed_url` in a browser and return the playlist URL it fetches.

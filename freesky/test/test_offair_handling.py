@@ -127,6 +127,28 @@ def test_each_failure_kind_keeps_its_own_response():
     assert b"not currently broadcasting" not in timeout.body
 
 
+def test_timeout_is_forgotten_sooner_than_offair():
+    """A timeout is a weak verdict — a cold browser or a slow hop — so it must be
+    re-checked far sooner than a CDN 404. Caching a single cold-start overrun for a
+    full minute made a working channel look permanently dead after a restart."""
+    try:
+        from freesky import backend
+    except Exception:
+        print("  (skipped: reflex unavailable)")
+        return
+    assert backend._failure_ttl(backend._FAILURE_TIMEOUT) < backend._failure_ttl(backend._FAILURE_OFFAIR)
+
+
+def test_warm_is_a_noop_when_disabled():
+    import asyncio, os
+    os.environ["BROWSER_RESOLVE"] = "0"
+    try:
+        br = _load_browser_resolver()
+        assert asyncio.run(br.browser_resolver.warm()) is False
+    finally:
+        os.environ.pop("BROWSER_RESOLVE", None)
+
+
 def _load_browser_resolver():
     """Import browser_resolver without pulling in reflex via the package."""
     import importlib.util, pathlib

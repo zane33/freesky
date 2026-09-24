@@ -436,6 +436,21 @@ channel_update_task = None
 async def startup_event():
     # Background task now managed by Reflex lifespan
     logger.info("FastAPI startup complete - channel loading managed by Reflex")
+    # Start Chromium now, in the background, so the first channel that needs the
+    # browser fallback does not pay the launch cost out of its resolve budget.
+    # Measured: a warm resolve is ~2-4s and fits; a cold one overran the 10s budget,
+    # returned 504, and was then negatively cached for a minute — so the first
+    # request for such a channel after every restart failed, which is exactly what
+    # a redeploy looked like from outside.
+    active_tasks["browser_warmup"] = asyncio.create_task(_warm_browser_resolver())
+
+
+async def _warm_browser_resolver():
+    """Launch the resolver's browser ahead of first use. Never fatal."""
+    try:
+        await browser_resolver.warm()
+    except Exception as e:
+        logger.warning(f"Browser resolver warm-up failed: {type(e).__name__}: {e}")
 
 @fastapi_app.on_event("shutdown")
 async def shutdown_event():
@@ -588,6 +603,16 @@ _FAILURE_OFFAIR = "offair"
 _FAILURE_TIMEOUT = "timeout"
 _FAILURE_NOT_FOUND = "not_found"
 
+# How long each failure kind stays cached. A timeout is a much weaker verdict than
+# an off-air 404 — it can mean nothing worse than a cold browser or a slow hop — so
+# it is re-checked far sooner. Caching a timeout for a full minute is what made a
+# single cold-start overrun look like a channel that stayed dead.
+def _failure_ttl(kind: str) -> float:
+    if kind == _FAILURE_TIMEOUT:
+        return min(15.0, failed_stream_cache_ttl)
+    return failed_stream_cache_ttl
+
+
 _FAILURE_RESPONSES = {
     # 404 rather than 504 for a genuine off-air channel: a gateway timeout tells a
     # client like Dispatcharr that WE are broken, so it retries hard and surfaces an
@@ -673,7 +698,7 @@ async def stream(channel_id: str, request: Request = None):
         # the admin is explicitly asking whether that source is live now.
         if not prefer and cache_key in failed_stream_cache:
             kind, reason, failed_at = failed_stream_cache[cache_key]
-            if current_time - failed_at < failed_stream_cache_ttl:
+            if current_time - failed_at < _failure_ttl(kind):
                 logger.info(
                     f"Channel {channel_id} failed ({kind}) {current_time - failed_at:.0f}s "
                     f"ago, failing fast for client {client_id}"
@@ -1619,7 +1644,7 @@ async def health():
             kind: sorted(
                 key.removeprefix("stream_")
                 for key, (k, _, failed_at) in list(failed_stream_cache.items())
-                if k == kind and time.time() - failed_at < failed_stream_cache_ttl
+                if k == kind and time.time() - failed_at < _failure_ttl(kind)
             )
             for kind in (_FAILURE_OFFAIR, _FAILURE_TIMEOUT, _FAILURE_NOT_FOUND)
         },
