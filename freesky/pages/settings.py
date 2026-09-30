@@ -63,6 +63,8 @@ class SettingsState(rx.State):
 
     # Instance-wide display timezone for schedule times and the EPG
     timezone: str = ""
+    # Auto-refresh interval label, see app_settings.REFRESH_INTERVALS
+    refresh_every: str = ""
 
     # Playlist URL revealed for one user at a time (see copy_playlist_url)
     revealed_user: str = ""
@@ -526,6 +528,7 @@ class SettingsState(rx.State):
         self.users = users.list_users()
         self.trusted_networks = ", ".join(app_settings.trusted_networks())
         self.timezone = app_settings.timezone()
+        self.refresh_every = self._refresh_label()
         self.sources = channel_prefs.sources()
         # The admin's own token, so each virtual-channel row can carry a working
         # link to its control panel. require_admin() above only returns a
@@ -664,6 +667,25 @@ class SettingsState(rx.State):
         except Exception as e:
             return rx.toast(f"Unknown timezone: {e}")
         return rx.toast(f"Times now shown in {self.timezone}")
+
+    @staticmethod
+    def _refresh_label() -> str:
+        minutes = app_settings.refresh_minutes()
+        for label, m in app_settings.REFRESH_INTERVALS.items():
+            if m == minutes:
+                return label
+        return f"{minutes} min"
+
+    @rx.event
+    def set_refresh_every(self, label: str):
+        """Change how often the backend re-scrapes upstream. Applies live."""
+        minutes = app_settings.REFRESH_INTERVALS.get(label)
+        if minutes is None:
+            return rx.toast(f"Unknown interval: {label}")
+        app_settings.set_refresh_minutes(minutes)
+        self.refresh_every = label
+        return rx.toast("Auto-refresh off" if minutes == 0
+                        else f"Channels auto-refresh every {label}")
 
     @rx.event
     def set_trusted_networks(self, value: str):
@@ -1611,6 +1633,14 @@ def settings() -> rx.Component:
                 rx.hstack(
                     rx.text(SettingsState.summary, size="2", weight="bold"),
                     rx.spacer(),
+                    rx.text("Auto-refresh", size="2", color="gray"),
+                    rx.select(
+                        list(app_settings.REFRESH_INTERVALS),
+                        value=SettingsState.refresh_every,
+                        on_change=SettingsState.set_refresh_every,
+                        width="110px",
+                        size="2",
+                    ),
                     rx.button(
                         rx.icon("refresh-cw", size=16),
                         "Refresh from source",

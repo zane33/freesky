@@ -543,7 +543,7 @@ User → Reflex Frontend → Backend → Stream URL → Frontend → Direct Conn
 #### **Live Channel Status**
 - **Purpose**: Monitor channel availability and connection status
 - **Technology**: Reflex state management with periodic backend updates
-- **Frequency**: Every 5 minutes with manual refresh option
+- **Frequency**: Configurable on the Settings page (Off / 5 min / 15 min / 30 min / 1 h / 6 h / 24 h, default 5 min, seed with `CHANNEL_REFRESH_MINUTES`), plus a manual "Refresh from source" button
 
 #### **Real-time Search**
 - **Purpose**: Instant search filtering without page reloads

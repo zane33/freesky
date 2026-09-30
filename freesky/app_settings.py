@@ -85,6 +85,30 @@ def set_timezone(name: str) -> str:
     return name
 
 
+# --- channel auto-refresh interval -------------------------------------------
+# How often the backend re-scrapes the channel list from upstream. Minutes;
+# 0 turns the timer off (manual "Refresh from source" still works).
+REFRESH_INTERVALS = {"Off": 0, "5 min": 5, "15 min": 15, "30 min": 30,
+                     "1 hour": 60, "6 hours": 360, "24 hours": 1440}
+_REFRESH_DEFAULT = int(os.environ.get("CHANNEL_REFRESH_MINUTES", "5"))
+
+
+def refresh_minutes() -> int:
+    """Minutes between automatic upstream refreshes, 0 = off."""
+    try:
+        return max(0, int(_load().get("refresh_minutes", _REFRESH_DEFAULT)))
+    except (TypeError, ValueError):
+        return _REFRESH_DEFAULT
+
+
+def set_refresh_minutes(minutes: int) -> int:
+    minutes = max(0, int(minutes))
+    data = _load()
+    data["refresh_minutes"] = minutes
+    _save(data)
+    return minutes
+
+
 def is_trusted_ip(ip: str) -> bool:
     """True when this client may skip login.
 

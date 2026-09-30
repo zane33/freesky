@@ -1338,8 +1338,20 @@ async def content(path: str, request: Request, ref: str = None):
             return Response(status_code=int(m.group(1)))
         return JSONResponse(content={"error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+async def _sleep_until_refresh():
+    """Sleep for the admin-configured interval, re-reading it every minute so a
+    change on the settings page takes effect without a restart. 0 = off: keep
+    idling until it is turned back on (manual refresh still works)."""
+    slept = 0
+    while True:
+        minutes = app_settings.refresh_minutes()
+        if minutes and slept >= minutes * 60:
+            return
+        await asyncio.sleep(60)
+        slept += 60
+
+
 async def update_channels():
-    update_interval = 300  # 5 minutes
     retry_interval = 60   # 1 minute on failure
     max_retries = 3      # Maximum number of retries
     
@@ -1360,7 +1372,7 @@ async def update_channels():
                         # Don't block the update loop on it; already-cached logos
                         # make later passes nearly free.
                         asyncio.create_task(warm_logo_cache())
-                        await asyncio.sleep(update_interval)
+                        await _sleep_until_refresh()
                     else:
                         raise Exception("No channels loaded from primary source")
                 except Exception as e:
@@ -1384,7 +1396,7 @@ async def update_channels():
                     logger.error("No fallback file available")
                 
                 # Wait before next attempt even if using fallback
-                await asyncio.sleep(update_interval)
+                await _sleep_until_refresh()
                 
         except asyncio.CancelledError:
             logger.info("Channel update task cancelled")

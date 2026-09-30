@@ -1,0 +1,68 @@
+{
+  "entries": {
+    "cmd-1790756725989": {
+      "key": "cmd-1790756725989",
+      "value": "{\"command\":\"grep -rn -i \\\"refresh\\\" freesky/pages/settings.py freesky/*.py --include=*.py | grep -v \\\"^.*#\\\" | head -60; ls freesky freesky/pages\",\"exitCode\":0,\"success\":true}",
+      "namespace": "commands",
+      "storedAt": "2026-09-30T08:25:25.989Z",
+      "lastAccessed": "2026-09-30T08:25:25.989Z",
+      "accessCount": 0,
+      "expiresAt": "2026-10-30T08:25:25.989Z"
+    },
+    "cmd-1790756733544": {
+      "key": "cmd-1790756733544",
+      "value": "{\"command\":\"grep -n -i \\\"refresh\\\\|source\\\" freesky/pages/settings.py | head -60; echo ---; grep -n -i \\\"refresh\\\\|def \\\\|class \\\\|_load\\\\|_save\\\\|DEFAULT\\\" freesky/app_settings.py | head -80; echo ---; grep -n -i \\\"refresh_from_source\\\\|refresh_channels\\\\|def refresh\\\\|reload_channels\\\\|force_refresh\\\\|get_channels\\\\|_cache\\\" freesky/backend.py freesky/free_sky_hybrid.py freesky/utils.py | head -60\",\"exitCode\":0,\"success\":true}",
+      "namespace": "commands",
+      "storedAt": "2026-09-30T08:25:33.544Z",
+      "lastAccessed": "2026-09-30T08:25:33.544Z",
+      "accessCount": 0,
+      "expiresAt": "2026-10-30T08:25:33.544Z"
+    },
+    "cmd-1790756744735": {
+      "key": "cmd-1790756744735",
+      "value": "{\"command\":\"sed -n 500,570p freesky/pages/settings.py; echo ---SETTINGS-UI; sed -n 1590,1640p freesky/pages/settings.py; echo ---BACKEND-UPDATE; sed -n 1240,1380p freesky/backend.py; echo ---ENDPOINT; sed -n 1645,1665p freesky/backend.py; echo ---APPSETTINGS; sed -n 1,90p freesky/app_settings.py; echo ---TZ-UI; grep -n \\\"timezone\\\" freesky/pages/settings.py | head\",\"exitCode\":0,\"success\":true}",
+      "namespace": "commands",
+      "storedAt": "2026-09-30T08:25:44.735Z",
+      "lastAccessed": "2026-09-30T08:25:44.735Z",
+      "accessCount": 0,
+      "expiresAt": "2026-10-30T08:25:44.735Z"
+    },
+    "cmd-1790756755651": {
+      "key": "cmd-1790756755651",
+      "value": "{\"command\":\"sed -n 1380,1420p freesky/backend.py; echo ---TZHANDLER; sed -n 655,670p freesky/pages/settings.py; echo ---TZUI; grep -n \\\"set_timezone\\\\|TIMEZONES\\\" freesky/pages/settings.py; N=$(grep -n \\\"on_change=SettingsState.set_timezone\\\" freesky/pages/settings.py | cut -d: -f1); sed -n $((N-20)),$((N+8))p freesky/pages/settings.py; echo ---DOCS; grep -rn -i \\\"5 minutes\\\\|every 5\\\\|update_channels\\\\|refresh from source\\\" documentation/*.md README.md 2>/dev/null | head\",\"exitCode\":0,\"success\":true}",
+      "namespace": "commands",
+      "storedAt": "2026-09-30T08:25:55.651Z",
+      "lastAccessed": "2026-09-30T08:25:55.651Z",
+      "accessCount": 0,
+      "expiresAt": "2026-10-30T08:25:55.651Z"
+    },
+    "cmd-1790756771354": {
+      "key": "cmd-1790756771354",
+      "value": "{\"command\":\"python3 - <<'EOF'\\nimport re\\np='freesky/app_settings.py'; s=open(p).read()\\ns=s.replace('''def is_trusted_ip(ip: str) -> bool:''','''# --- channel auto-refresh interval -------------------------------------------\\n# How often the backend re-scrapes the channel list from upstream. Minutes;\\n# 0 turns the timer off (manual \\\"Refresh from source\\\" still works).\\nREFRESH_INTERVALS = {\\\"Off\\\": 0, \\\"5 min\\\": 5, \\\"15 min\\\": 15, \\\"30 min\\\": 30,\\n                     \\\"1 hour\\\": 60, \\\"6 hours\\\": 360, \\\"24 hours\\\": 1440}\\n_REFRESH_DEFAULT = int(os.environ.get(\\\"CHANNEL_REFRESH_MINUTES\\\", \\\"5\\\"))\\n\\n\\ndef refresh_minutes() -> int:\\n    \\\"\\\"\\\"Minutes between automatic upstream refreshes, 0 = off.\\\"\\\"\\\"\\n    try:\\n        return max(0, int(_load().get(\\\"refresh_minutes\\\", _REFRESH_DEFAULT)))\\n    except (TypeError, ValueError):\\n        return _REFRESH_DEFAULT\\n\\n\\ndef set_refresh_minutes(minutes: int) -> int:\\n    minutes = max(0, int(minutes))\\n    data = _load()\\n    data[\\\"refresh_minutes\\\"] = minutes\\n    _save(data)\\n    return minutes\\n\\n\\ndef is_trusted_ip(ip: str) -> bool:''')\\nopen(p,'w').write(s)\\n\\np='freesky/backend.py'; s=open(p).read()\\nold='''async def update_channels():\\n    update_interval = 300  # 5 minutes\\n    retry_interval = 60   # 1 minute on failure\\n    max_retries = 3      # Maximum number of retries\\n    \\n    while True:\\n        try:\\n'''\\nnew='''async def _sleep_until_refresh():\\n    \\\"\\\"\\\"Sleep for the admin-configured interval, re-reading it every minute so a\\n    change on the settings page takes effect without a restart. 0 = off: keep\\n    idling until it is turned back on (manual refresh still works).\\\"\\\"\\\"\\n    slept = 0\\n    while True:\\n        minutes = app_settings.refresh_minutes()\\n        if minutes and slept >= minutes * 60:\\n            return\\n        await asyncio.sleep(60)\\n        slept += 60\\n\\n\\nasync def update_channels():\\n    retry_interval = 60   # 1 minute on failure\\n    max_retries = 3      # Maximum number of retries\\n    \\n    while True:\\n        try:\\n'''\\nassert old in s; s=s.replace(old,new)\\nassert s.count('await asyncio.sleep(update_interval)')==2\\ns=s.replace('await asyncio.sleep(update_interval)','await _sleep_until_refresh()')\\nopen(p,'w').write(s)\\nEOF\\ngrep -n \\\"^from\\\\|^import\\\" freesky/backend.py | grep -n \\\"app_settings\\\\|channel_prefs\\\"\",\"exitCode\":0,\"success\":true}",
+      "namespace": "commands",
+      "storedAt": "2026-09-30T08:26:11.354Z",
+      "lastAccessed": "2026-09-30T08:26:11.354Z",
+      "accessCount": 0,
+      "expiresAt": "2026-10-30T08:26:11.354Z"
+    },
+    "cmd-1790756789687": {
+      "key": "cmd-1790756789687",
+      "value": "{\"command\":\"python3 - <<'EOF'\\np='freesky/pages/settings.py'; s=open(p).read()\\n# state var\\nold='''    # Instance-wide display timezone for schedule times and the EPG\\n    timezone: str = \\\"\\\"\\n'''\\nnew=old+'''    # Auto-refresh interval label, see app_settings.REFRESH_INTERVALS\\n    refresh_every: str = \\\"\\\"\\n'''\\nassert old in s; s=s.replace(old,new)\\n# on_load\\nold='''        self.timezone = app_settings.timezone()\\n        self.sources'''\\nnew='''        self.timezone = app_settings.timezone()\\n        self.refresh_every = self._refresh_label()\\n        self.sources'''\\nassert old in s; s=s.replace(old,new)\\n# handler after set_timezone\\nold='''        return rx.toast(f\\\"Times now shown in {self.timezone}\\\")\\n'''\\nnew=old+'''\\n    @staticmethod\\n    def _refresh_label() -> str:\\n        minutes = app_settings.refresh_minutes()\\n        for label, m in app_settings.REFRESH_INTERVALS.items():\\n            if m == minutes:\\n                return label\\n        return f\\\"{minutes} min\\\"\\n\\n    @rx.event\\n    def set_refresh_every(self, label: str):\\n        \\\"\\\"\\\"Change how often the backend re-scrapes upstream. Applies live.\\\"\\\"\\\"\\n        minutes = app_settings.REFRESH_INTERVALS.get(label)\\n        if minutes is None:\\n            return rx.toast(f\\\"Unknown interval: {label}\\\")\\n        app_settings.set_refresh_minutes(minutes)\\n        self.refresh_every = label\\n        return rx.toast(\\\"Auto-refresh off\\\" if minutes == 0\\n                        else f\\\"Channels auto-refresh every {label}\\\")\\n'''\\nassert old in s; s=s.replace(old,new,1)\\n# UI: selector next to refresh button\\nold='''                    rx.spacer(),\\n                    rx.button(\\n                        rx.icon(\\\"refresh-cw\\\", size=16),\\n                        \\\"Refresh from source\\\",\\n'''\\nnew='''                    rx.spacer(),\\n                    rx.text(\\\"Auto-refresh\\\", size=\\\"2\\\", color=\\\"gray\\\"),\\n                    rx.select(\\n                        list(app_settings.REFRESH_INTERVALS),\\n                        value=SettingsState.refresh_every,\\n                        on_change=SettingsState.set_refresh_every,\\n                        width=\\\"110px\\\",\\n                        size=\\\"2\\\",\\n                    ),\\n                    rx.button(\\n                        rx.icon(\\\"refresh-cw\\\", size=16),\\n                        \\\"Refresh from source\\\",\\n'''\\nassert old in s; s=s.replace(old,new)\\nopen(p,'w').write(s)\\n\\np='documentation/README.md'; s=open(p).read()\\ns=s.replace('- **Frequency**: Every 5 minutes with manual refresh option',\\n '- **Frequency**: Configurable on the Settings page (Off / 5 min / 15 min / 30 min / 1 h / 6 h / 24 h, default 5 min, seed with `CHANNEL_REFRESH_MINUTES`), plus a manual \\\"Refresh from source\\\" button')\\nopen(p,'w').write(s)\\nEOF\\npython3 -c \\\"import ast,sys;[ast.parse(open(f).read()) for f in ['freesky/app_settings.py','freesky/backend.py','freesky/pages/settings.py']];print('syntax ok')\\\"\\npython3 - <<'EOF'\\nimport os,tempfile\\nos.environ['APP_SETTINGS_FILE']=tempfile.mktemp()\\nfrom freesky import app_settings as a\\nassert a.refresh_minutes()==5\\nassert a.set_refresh_minutes(30)==30 and a.refresh_minutes()==30\\nassert a.set_refresh_minutes(0)==0 and a.refresh_minutes()==0\\nprint('settings ok')\\nEOF\\ngit diff --stat\",\"exitCode\":0,\"success\":true}",
+      "namespace": "commands",
+      "storedAt": "2026-09-30T08:26:29.687Z",
+      "lastAccessed": "2026-09-30T08:26:29.687Z",
+      "accessCount": 0,
+      "expiresAt": "2026-10-30T08:26:29.687Z"
+    },
+    "cmd-1790756798255": {
+      "key": "cmd-1790756798255",
+      "value": "{\"command\":\"ifconfig 2>/dev/null | grep -c \\\"192.168.3.148\\\"; docker ps --format '{{.Names}} {{.Image}} {{.Ports}}' 2>/dev/null | grep -i freesky; git status --short\",\"exitCode\":0,\"success\":true}",
+      "namespace": "commands",
+      "storedAt": "2026-09-30T08:26:38.255Z",
+      "lastAccessed": "2026-09-30T08:26:38.255Z",
+      "accessCount": 0,
+      "expiresAt": "2026-10-30T08:26:38.255Z"
+    }
+  },
+  "version": "3.0.0"
+}
